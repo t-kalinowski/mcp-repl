@@ -1,0 +1,16 @@
+---
+source: tests/refactor_coverage.rs
+expression: snapshot.render_transcript()
+---
+== session: truncation_tail ==
+1) write_stdin timeout=20.0
+>>> 
+>>> cat(paste(rep("x", 2200000), collapse = ""))
+>>> cat("\nEND\n")
+<<< xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+<<< --More-- (6978p, 0.0%, @0..300/2093526)
+
+2) write_stdin timeout=10.0
+>>> tail 8k
+<<< [mcp-console:pager] input blocked while pager is active: tail 8k (use :q to exit pager)
+<<< --More-- (6978p, 0.0%, @0..300/2093526)

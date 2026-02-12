@@ -1,0 +1,16 @@
+---
+source: tests/mcp_transcripts.rs
+expression: snapshot.render_transcript()
+---
+== session: interrupt_handler ==
+1) write_stdin timeout=0.2
+>>> tryCatch({ Sys.sleep(10000000) }, interrupt = function(e) cat("interrupt received\n"))
+<<< <<console status: busy, write_stdin timeout reached; elapsed_ms=200>>
+
+2) write_stdin timeout=5.0
+>>> 
+<<< interrupt received
+
+3) write_stdin timeout=10.0
+>>> 1+1
+<<< [1] 2

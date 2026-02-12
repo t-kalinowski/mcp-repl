@@ -1,0 +1,23 @@
+---
+source: tests/write_stdin_batch.rs
+expression: snapshot.render_transcript()
+---
+== session: browser_queue ==
+1) write_stdin timeout=10.0
+>>> f <- function() { browser(); x <- 1; x <- x + 1; x }
+
+2) write_stdin timeout=10.0
+>>> f()
+<<< Called from: f()
+
+3) write_stdin timeout=10.0
+>>> n
+<<< debug at #1: x <- 1
+
+4) write_stdin timeout=10.0
+>>> n
+<<< debug at #1: x <- x + 1
+
+5) write_stdin timeout=10.0
+>>> c
+<<< [1] 2

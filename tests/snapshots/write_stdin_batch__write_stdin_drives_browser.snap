@@ -1,0 +1,121 @@
+---
+source: tests/write_stdin_batch.rs
+expression: snapshot.render()
+---
+== session: browser_queue ==
+-- step 1 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "f <- function() { browser(); x <- 1; x <- x + 1; x }\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}
+-- step 2 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "f()\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "Called from: f()"
+    },
+    {
+      "type": "text",
+      "text": "Browse[1]> "
+    }
+  ]
+}
+-- step 3 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "n\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "debug at #1: x <- 1"
+    },
+    {
+      "type": "text",
+      "text": "Browse[1]> "
+    }
+  ]
+}
+-- step 4 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "n\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "debug at #1: x <- x + 1"
+    },
+    {
+      "type": "text",
+      "text": "Browse[1]> "
+    }
+  ]
+}
+-- step 5 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "c\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[1] 2"
+    },
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}

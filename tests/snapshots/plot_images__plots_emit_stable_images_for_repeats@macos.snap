@@ -1,0 +1,74 @@
+---
+source: tests/plot_images.rs
+assertion_line: 139
+expression: serialized
+---
+{
+  "steps": [
+    {
+      "tool": "write_stdin",
+      "input": "plot(1:10)",
+      "response": {
+        "content": [
+          {
+            "type": "image",
+            "data": "blake3:ae6672605feb09b2f26604d8439f4ca60aac78b7db4f1f6a210b44194d84af6c",
+            "mimeType": "image/png",
+            "_meta": {
+              "mcpConsole": {
+                "imageId": "plot-2",
+                "isNewPage": true
+              }
+            }
+          },
+          {
+            "type": "text",
+            "text": "> "
+          }
+        ],
+        "isError": false
+      }
+    },
+    {
+      "tool": "write_stdin",
+      "input": "plot(1:10)",
+      "response": {
+        "content": [
+          {
+            "type": "image",
+            "data": "blake3:ae6672605feb09b2f26604d8439f4ca60aac78b7db4f1f6a210b44194d84af6c",
+            "mimeType": "image/png",
+            "_meta": {
+              "mcpConsole": {
+                "imageId": "plot-3",
+                "isNewPage": true
+              }
+            }
+          },
+          {
+            "type": "text",
+            "text": "> "
+          }
+        ],
+        "isError": false
+      }
+    },
+    {
+      "tool": "write_stdin",
+      "input": "1+1",
+      "response": {
+        "content": [
+          {
+            "type": "text",
+            "text": "[1] 2\n"
+          },
+          {
+            "type": "text",
+            "text": "> "
+          }
+        ],
+        "isError": false
+      }
+    }
+  ]
+}

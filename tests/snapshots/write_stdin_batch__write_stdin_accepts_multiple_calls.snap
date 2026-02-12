@@ -1,0 +1,49 @@
+---
+source: tests/write_stdin_batch.rs
+expression: snapshot.render()
+---
+== session: list_inputs ==
+-- step 1 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "x <- 1\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}
+-- step 2 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "x + 1\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[1] 2"
+    },
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}

@@ -1,0 +1,4 @@
+# [mcp_servers.mcp-console]
+# command = "/Users/tomasz/github/t-kalinowski/mcp-console/target/debug/mcp-console"
+# cwd = "/Users/tomasz/github/t-kalinowski/mcp-console"
+# env = { MCP_CONSOLE_DEBUG_STARTUP = "1", MCP_CONSOLE_DEBUG_STARTUP_FILE = "mcp-console-startup.log" }

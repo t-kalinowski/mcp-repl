@@ -1,0 +1,50 @@
+---
+source: tests/plot_images.rs
+assertion_line: 145
+expression: serialized
+---
+{
+  "steps": [
+    {
+      "tool": "write_stdin",
+      "input": "par(mfrow = c(2, 1)); plot(1:10); plot(10:1)",
+      "response": {
+        "content": [
+          {
+            "type": "image",
+            "data": "blake3:709934cb4985dce96f6d6cf437d06f422027aa525901182b6b5c3e76167d6128",
+            "mimeType": "image/png",
+            "_meta": {
+              "mcpConsole": {
+                "imageId": "plot-2",
+                "isNewPage": false
+              }
+            }
+          },
+          {
+            "type": "text",
+            "text": "> "
+          }
+        ],
+        "isError": false
+      }
+    },
+    {
+      "tool": "write_stdin",
+      "input": "1+1",
+      "response": {
+        "content": [
+          {
+            "type": "text",
+            "text": "[1] 2\n"
+          },
+          {
+            "type": "text",
+            "text": "> "
+          }
+        ],
+        "isError": false
+      }
+    }
+  ]
+}

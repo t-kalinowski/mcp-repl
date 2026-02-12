@@ -1,0 +1,135 @@
+mod common;
+
+use common::{McpSnapshot, TestResult};
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshots_restart_and_interrupt_with_plots() -> TestResult<()> {
+    let mut snapshot = McpSnapshot::new();
+
+    snapshot
+        .session(
+            "restart_interrupt",
+            mcp_script! {
+                write_stdin(r#"
+set.seed(1)
+plot(1:5, type = "l")
+"#, timeout = 10.0);
+                write_stdin(r#"
+plot(5:1, type = "l")
+cat("plots_done\n")
+"#, timeout = 10.0);
+                write_stdin("\u{4}");
+                write_stdin("1+1", timeout = 10.0);
+                write_stdin("Sys.sleep(5)", timeout = 0.2);
+                write_stdin("\u{3}", timeout = 5.0);
+                write_stdin("1+1", timeout = 10.0);
+            },
+        )
+        .await?;
+
+    insta::assert_snapshot!(
+        "snapshots_restart_and_interrupt_with_plots",
+        snapshot.render()
+    );
+    insta::with_settings!({ snapshot_suffix => "transcript" }, {
+        insta::assert_snapshot!(
+            "snapshots_restart_and_interrupt_with_plots",
+            snapshot.render_transcript()
+        );
+    });
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshots_browser_prompt_and_continue() -> TestResult<()> {
+    let mut snapshot = McpSnapshot::new();
+
+    snapshot
+        .session(
+            "browser_prompt",
+            mcp_script! {
+                write_stdin("browser()", timeout = 10.0);
+                write_stdin("c", timeout = 10.0);
+                write_stdin("1+1", timeout = 10.0);
+            },
+        )
+        .await?;
+
+    insta::assert_snapshot!("snapshots_browser_prompt_and_continue", snapshot.render());
+    insta::with_settings!({ snapshot_suffix => "transcript" }, {
+        insta::assert_snapshot!(
+            "snapshots_browser_prompt_and_continue",
+            snapshot.render_transcript()
+        );
+    });
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshots_truncation_notice_tail() -> TestResult<()> {
+    let mut snapshot = McpSnapshot::new();
+
+    let big_output = r#"
+cat(paste(rep("x", 2200000), collapse = ""))
+cat("\nEND\n")
+"#;
+
+    snapshot
+        .session(
+            "truncation_tail",
+            mcp_script! {
+                write_stdin(big_output, timeout = 20.0);
+                write_stdin("tail 8k", timeout = 10.0);
+            },
+        )
+        .await?;
+
+    insta::assert_snapshot!("snapshots_truncation_notice_tail", snapshot.render());
+    insta::with_settings!({ snapshot_suffix => "transcript" }, {
+        insta::assert_snapshot!(
+            "snapshots_truncation_notice_tail",
+            snapshot.render_transcript()
+        );
+    });
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn snapshots_pager_hits_with_images() -> TestResult<()> {
+    let mut snapshot = McpSnapshot::new();
+
+    let output = r##"
+set.seed(1)
+cat("# Title\n")
+for (i in 1:60) cat("alpha line ", i, "\n", sep = "")
+plot(1:5, type = "l")
+for (i in 1:60) cat("beta line ", i, "\n", sep = "")
+plot(5:1, type = "l")
+for (i in 1:60) cat("gamma line ", i, "\n", sep = "")
+"##;
+
+    snapshot
+        .session(
+            "pager_hits_images",
+            mcp_script! {
+                write_stdin(output, timeout = 10.0);
+                write_stdin("hits alpha", timeout = 10.0);
+                write_stdin("seek 0", timeout = 10.0);
+                write_stdin("hits beta", timeout = 10.0);
+            },
+        )
+        .await?;
+
+    insta::assert_snapshot!("snapshots_pager_hits_with_images", snapshot.render());
+    insta::with_settings!({ snapshot_suffix => "transcript" }, {
+        insta::assert_snapshot!(
+            "snapshots_pager_hits_with_images",
+            snapshot.render_transcript()
+        );
+    });
+
+    Ok(())
+}

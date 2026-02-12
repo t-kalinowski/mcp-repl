@@ -1,0 +1,111 @@
+use std::io::Read;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+#[cfg(target_os = "macos")]
+fn sandbox_exec_available() -> bool {
+    // Mirror tests/common/mod.rs: sandbox-exec may exist but be unusable (status 71).
+    if std::env::var_os("CODEX_SANDBOX").is_some() {
+        return false;
+    }
+    Command::new("/usr/bin/sandbox-exec")
+        .args(["-p", "(version 1)", "--", "/usr/bin/true"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn resolve_mcp_console_path() -> TestResult<PathBuf> {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-console") {
+        return Ok(PathBuf::from(path));
+    }
+
+    let mut path = std::env::current_exe()?;
+    path.pop();
+    path.pop();
+    path.push("mcp-console");
+    if cfg!(windows) {
+        path.set_extension("exe");
+    }
+
+    if path.exists() {
+        Ok(path)
+    } else {
+        Err("unable to locate mcp-console test binary".into())
+    }
+}
+
+#[test]
+fn debug_repl_prints_initial_prompt() -> TestResult<()> {
+    let exe = resolve_mcp_console_path()?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("--debug-repl");
+    #[cfg(target_os = "macos")]
+    if !sandbox_exec_available() {
+        cmd.arg("--sandbox-state").arg("danger-full-access");
+    }
+    let mut child = cmd
+        .env("MCP_CONSOLE_REPL_IMAGES", "0")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+
+    let mut stdout = child.stdout.take().ok_or("missing stdout")?;
+    let (tx, rx) = mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        loop {
+            match stdout.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(buf[..n].to_vec()).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut seen = Vec::new();
+    let mut saw_prompt = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remaining.min(Duration::from_millis(250))) {
+            Ok(chunk) => {
+                seen.extend_from_slice(&chunk);
+                if String::from_utf8_lossy(&seen).contains("> ") {
+                    saw_prompt = true;
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // keep waiting
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+
+    drop(child.stdin.take());
+    let _ = child.kill();
+    let _ = child.wait();
+
+    let output = String::from_utf8_lossy(&seen);
+    assert!(
+        saw_prompt && output.contains("> "),
+        "expected initial \"> \" prompt in stdout, got: {output:?}"
+    );
+    Ok(())
+}

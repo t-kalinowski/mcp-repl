@@ -1,0 +1,29 @@
+---
+source: tests/server_smoke.rs
+expression: snapshot.render()
+---
+== session: default ==
+-- step 1 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "1+1\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[1] 2"
+    },
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}

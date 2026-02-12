@@ -1,0 +1,7 @@
+/target
+/deps
+mcp-console-startup.log
+.Rhistory
+.Rproj.user
+.venv
+/eval

@@ -1,0 +1,109 @@
+---
+source: tests/pager.rs
+expression: snapshot.render()
+---
+== session: default ==
+-- step 1 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "cat('# Title\\n\\n## Alpha\\n'); for (i in 1:20) cat(sprintf('alpha line %02d foo\\n', i)); cat('\\n## Beta\\n'); for (i in 1:20) cat(sprintf('beta line %02d foo\\n', i))\n",
+    "timeout": 30.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "# Title\n\n## Alpha\nalpha line 01 foo\nalpha line 02 foo\nalpha line 03 foo\nalpha line 04 foo\nalpha line 05 foo\nalpha line 06 foo\nalpha line 07 foo\nalpha line 08 foo\nalpha line 09 foo\nalpha line 10 foo\nalpha line 11 foo\nalpha line 12 foo\nalpha line 13 foo\nalpha line 14 foo\nalpha line 15 foo"
+    },
+    {
+      "type": "text",
+      "text": "--More-- (2p, 39.6%, @0..288/727)"
+    }
+  ]
+}
+-- step 2 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": ":matches foo\n",
+    "timeout": 30.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[mcp-console:pager] matches: 25 (limit 50); use `matches -n all` or `seek @OFFSET` to jump"
+    },
+    {
+      "type": "text",
+      "text": "#1 @288 Title > Alpha | alpha line 16 foo\n#2 @306 Title > Alpha | alpha line 17 foo\n#3 @324 Title > Alpha | alpha line 18 foo\n#4 @342 Title > Alpha | alpha line 19 foo\n#5 @360 Title > Alpha | alpha line 20 foo\n#6 @387 Title > Beta | beta line 01 foo\n#7 @404 Title > Beta | beta line 02 foo\n#8 @421 Title > Beta | beta line 03 foo\n#9 @438 Title > Beta | beta line 04 foo\n#10 @455 Title > Beta | beta line 05 foo\n#11 @472 Title > Beta | beta line 06 foo\n#12 @489 Title > Beta | beta line 07 foo\n#13 @506 Title > Beta | beta line 08 foo\n#14 @523 Title > Beta | beta line 09 foo\n#15 @540 Title > Beta | beta line 10 foo\n#16 @557 Title > Beta | beta line 11 foo\n#17 @574 Title > Beta | beta line 12 foo\n#18 @591 Title > Beta | beta line 13 foo\n#19 @608 Title > Beta | beta line 14 foo\n#20 @625 Title > Beta | beta line 15 foo\n#21 @642 Title > Beta | beta line 16 foo\n#22 @659 Title > Beta | beta line 17 foo\n#23 @676 Title > Beta | beta line 18 foo\n#24 @693 Title > Beta | beta line 19 foo\n#25 @710 Title > Beta | beta line 20 foo"
+    },
+    {
+      "type": "text",
+      "text": "--More-- (2p, 39.6%, @0..288/727)"
+    }
+  ]
+}
+-- step 3 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": ":matches -C 1 foo\n",
+    "timeout": 30.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[mcp-console:pager] matches: 25 (limit 50); use `matches -n all` or `seek @OFFSET` to jump"
+    },
+    {
+      "type": "text",
+      "text": "#1 @288 Title > Alpha\n  > alpha line 16 foo\n    alpha line 17 foo\n#2 @306 Title > Alpha\n    alpha line 16 foo\n  > alpha line 17 foo\n    alpha line 18 foo\n#3 @324 Title > Alpha\n    alpha line 17 foo\n  > alpha line 18 foo\n    alpha line 19 foo\n#4 @342 Title > Alpha\n    alpha line 18 foo\n  > alpha line 19 foo\n    alpha line 20 foo\n#5 @360 Title > Alpha\n    alpha line 19 foo\n  > alpha line 20 foo\n    \n#6 @387 Title > Beta\n    ## Beta\n  > beta line 01 foo\n    beta line 02 foo\n#7 @404 Title > Beta\n    beta line 01 foo\n  > beta line 02 foo\n    beta line 03 foo\n#8 @421 Title > Beta\n    beta line 02 foo\n  > beta line 03 foo\n    beta line 04 foo\n#9 @438 Title > Beta\n    beta line 03 foo\n  > beta line 04 foo\n    beta line 05 foo\n#10 @455 Title > Beta\n    beta line 04 foo\n  > beta line 05 foo\n    beta line 06 foo\n#11 @472 Title > Beta\n    beta line 05 foo\n  > beta line 06 foo\n    beta line 07 foo\n#12 @489 Title > Beta\n    beta line 06 foo\n  > beta line 07 foo\n    beta line 08 foo\n#13 @506 Title > Beta\n    beta line 07 foo\n  > beta line 08 foo\n    beta line 09 foo\n#14 @523 Title > Beta\n    beta line 08 foo\n  > beta line 09 foo\n    beta line 10 foo\n#15 @540 Title > Beta\n    beta line 09 foo\n  > beta line 10 foo\n    beta line 11 foo\n#16 @557 Title > Beta\n    beta line 10 foo\n  > beta line 11 foo\n    beta line 12 foo\n#17 @574 Title > Beta\n    beta line 11 foo\n  > beta line 12 foo\n    beta line 13 foo\n#18 @591 Title > Beta\n    beta line 12 foo\n  > beta line 13 foo\n    beta line 14 foo\n#19 @608 Title > Beta\n    beta line 13 foo\n  > beta line 14 foo\n    beta line 15 foo\n#20 @625 Title > Beta\n    beta line 14 foo\n  > beta line 15 foo\n    beta line 16 foo\n#21 @642 Title > Beta\n    beta line 15 foo\n  > beta line 16 foo\n    beta line 17 foo\n#22 @659 Title > Beta\n    beta line 16 foo\n  > beta line 17 foo\n    beta line 18 foo\n#23 @676 Title > Beta\n    beta line 17 foo\n  > beta line 18 foo\n    beta line 19 foo\n#24 @693 Title > Beta\n    beta line 18 foo\n  > beta line 19 foo\n    beta line 20 foo\n#25 @710 Title > Beta\n    beta line 19 foo\n  > beta line 20 foo"
+    },
+    {
+      "type": "text",
+      "text": "--More-- (2p, 39.6%, @0..288/727)"
+    }
+  ]
+}
+-- step 4 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": ":q\n",
+    "timeout": 30.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "(END, 39.6%, @0..288/727)"
+    },
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}

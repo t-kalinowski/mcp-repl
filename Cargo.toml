@@ -1,0 +1,56 @@
+[package]
+name = "mcp-console"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "MCP server exposing a long-lived interactive console (R or Python backend) over stdio."
+repository = "https://github.com/t-kalinowski/mcp-console"
+license = "Apache-2.0"
+
+[dependencies]
+ctor = "0.6.3"
+base64 = "0.22.1"
+harp = { git = "https://github.com/t-kalinowski/ark" }
+htmd = "0.5"
+libc = "0.2"
+libr = { git = "https://github.com/t-kalinowski/ark" }
+memchr = "2.8.0"
+regex-lite = "0.1"
+rmcp = { version = "0.15.0", features = ["client", "transport-child-process", "transport-io"] }
+schemars = "1.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sysinfo = "0.38.1"
+tempfile = "3.25.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+toml_edit = "0.25.0"
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4.4"
+seccompiler = "0.5.0"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+url = "2.5.8"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+blake3 = "1.8.3"
+insta = { version = "1.46.3", features = ["yaml"] }
+portable-pty = "0.9.0"
+tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+vt100 = "0.16.2"
+
+[features]
+echo-heuristics = []
+
+[profile.dev.package]
+insta.opt-level = 3
+similar.opt-level = 3

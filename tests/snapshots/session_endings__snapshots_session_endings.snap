@@ -1,0 +1,417 @@
+---
+source: tests/session_endings.rs
+expression: snapshot.render()
+---
+== session: restart_timeout_zero ==
+-- step 1 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "x <- 1\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}
+-- step 2 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "\u0004\n",
+    "timeout": 0.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[mcp-console] new session started"
+    }
+  ]
+}
+-- step 3 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "print(exists(\"x\"))\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[1] FALSE"
+    },
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}
+
+== session: restart_timeout_thirty ==
+-- step 1 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "x <- 1\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}
+-- step 2 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "\u0004\n",
+    "timeout": 30.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[mcp-console] new session started"
+    }
+  ]
+}
+-- step 3 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "print(exists(\"x\"))\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[1] FALSE"
+    },
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}
+
+== session: eof_input ==
+-- step 1 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "\u0004\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[mcp-console] new session started"
+    }
+  ]
+}
+-- step 2 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "1+1\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[1] 2"
+    },
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}
+
+== session: eof_then_remaining_input_same_call ==
+-- step 1 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "\u0004\n1+1\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[1] 2"
+    },
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}
+
+== session: quit_no ==
+-- step 1 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "x <- 1\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}
+-- step 2 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "quit(\"no\")\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "> quit(\"no\")"
+    },
+    {
+      "type": "text",
+      "text": "worker error: worker protocol error: ipc disconnected while waiting for request completion"
+    }
+  ]
+}
+-- step 3 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "1+1\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[1] 2"
+    },
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}
+
+== session: quit_default ==
+-- step 1 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "x <- 1\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}
+-- step 2 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "quit()\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "> quit()"
+    },
+    {
+      "type": "text",
+      "text": "worker error: worker protocol error: ipc disconnected while waiting for request completion"
+    }
+  ]
+}
+-- step 3 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "1+1\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[1] 2"
+    },
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}
+
+== session: quit_yes ==
+-- step 1 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "setwd(tempdir()); x <- 1\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}
+-- step 2 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "quit(\"yes\")\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "> quit(\"yes\")"
+    },
+    {
+      "type": "text",
+      "text": "worker error: worker protocol error: ipc disconnected while waiting for request completion"
+    }
+  ]
+}
+-- step 3 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "1+1\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[1] 2"
+    },
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}

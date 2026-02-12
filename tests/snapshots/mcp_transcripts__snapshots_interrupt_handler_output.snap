@@ -1,0 +1,77 @@
+---
+source: tests/mcp_transcripts.rs
+expression: snapshot.render()
+---
+== session: interrupt_handler ==
+-- step 1 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "tryCatch({ Sys.sleep(10000000) }, interrupt = function(e) cat(\"interrupt received\\n\"))\n",
+    "timeout": 0.2
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "> tryCatch({ Sys.sleep(10000000) }, interrupt = function(e) cat(\"interrupt received\\n\"))"
+    },
+    {
+      "type": "text",
+      "text": "<<console status: busy, write_stdin timeout reached; elapsed_ms=200>>"
+    }
+  ]
+}
+-- step 2 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "\u0003\n",
+    "timeout": 5.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "interrupt received"
+    },
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}
+-- step 3 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "1+1\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[1] 2"
+    },
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}

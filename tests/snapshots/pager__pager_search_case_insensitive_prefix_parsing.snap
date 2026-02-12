@@ -1,0 +1,129 @@
+---
+source: tests/pager.rs
+expression: snapshot.render()
+---
+== session: default ==
+-- step 1 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))\n",
+    "timeout": 30.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "line0001 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    {
+      "type": "text",
+      "text": "--More-- (140p, 0.5%, @0..210/42000)"
+    }
+  ]
+}
+-- step 2 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": ":where -i LINE01\n",
+    "timeout": 30.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[mcp-console:pager] next match is ~98 page(s) ahead: use /i LINE01 or `skip 98`"
+    },
+    {
+      "type": "text",
+      "text": "--More-- (140p, 0.5%, @210/42000)"
+    }
+  ]
+}
+-- step 3 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": ":/i LINE01\n",
+    "timeout": 30.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[mcp-console:pager] elided output (already shown): @210..20790"
+    },
+    {
+      "type": "text",
+      "text": "line0100 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    {
+      "type": "text",
+      "text": "--More-- (70p, 50.0%, @20790..21000/42000)"
+    }
+  ]
+}
+-- step 4 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": ":/iLINE01\n",
+    "timeout": 30.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[mcp-console:pager] pattern not found (search is forward-only over unseen output; use `:matches -n all iLINE01` to locate offsets, then `:seek @OFFSET` to jump)"
+    },
+    {
+      "type": "text",
+      "text": "--More-- (70p, 50.0%, @21000/42000)"
+    }
+  ]
+}
+-- step 5 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": ":q\n",
+    "timeout": 30.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "(END, 50.0%, @21000/42000)"
+    },
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}

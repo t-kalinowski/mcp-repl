@@ -1,0 +1,163 @@
+---
+source: tests/pager.rs
+expression: snapshot.render_transcript()
+---
+== session: default ==
+1) write_stdin timeout=30.0
+>>> cat('# Title\n\n## Alpha\n'); for (i in 1:20) cat(sprintf('alpha line %02d foo\n', i)); cat('\n## Beta\n'); for (i in 1:20) cat(sprintf('beta line %02d foo\n', i))
+<<< # Title
+<<< 
+<<< ## Alpha
+<<< alpha line 01 foo
+<<< alpha line 02 foo
+<<< alpha line 03 foo
+<<< alpha line 04 foo
+<<< alpha line 05 foo
+<<< alpha line 06 foo
+<<< alpha line 07 foo
+<<< alpha line 08 foo
+<<< alpha line 09 foo
+<<< alpha line 10 foo
+<<< alpha line 11 foo
+<<< alpha line 12 foo
+<<< alpha line 13 foo
+<<< alpha line 14 foo
+<<< alpha line 15 foo
+<<< --More-- (2p, 39.6%, @0..288/727)
+
+2) write_stdin timeout=30.0
+>>> :matches foo
+<<< [mcp-console:pager] matches: 25 (limit 50); use `matches -n all` or `seek @OFFSET` to jump
+<<< #1 @288 Title > Alpha | alpha line 16 foo
+<<< #2 @306 Title > Alpha | alpha line 17 foo
+<<< #3 @324 Title > Alpha | alpha line 18 foo
+<<< #4 @342 Title > Alpha | alpha line 19 foo
+<<< #5 @360 Title > Alpha | alpha line 20 foo
+<<< #6 @387 Title > Beta | beta line 01 foo
+<<< #7 @404 Title > Beta | beta line 02 foo
+<<< #8 @421 Title > Beta | beta line 03 foo
+<<< #9 @438 Title > Beta | beta line 04 foo
+<<< #10 @455 Title > Beta | beta line 05 foo
+<<< #11 @472 Title > Beta | beta line 06 foo
+<<< #12 @489 Title > Beta | beta line 07 foo
+<<< #13 @506 Title > Beta | beta line 08 foo
+<<< #14 @523 Title > Beta | beta line 09 foo
+<<< #15 @540 Title > Beta | beta line 10 foo
+<<< #16 @557 Title > Beta | beta line 11 foo
+<<< #17 @574 Title > Beta | beta line 12 foo
+<<< #18 @591 Title > Beta | beta line 13 foo
+<<< #19 @608 Title > Beta | beta line 14 foo
+<<< #20 @625 Title > Beta | beta line 15 foo
+<<< #21 @642 Title > Beta | beta line 16 foo
+<<< #22 @659 Title > Beta | beta line 17 foo
+<<< #23 @676 Title > Beta | beta line 18 foo
+<<< #24 @693 Title > Beta | beta line 19 foo
+<<< #25 @710 Title > Beta | beta line 20 foo
+<<< --More-- (2p, 39.6%, @0..288/727)
+
+3) write_stdin timeout=30.0
+>>> :matches -C 1 foo
+<<< [mcp-console:pager] matches: 25 (limit 50); use `matches -n all` or `seek @OFFSET` to jump
+<<< #1 @288 Title > Alpha
+<<<   > alpha line 16 foo
+<<<     alpha line 17 foo
+<<< #2 @306 Title > Alpha
+<<<     alpha line 16 foo
+<<<   > alpha line 17 foo
+<<<     alpha line 18 foo
+<<< #3 @324 Title > Alpha
+<<<     alpha line 17 foo
+<<<   > alpha line 18 foo
+<<<     alpha line 19 foo
+<<< #4 @342 Title > Alpha
+<<<     alpha line 18 foo
+<<<   > alpha line 19 foo
+<<<     alpha line 20 foo
+<<< #5 @360 Title > Alpha
+<<<     alpha line 19 foo
+<<<   > alpha line 20 foo
+<<<     
+<<< #6 @387 Title > Beta
+<<<     ## Beta
+<<<   > beta line 01 foo
+<<<     beta line 02 foo
+<<< #7 @404 Title > Beta
+<<<     beta line 01 foo
+<<<   > beta line 02 foo
+<<<     beta line 03 foo
+<<< #8 @421 Title > Beta
+<<<     beta line 02 foo
+<<<   > beta line 03 foo
+<<<     beta line 04 foo
+<<< #9 @438 Title > Beta
+<<<     beta line 03 foo
+<<<   > beta line 04 foo
+<<<     beta line 05 foo
+<<< #10 @455 Title > Beta
+<<<     beta line 04 foo
+<<<   > beta line 05 foo
+<<<     beta line 06 foo
+<<< #11 @472 Title > Beta
+<<<     beta line 05 foo
+<<<   > beta line 06 foo
+<<<     beta line 07 foo
+<<< #12 @489 Title > Beta
+<<<     beta line 06 foo
+<<<   > beta line 07 foo
+<<<     beta line 08 foo
+<<< #13 @506 Title > Beta
+<<<     beta line 07 foo
+<<<   > beta line 08 foo
+<<<     beta line 09 foo
+<<< #14 @523 Title > Beta
+<<<     beta line 08 foo
+<<<   > beta line 09 foo
+<<<     beta line 10 foo
+<<< #15 @540 Title > Beta
+<<<     beta line 09 foo
+<<<   > beta line 10 foo
+<<<     beta line 11 foo
+<<< #16 @557 Title > Beta
+<<<     beta line 10 foo
+<<<   > beta line 11 foo
+<<<     beta line 12 foo
+<<< #17 @574 Title > Beta
+<<<     beta line 11 foo
+<<<   > beta line 12 foo
+<<<     beta line 13 foo
+<<< #18 @591 Title > Beta
+<<<     beta line 12 foo
+<<<   > beta line 13 foo
+<<<     beta line 14 foo
+<<< #19 @608 Title > Beta
+<<<     beta line 13 foo
+<<<   > beta line 14 foo
+<<<     beta line 15 foo
+<<< #20 @625 Title > Beta
+<<<     beta line 14 foo
+<<<   > beta line 15 foo
+<<<     beta line 16 foo
+<<< #21 @642 Title > Beta
+<<<     beta line 15 foo
+<<<   > beta line 16 foo
+<<<     beta line 17 foo
+<<< #22 @659 Title > Beta
+<<<     beta line 16 foo
+<<<   > beta line 17 foo
+<<<     beta line 18 foo
+<<< #23 @676 Title > Beta
+<<<     beta line 17 foo
+<<<   > beta line 18 foo
+<<<     beta line 19 foo
+<<< #24 @693 Title > Beta
+<<<     beta line 18 foo
+<<<   > beta line 19 foo
+<<<     beta line 20 foo
+<<< #25 @710 Title > Beta
+<<<     beta line 19 foo
+<<<   > beta line 20 foo
+<<< --More-- (2p, 39.6%, @0..288/727)
+
+4) write_stdin timeout=30.0
+>>> :q
+<<< (END, 39.6%, @0..288/727)

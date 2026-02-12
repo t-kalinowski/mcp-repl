@@ -1,0 +1,11 @@
+---
+source: tests/write_stdin_batch.rs
+expression: snapshot.render_transcript()
+---
+== session: list_inputs ==
+1) write_stdin timeout=10.0
+>>> x <- 1
+
+2) write_stdin timeout=10.0
+>>> x + 1
+<<< [1] 2

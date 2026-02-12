@@ -1,0 +1,66 @@
+---
+source: tests/mcp_transcripts.rs
+expression: snapshot.render_transcript()
+---
+== session: tempdir_session ==
+1) write_stdin timeout=10.0
+>>> 
+>>> cat("TMPDIR_SET=", nzchar(Sys.getenv("TMPDIR")), "\n", sep = "")
+>>> cat("TMPDIR_MATCH=", Sys.getenv("TMPDIR") == Sys.getenv("MCP_CONSOLE_R_SESSION_TMPDIR"), "\n", sep = "")
+>>> cat("TEMPDIR_UNDER_TMPDIR=", startsWith(tempdir(), Sys.getenv("TMPDIR")), "\n", sep = "")
+>>> marker <- file.path(tempdir(), "mcp-console-snapshot.txt")
+>>> tryCatch({
+>>>   writeLines("foo", marker)
+>>>   cat("TEMPDIR_MARKER_OK\n")
+>>> }, error = function(e) {
+>>>   message("TEMPDIR_MARKER_ERROR:", conditionMessage(e))
+>>> })
+>>> tf <- tempfile()
+>>> tryCatch({
+>>>   writeLines("bar", tf)
+>>>   cat("TEMPFILE_OK\n")
+>>> }, error = function(e) {
+>>>   message("TEMPFILE_ERROR:", conditionMessage(e))
+>>> })
+>>> unlink(tf)
+>>> cat("TEMPDIR_LIST=", paste(list.files(tempdir()), collapse = ","), "\n", sep = "")
+>>> root_marker <- file.path(Sys.getenv("TMPDIR"), "mcp-console-snapshot-root.txt")
+>>> tryCatch({
+>>>   writeLines("root", root_marker)
+>>>   cat("ROOT_MARKER_OK\n")
+>>> }, error = function(e) {
+>>>   message("ROOT_MARKER_ERROR:", conditionMessage(e))
+>>> })
+>>> cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
+<<< [mcp-console] echoed input elided: 2 lines (70 bytes); head: > ; tail: > cat("TMPDIR_SET=", nzchar(Sys.getenv("TMPDIR")), "\n", sep = "")
+<<< TMPDIR_SET=TRUE
+<<< TMPDIR_MATCH=TRUE
+<<< --More-- (3p, 24.8%, @0..279/1125)
+
+2) write_stdin
+>>> 
+<<< [mcp-console] new session started
+
+3) write_stdin timeout=10.0
+>>> 
+>>> root_marker <- file.path(Sys.getenv("TMPDIR"), "mcp-console-snapshot-root.txt")
+>>> cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
+>>> cat("TEMPDIR_LIST=", paste(list.files(tempdir()), collapse = ","), "\n", sep = "")
+>>> cat("TEMPDIR_UNDER_TMPDIR=", startsWith(tempdir(), Sys.getenv("TMPDIR")), "\n", sep = "")
+<<< [mcp-console] echoed input elided: 3 lines (156 bytes); head: > ; tail: > cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
+<<< ROOT_MARKER_EXISTS=FALSE
+<<< TEMPDIR_LIST=
+
+4) write_stdin
+>>> 
+<<< [mcp-console] new session started
+
+5) write_stdin timeout=10.0
+>>> 
+>>> root_marker <- file.path(Sys.getenv("TMPDIR"), "mcp-console-snapshot-root.txt")
+>>> cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
+>>> cat("TEMPDIR_LIST=", paste(list.files(tempdir()), collapse = ","), "\n", sep = "")
+>>> cat("TEMPDIR_UNDER_TMPDIR=", startsWith(tempdir(), Sys.getenv("TMPDIR")), "\n", sep = "")
+<<< [mcp-console] echoed input elided: 3 lines (156 bytes); head: > ; tail: > cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
+<<< ROOT_MARKER_EXISTS=FALSE
+<<< TEMPDIR_LIST=

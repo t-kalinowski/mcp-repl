@@ -1,0 +1,53 @@
+---
+source: tests/refactor_coverage.rs
+expression: snapshot.render()
+---
+== session: truncation_tail ==
+-- step 1 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "\ncat(paste(rep(\"x\", 2200000), collapse = \"\"))\ncat(\"\\nEND\\n\")\n",
+    "timeout": 20.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    {
+      "type": "text",
+      "text": "--More-- (6978p, 0.0%, @0..300/2093526)"
+    }
+  ]
+}
+-- step 2 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "tail 8k\n",
+    "timeout": 10.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[mcp-console:pager] input blocked while pager is active: tail 8k (use :q to exit pager)"
+    },
+    {
+      "type": "text",
+      "text": "--More-- (6978p, 0.0%, @0..300/2093526)"
+    }
+  ]
+}

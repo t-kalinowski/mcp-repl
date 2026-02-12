@@ -1,0 +1,157 @@
+---
+source: tests/pager.rs
+expression: snapshot.render()
+---
+== session: default ==
+-- step 1 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": "line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) { suffix <- if (i == 25) \" r\" else if (i == 75) \"r \" else \"\"; cat(sprintf(\"line%04d %s%s\\n\", i, line, suffix)) }\n",
+    "timeout": 30.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "line0001 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+    },
+    {
+      "type": "text",
+      "text": "--More-- (140p, 0.4%, @0..210/42004)"
+    }
+  ]
+}
+-- step 2 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": ":where  r\n",
+    "timeout": 30.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[mcp-console:pager] next match is ~23 page(s) ahead: use / r or `skip 23`"
+    },
+    {
+      "type": "text",
+      "text": "--More-- (140p, 0.4%, @210/42004)"
+    }
+  ]
+}
+-- step 3 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": ":/ r\n",
+    "timeout": 30.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[mcp-console:pager] elided output (already shown): @210..5040"
+    },
+    {
+      "type": "text",
+      "text": "line0025 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx r"
+    },
+    {
+      "type": "text",
+      "text": "--More-- (123p, 12.5%, @5040..5252/42004)"
+    }
+  ]
+}
+-- step 4 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": ":where r \n",
+    "timeout": 30.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[mcp-console:pager] next match is ~49 page(s) ahead: use /r or `skip 49`"
+    },
+    {
+      "type": "text",
+      "text": "--More-- (123p, 12.5%, @5252/42004)"
+    }
+  ]
+}
+-- step 5 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": ":/r \n",
+    "timeout": 30.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "[mcp-console:pager] elided output (already shown): @5252..15542"
+    },
+    {
+      "type": "text",
+      "text": "line0075 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxr "
+    },
+    {
+      "type": "text",
+      "text": "--More-- (88p, 37.5%, @15542..15754/42004)"
+    }
+  ]
+}
+-- step 6 --
+call:
+{
+  "tool": "write_stdin",
+  "arguments": {
+    "chars": ":q\n",
+    "timeout": 30.0
+  }
+}
+response:
+{
+  "type": "tool_result",
+  "is_error": false,
+  "content": [
+    {
+      "type": "text",
+      "text": "(END, 37.5%, @15542..15754/42004)"
+    },
+    {
+      "type": "text",
+      "text": "> "
+    }
+  ]
+}

@@ -1,0 +1,43 @@
+---
+source: tests/refactor_coverage.rs
+expression: snapshot.render_transcript()
+---
+== session: pager_hits_images ==
+1) write_stdin timeout=10.0
+>>> 
+>>> set.seed(1)
+>>> cat("# Title\n")
+>>> for (i in 1:60) cat("alpha line ", i, "\n", sep = "")
+>>> plot(1:5, type = "l")
+>>> for (i in 1:60) cat("beta line ", i, "\n", sep = "")
+>>> plot(5:1, type = "l")
+>>> for (i in 1:60) cat("gamma line ", i, "\n", sep = "")
+<<< [mcp-console] echoed input elided: 3 lines (36 bytes); head: > ; tail: > cat("# Title\n")
+<<< # Title
+<<< alpha line 1
+<<< alpha line 2
+<<< alpha line 3
+<<< alpha line 4
+<<< alpha line 5
+<<< alpha line 6
+<<< alpha line 7
+<<< alpha line 8
+<<< alpha line 9
+<<< alpha line 10
+<<< alpha line 11
+<<< --More-- (14p, 10.3%, @0..299/2882)
+
+2) write_stdin timeout=10.0
+>>> hits alpha
+<<< [mcp-console:pager] input blocked while pager is active: hits alpha (use :q to exit pager)
+<<< --More-- (14p, 10.3%, @0..299/2882)
+
+3) write_stdin timeout=10.0
+>>> seek 0
+<<< [mcp-console:pager] input blocked while pager is active: seek 0 (use :q to exit pager)
+<<< --More-- (14p, 10.3%, @0..299/2882)
+
+4) write_stdin timeout=10.0
+>>> hits beta
+<<< [mcp-console:pager] input blocked while pager is active: hits beta (use :q to exit pager)
+<<< --More-- (14p, 10.3%, @0..299/2882)

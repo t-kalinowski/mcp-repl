@@ -1,0 +1,16 @@
+---
+source: tests/refactor_coverage.rs
+assertion_line: 56
+expression: snapshot.render_transcript()
+---
+== session: browser_prompt ==
+1) write_stdin timeout=10.0
+>>> browser()
+<<< Called from: top level 
+
+2) write_stdin timeout=10.0
+>>> c
+
+3) write_stdin timeout=10.0
+>>> 1+1
+<<< [1] 2

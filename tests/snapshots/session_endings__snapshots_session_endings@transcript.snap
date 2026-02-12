@@ -1,0 +1,78 @@
+---
+source: tests/session_endings.rs
+expression: snapshot.render_transcript()
+---
+== session: restart_timeout_zero ==
+1) write_stdin timeout=10.0
+>>> x <- 1
+
+2) write_stdin timeout=0.0
+>>> 
+<<< [mcp-console] new session started
+
+3) write_stdin timeout=10.0
+>>> print(exists("x"))
+<<< [1] FALSE
+
+== session: restart_timeout_thirty ==
+1) write_stdin timeout=10.0
+>>> x <- 1
+
+2) write_stdin timeout=30.0
+>>> 
+<<< [mcp-console] new session started
+
+3) write_stdin timeout=10.0
+>>> print(exists("x"))
+<<< [1] FALSE
+
+== session: eof_input ==
+1) write_stdin timeout=10.0
+>>> 
+<<< [mcp-console] new session started
+
+2) write_stdin timeout=10.0
+>>> 1+1
+<<< [1] 2
+
+== session: eof_then_remaining_input_same_call ==
+1) write_stdin timeout=10.0
+>>> 
+>>> 1+1
+<<< [1] 2
+
+== session: quit_no ==
+1) write_stdin timeout=10.0
+>>> x <- 1
+
+2) write_stdin timeout=10.0
+>>> quit("no")
+<<< worker error: worker protocol error: ipc disconnected while waiting for request completion
+
+3) write_stdin timeout=10.0
+>>> 1+1
+<<< [1] 2
+
+== session: quit_default ==
+1) write_stdin timeout=10.0
+>>> x <- 1
+
+2) write_stdin timeout=10.0
+>>> quit()
+<<< worker error: worker protocol error: ipc disconnected while waiting for request completion
+
+3) write_stdin timeout=10.0
+>>> 1+1
+<<< [1] 2
+
+== session: quit_yes ==
+1) write_stdin timeout=10.0
+>>> setwd(tempdir()); x <- 1
+
+2) write_stdin timeout=10.0
+>>> quit("yes")
+<<< worker error: worker protocol error: ipc disconnected while waiting for request completion
+
+3) write_stdin timeout=10.0
+>>> 1+1
+<<< [1] 2
