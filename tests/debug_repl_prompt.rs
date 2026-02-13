@@ -72,7 +72,7 @@ fn debug_repl_prints_initial_prompt() -> TestResult<()> {
             ),
             "expected unsupported IPC error on Windows, got: {stderr:?}"
         );
-        return Ok(());
+        Ok(())
     }
 
     #[cfg(not(target_family = "windows"))]
