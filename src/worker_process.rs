@@ -17,12 +17,12 @@ use crate::backend::Backend;
 use crate::input_protocol::format_input_frame_header;
 #[cfg(target_family = "unix")]
 use crate::ipc::{IPC_READ_FD_ENV, IPC_WRITE_FD_ENV};
-#[cfg(target_family = "unix")]
-use crate::ipc::{IpcHandlers, IpcPlotImage};
 use crate::ipc::{
     IpcEchoEvent, IpcHandle, IpcServer, IpcWaitError, ServerIpcConnection,
     ServerToWorkerIpcMessage, WorkerToServerIpcMessage,
 };
+#[cfg(target_family = "unix")]
+use crate::ipc::{IpcHandlers, IpcPlotImage};
 use crate::output_capture::{
     OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEventKind, OutputRange, OutputTimeline,
     ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,

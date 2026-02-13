@@ -1,7 +1,10 @@
+#[cfg(not(target_family = "windows"))]
 use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+#[cfg(not(target_family = "windows"))]
 use std::sync::mpsc;
+#[cfg(not(target_family = "windows"))]
 use std::time::{Duration, Instant};
 
 type TestResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -51,6 +54,7 @@ fn debug_repl_prints_initial_prompt() -> TestResult<()> {
     if !sandbox_exec_available() {
         cmd.arg("--sandbox-state").arg("danger-full-access");
     }
+    #[cfg_attr(target_family = "windows", allow(unused_mut))]
     let mut child = cmd
         .env("MCP_CONSOLE_REPL_IMAGES", "0")
         .stdin(Stdio::piped())
@@ -58,54 +62,70 @@ fn debug_repl_prints_initial_prompt() -> TestResult<()> {
         .stderr(Stdio::piped())
         .spawn()?;
 
-    let mut stdout = child.stdout.take().ok_or("missing stdout")?;
-    let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    std::thread::spawn(move || {
-        let mut buf = [0u8; 1024];
+    #[cfg(target_family = "windows")]
+    {
+        let output = child.wait_with_output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(
+                "IPC sideband requires Unix-style pipe handle inheritance; not supported on Windows"
+            ),
+            "expected unsupported IPC error on Windows, got: {stderr:?}"
+        );
+        return Ok(());
+    }
+
+    #[cfg(not(target_family = "windows"))]
+    {
+        let mut stdout = child.stdout.take().ok_or("missing stdout")?;
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1024];
+            loop {
+                match stdout.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut seen = Vec::new();
+        let mut saw_prompt = false;
         loop {
-            match stdout.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if tx.send(buf[..n].to_vec()).is_err() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match rx.recv_timeout(remaining.min(Duration::from_millis(250))) {
+                Ok(chunk) => {
+                    seen.extend_from_slice(&chunk);
+                    if String::from_utf8_lossy(&seen).contains("> ") {
+                        saw_prompt = true;
                         break;
                     }
                 }
-                Err(_) => break,
-            }
-        }
-    });
-
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let mut seen = Vec::new();
-    let mut saw_prompt = false;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            break;
-        }
-        match rx.recv_timeout(remaining.min(Duration::from_millis(250))) {
-            Ok(chunk) => {
-                seen.extend_from_slice(&chunk);
-                if String::from_utf8_lossy(&seen).contains("> ") {
-                    saw_prompt = true;
-                    break;
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    // keep waiting
                 }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // keep waiting
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
+
+        drop(child.stdin.take());
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let output = String::from_utf8_lossy(&seen);
+        assert!(
+            saw_prompt && output.contains("> "),
+            "expected initial \"> \" prompt in stdout, got: {output:?}"
+        );
+        Ok(())
     }
-
-    drop(child.stdin.take());
-    let _ = child.kill();
-    let _ = child.wait();
-
-    let output = String::from_utf8_lossy(&seen);
-    assert!(
-        saw_prompt && output.contains("> "),
-        "expected initial \"> \" prompt in stdout, got: {output:?}"
-    );
-    Ok(())
 }

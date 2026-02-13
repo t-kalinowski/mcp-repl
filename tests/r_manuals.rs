@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use common::TestResult;
 use rmcp::model::RawContent;
 

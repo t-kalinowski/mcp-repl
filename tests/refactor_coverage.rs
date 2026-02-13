@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 mod common;
 
 use common::{McpSnapshot, TestResult};

@@ -457,11 +457,7 @@ fn setup_r(args: &[String]) -> Result<(), String> {
         let (owned_args, mut c_args) = build_c_args_owned(args);
         let _ = R_MAIN_ARGS.set(owned_args);
         let mut c_args_len = c_args.len() as c_int;
-        R_common_command_line(
-            &mut c_args_len,
-            c_args.as_mut_ptr(),
-            params,
-        );
+        R_common_command_line(&mut c_args_len, c_args.as_mut_ptr(), params);
 
         (*params).R_Interactive = 1;
         (*params).CharacterMode = UImode_RGui;

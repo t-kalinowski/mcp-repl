@@ -1,9 +1,13 @@
 mod common;
 
+#[cfg(unix)]
 use common::TestResult;
+#[cfg(unix)]
 use rmcp::model::{CallToolResult, RawContent};
+#[cfg(unix)]
 use tokio::time::{Duration, Instant, sleep};
 
+#[cfg(unix)]
 fn result_text(result: &CallToolResult) -> String {
     result
         .content
@@ -16,6 +20,7 @@ fn result_text(result: &CallToolResult) -> String {
         .join("")
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn interrupt_unblocks_long_running_request() -> TestResult<()> {
     let mut session = common::spawn_server().await?;
@@ -60,6 +65,7 @@ async fn interrupt_unblocks_long_running_request() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_ctrl_c_prefix_interrupts_then_runs_remaining_input() -> TestResult<()> {
     let mut session = common::spawn_server().await?;
@@ -84,6 +90,7 @@ async fn write_stdin_ctrl_c_prefix_interrupts_then_runs_remaining_input() -> Tes
     Ok(())
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_ctrl_d_prefix_restarts_then_runs_remaining_input() -> TestResult<()> {
     let mut session = common::spawn_server().await?;

@@ -2074,7 +2074,14 @@ mod tests {
 
     #[test]
     fn session_temp_dir_rejects_outside_system_tmp() {
+        #[cfg(target_os = "windows")]
+        let outside = {
+            let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+            PathBuf::from(format!(r"{system_drive}\mcp-console-test"))
+        };
+        #[cfg(not(target_os = "windows"))]
         let base_tmp = std::env::temp_dir();
+        #[cfg(not(target_os = "windows"))]
         let outside = if base_tmp.starts_with("/tmp") {
             PathBuf::from("/var/mcp-console-test")
         } else {
