@@ -1,4 +1,4 @@
-#![cfg(target_os = "windows")]
+#![allow(unsafe_op_in_unsafe_fn)]
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -11,6 +11,7 @@ use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HLOCAL;
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::LUID;
 use windows_sys::Win32::Foundation::SetHandleInformation;
 use windows_sys::Win32::Foundation::WAIT_FAILED;
@@ -29,7 +30,6 @@ use windows_sys::Win32::Security::CreateWellKnownSid;
 use windows_sys::Win32::Security::GetLengthSid;
 use windows_sys::Win32::Security::GetTokenInformation;
 use windows_sys::Win32::Security::LookupPrivilegeValueW;
-use windows_sys::Win32::Security::OpenProcessToken;
 use windows_sys::Win32::Security::SID_AND_ATTRIBUTES;
 use windows_sys::Win32::Security::SetTokenInformation;
 use windows_sys::Win32::Security::TOKEN_ADJUST_DEFAULT;
@@ -56,6 +56,7 @@ use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::INFINITE;
+use windows_sys::Win32::System::Threading::OpenProcessToken;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
 use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
 use windows_sys::Win32::System::Threading::STARTUPINFOW;
@@ -155,7 +156,7 @@ pub fn run_sandboxed_command(
 
 unsafe fn create_job_kill_on_close() -> Result<HANDLE, String> {
     let h = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
-    if h == 0 {
+    if h.is_null() {
         return Err("CreateJobObjectW failed".to_string());
     }
     let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
@@ -197,7 +198,7 @@ unsafe fn create_restricted_token_for_policy(
         });
     }
 
-    let mut new_token: HANDLE = 0;
+    let mut new_token: HANDLE = std::ptr::null_mut();
     let sid_count = restricted_sids.len() as u32;
     let sid_ptr = if restricted_sids.is_empty() {
         std::ptr::null_mut()
@@ -271,7 +272,7 @@ unsafe fn create_process_as_user(
 unsafe fn ensure_inheritable_stdio(startup_info: &mut STARTUPINFOW) -> Result<(), String> {
     for std_handle_kind in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
         let std_handle = GetStdHandle(std_handle_kind);
-        if std_handle == 0 {
+        if std_handle.is_null() || std_handle == INVALID_HANDLE_VALUE {
             return Err(format!(
                 "GetStdHandle failed: {}",
                 std::io::Error::last_os_error()
@@ -456,7 +457,7 @@ unsafe fn get_current_token_for_restriction() -> Result<HANDLE, String> {
         | TOKEN_ADJUST_DEFAULT
         | TOKEN_ADJUST_SESSIONID
         | TOKEN_ADJUST_PRIVILEGES;
-    let mut token: HANDLE = 0;
+    let mut token: HANDLE = std::ptr::null_mut();
     let ok = OpenProcessToken(GetCurrentProcess(), desired_access, &mut token);
     if ok == 0 {
         return Err(format!("OpenProcessToken failed: {}", GetLastError()));
@@ -559,7 +560,7 @@ unsafe fn get_logon_sid_bytes(token: HANDLE) -> Result<Vec<u8>, String> {
         );
         if ok != 0 {
             let linked = std::ptr::read_unaligned(linked_buf.as_ptr() as *const TokenLinkedToken);
-            if linked.linked_token != 0 {
+            if !linked.linked_token.is_null() {
                 let result = scan_token_groups_for_logon(linked.linked_token);
                 CloseHandle(linked.linked_token);
                 if let Some(logon_sid) = result {
