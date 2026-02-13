@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -123,10 +124,36 @@ fn default_claude_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 fn home_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let Some(home) = env::var_os("HOME") else {
-        return Err("cannot determine home directory (HOME is unset)".into());
-    };
-    Ok(PathBuf::from(home))
+    resolve_home_dir_from_env(
+        env::var_os("HOME"),
+        env::var_os("USERPROFILE"),
+        env::var_os("HOMEDRIVE"),
+        env::var_os("HOMEPATH"),
+    )
+    .ok_or_else(|| {
+        "cannot determine home directory (expected HOME, USERPROFILE, or HOMEDRIVE+HOMEPATH)".into()
+    })
+}
+
+fn resolve_home_dir_from_env(
+    home: Option<OsString>,
+    userprofile: Option<OsString>,
+    homedrive: Option<OsString>,
+    homepath: Option<OsString>,
+) -> Option<PathBuf> {
+    if let Some(home) = home.filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(home));
+    }
+
+    if let Some(userprofile) = userprofile.filter(|value| !value.is_empty()) {
+        return Some(PathBuf::from(userprofile));
+    }
+
+    let homedrive = homedrive.filter(|value| !value.is_empty())?;
+    let homepath = homepath.filter(|value| !value.is_empty())?;
+    let mut path = PathBuf::from(homedrive);
+    path.push(homepath);
+    Some(path)
 }
 
 fn resolve_claude_config_path(root: &Path) -> PathBuf {
@@ -267,5 +294,45 @@ mod tests {
         assert_eq!(args.len(), 2);
         assert_eq!(args.get(0).and_then(|v| v.as_str()), Some("--backend"));
         assert_eq!(args.get(1).and_then(|v| v.as_str()), Some("python"));
+    }
+
+    #[test]
+    fn resolve_home_dir_prefers_home() {
+        let resolved = resolve_home_dir_from_env(
+            Some(OsString::from("/tmp/home")),
+            Some(OsString::from("/tmp/userprofile")),
+            Some(OsString::from("C:")),
+            Some(OsString::from(r"\Users\kalin")),
+        );
+        assert_eq!(resolved, Some(PathBuf::from("/tmp/home")));
+    }
+
+    #[test]
+    fn resolve_home_dir_falls_back_to_userprofile() {
+        let resolved = resolve_home_dir_from_env(
+            None,
+            Some(OsString::from(r"C:\Users\kalin")),
+            Some(OsString::from("C:")),
+            Some(OsString::from(r"\Users\other")),
+        );
+        assert_eq!(resolved, Some(PathBuf::from(r"C:\Users\kalin")));
+    }
+
+    #[test]
+    fn resolve_home_dir_uses_homedrive_and_homepath_when_needed() {
+        let resolved = resolve_home_dir_from_env(
+            None,
+            None,
+            Some(OsString::from("C:")),
+            Some(OsString::from(r"\Users\kalin")),
+        )
+        .expect("home dir");
+        assert_eq!(resolved, PathBuf::from(r"C:\Users\kalin"));
+    }
+
+    #[test]
+    fn resolve_home_dir_returns_none_when_all_sources_missing() {
+        let resolved = resolve_home_dir_from_env(None, None, None, None);
+        assert!(resolved.is_none());
     }
 }
