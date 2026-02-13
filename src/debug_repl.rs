@@ -1,6 +1,8 @@
 use std::env;
 use std::io::{self, BufRead, Write};
+use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 use crate::backend::Backend;
 use crate::pager;
@@ -11,6 +13,8 @@ const DEFAULT_WRITE_STDIN_TIMEOUT: Duration = Duration::from_secs(60);
 const SAFETY_MARGIN: f64 = 1.05;
 const MIN_SERVER_GRACE: Duration = Duration::from_secs(1);
 const DEBUG_REPL_PAGE_CHARS: u64 = 300;
+const INITIAL_PROMPT_WAIT: Duration = Duration::from_secs(5);
+const INITIAL_PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 pub(crate) fn run(backend: Backend) -> Result<(), Box<dyn std::error::Error>> {
     ensure_debug_repl_page_size();
@@ -27,13 +31,7 @@ pub(crate) fn run(backend: Backend) -> Result<(), Box<dyn std::error::Error>> {
 
     let mut worker = WorkerManager::new(backend)?;
     worker.warm_start()?;
-    let reply = worker.write_stdin(
-        String::new(),
-        DEFAULT_WRITE_STDIN_TIMEOUT,
-        server_timeout,
-        None,
-        false,
-    )?;
+    let reply = wait_for_initial_prompt(&mut worker, server_timeout)?;
     render_reply(reply, &mut stdout, &mut stderr, image_support)?;
 
     let stdin = io::stdin();
@@ -92,6 +90,40 @@ pub(crate) fn run(backend: Backend) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+fn wait_for_initial_prompt(
+    worker: &mut WorkerManager,
+    server_timeout: Duration,
+) -> Result<WorkerReply, WorkerError> {
+    let deadline = Instant::now() + INITIAL_PROMPT_WAIT;
+    let mut last_reply = worker.write_stdin(
+        String::new(),
+        DEFAULT_WRITE_STDIN_TIMEOUT,
+        server_timeout,
+        None,
+        false,
+    )?;
+    while !reply_has_prompt(&last_reply) && Instant::now() < deadline {
+        thread::sleep(INITIAL_PROMPT_POLL_INTERVAL);
+        last_reply = worker.write_stdin(
+            String::new(),
+            DEFAULT_WRITE_STDIN_TIMEOUT,
+            server_timeout,
+            None,
+            false,
+        )?;
+    }
+    Ok(last_reply)
+}
+
+fn reply_has_prompt(reply: &WorkerReply) -> bool {
+    match reply {
+        WorkerReply::Output { prompt, .. } => prompt
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
+    }
 }
 
 fn read_line(reader: &mut impl BufRead) -> Result<Option<String>, WorkerError> {

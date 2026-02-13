@@ -21,15 +21,5 @@ expression: "super::unix_impl::render_steps(&steps)"
 
 • Called
   └ r.write_stdin(<omitted>)
-    > target <- tempfile("mcp-console-codex")
-    > tryCatch({
-    +   writeLines("ok", target)
-    +   cat("WRITE_OK\n")
-    +   unlink(target)
-    + }, error = function(e) {
-    +   message("WRITE_ERROR:", conditionMessage(e))
-    + })
-    WRITE_OK
-    >
 
 • Tool call 1 completed

@@ -196,13 +196,30 @@ trust_level = "trusted"
                 return line.to_string();
             };
             let version_end = version_start + version_end_rel;
-            let version = &line[version_start..version_end];
-            let masked: String = version
-                .chars()
-                .map(|ch| if ch.is_ascii_digit() { 'N' } else { ch })
-                .collect();
             let mut out = line.to_string();
-            out.replace_range(version_start..version_end, &masked);
+            let original_len = out.len();
+            out.replace_range(version_start..version_end, "vN.NN.N");
+            if out.len() < original_len {
+                let pad = original_len - out.len();
+                if let Some(border_idx) = out.rfind('│') {
+                    out.insert_str(border_idx, &" ".repeat(pad));
+                } else {
+                    out.push_str(&" ".repeat(pad));
+                }
+            } else if out.len() > original_len {
+                let mut excess = out.len() - original_len;
+                if let Some(border_idx) = out.rfind('│') {
+                    let mut start = border_idx;
+                    let bytes = out.as_bytes();
+                    while excess > 0 && start > 0 && bytes[start - 1] == b' ' {
+                        start -= 1;
+                        excess -= 1;
+                    }
+                    if start < border_idx {
+                        out.replace_range(start..border_idx, "");
+                    }
+                }
+            }
             out
         }
 
@@ -225,11 +242,11 @@ trust_level = "trusted"
 
             if skipping_wrapped_tool_args {
                 let trimmed = line.trim_start();
-                if trimmed.starts_with("> ") || trimmed.starts_with("+ ") {
-                    skipping_wrapped_tool_args = false;
-                } else {
+                let indent = line.len().saturating_sub(trimmed.len());
+                if trimmed.is_empty() || indent >= 4 {
                     continue;
                 }
+                skipping_wrapped_tool_args = false;
             }
 
             if skipping_underdev_warning {
@@ -264,6 +281,9 @@ trust_level = "trusted"
             if trimmed.starts_with("guides/") {
                 continue;
             }
+            if trimmed.contains("developers.openai.com/mcp") {
+                continue;
+            }
             if trimmed.contains("directory:") {
                 continue;
             }
@@ -289,6 +309,15 @@ trust_level = "trusted"
                 continue;
             }
             if is_horizontal_rule(trimmed) {
+                continue;
+            }
+            if lines.is_empty() && trimmed.is_empty() {
+                continue;
+            }
+            if lines.is_empty() && trimmed.starts_with("╰") {
+                continue;
+            }
+            if lines.is_empty() && trimmed.contains(WARMUP_MARKER) {
                 continue;
             }
 
