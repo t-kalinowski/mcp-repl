@@ -465,6 +465,19 @@ pub fn prepare_worker_command(
         let temp_dir = state.session_temp_dir.to_string_lossy().to_string();
         env.insert("TMPDIR".to_string(), temp_dir.clone());
         env.insert(R_SESSION_TMPDIR_ENV.to_string(), temp_dir);
+        #[cfg(target_os = "windows")]
+        {
+            // Ensure Windows sandbox policy and runtime temp resolution both target the
+            // per-session temp directory instead of the full user TEMP tree.
+            env.insert(
+                "TEMP".to_string(),
+                state.session_temp_dir.to_string_lossy().to_string(),
+            );
+            env.insert(
+                "TMP".to_string(),
+                state.session_temp_dir.to_string_lossy().to_string(),
+            );
+        }
     }
 
     if !state.sandbox_policy.requires_sandbox() {
