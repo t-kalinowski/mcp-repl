@@ -31,12 +31,27 @@ fn backend_unavailable(text: &str) -> bool {
         )
 }
 
+async fn spawn_behavior_session() -> TestResult<common::McpTestSession> {
+    #[cfg(target_os = "windows")]
+    {
+        return common::spawn_server_with_args(vec![
+            "--sandbox-state".to_string(),
+            "danger-full-access".to_string(),
+        ])
+        .await;
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        common::spawn_server().await
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_discards_when_busy() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "write_stdin_behavior test mutex poisoned")?;
-    let mut session = common::spawn_server().await?;
+    let mut session = spawn_behavior_session().await?;
 
     let _ = session
         .write_stdin_raw_with("Sys.sleep(2)", Some(0.1))
@@ -66,7 +81,7 @@ async fn write_stdin_trims_continuation_echo() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "write_stdin_behavior test mutex poisoned")?;
-    let mut session = common::spawn_server().await?;
+    let mut session = spawn_behavior_session().await?;
 
     let result = session.write_stdin_raw_with("1+\n1", Some(30.0)).await?;
     let text = result_text(&result);
@@ -98,7 +113,7 @@ async fn write_stdin_mixed_stdout_stderr() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "write_stdin_behavior test mutex poisoned")?;
-    let mut session = common::spawn_server().await?;
+    let mut session = spawn_behavior_session().await?;
 
     let result = session
         .write_stdin_raw_with(
@@ -128,7 +143,7 @@ async fn write_stdin_normalizes_error_prompt() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "write_stdin_behavior test mutex poisoned")?;
-    let mut session = common::spawn_server().await?;
+    let mut session = spawn_behavior_session().await?;
 
     let result = session
         .write_stdin_raw_with("cat('> Error: boom\\n'); message('boom')", Some(30.0))
