@@ -34,7 +34,7 @@ use windows_sys::Win32::Security::{
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING,
-    PIPE_ACCESS_DUPLEX,
+    PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND,
 };
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::System::Pipes::{
@@ -46,7 +46,9 @@ pub const IPC_READ_FD_ENV: &str = "MCP_CONSOLE_IPC_READ_FD";
 #[cfg(target_family = "unix")]
 pub const IPC_WRITE_FD_ENV: &str = "MCP_CONSOLE_IPC_WRITE_FD";
 #[cfg(target_family = "windows")]
-pub const IPC_PIPE_NAME_ENV: &str = "MCP_CONSOLE_IPC_PIPE_NAME";
+pub const IPC_PIPE_TO_WORKER_ENV: &str = "MCP_CONSOLE_IPC_PIPE_TO_WORKER";
+#[cfg(target_family = "windows")]
+pub const IPC_PIPE_FROM_WORKER_ENV: &str = "MCP_CONSOLE_IPC_PIPE_FROM_WORKER";
 const MAX_PROMPT_HISTORY: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -561,9 +563,13 @@ pub struct IpcServer {
     #[cfg(target_family = "unix")]
     child_fds: Option<IpcChildFds>,
     #[cfg(target_family = "windows")]
-    pipe_name: Option<String>,
+    pipe_name_to_worker: Option<String>,
     #[cfg(target_family = "windows")]
-    server_pipe: Option<File>,
+    pipe_name_from_worker: Option<String>,
+    #[cfg(target_family = "windows")]
+    server_pipe_to_worker: Option<File>,
+    #[cfg(target_family = "windows")]
+    server_pipe_from_worker: Option<File>,
 }
 
 #[cfg(target_family = "unix")]
@@ -588,11 +594,18 @@ impl IpcServer {
         }
         #[cfg(target_family = "windows")]
         {
-            let pipe_name = next_pipe_name();
-            let server_pipe = create_named_pipe_server(&pipe_name)?;
+            let base = next_pipe_name();
+            let pipe_name_to_worker = format!("{base}-to-worker");
+            let pipe_name_from_worker = format!("{base}-from-worker");
+            let server_pipe_to_worker =
+                create_named_pipe_server(&pipe_name_to_worker, PIPE_ACCESS_OUTBOUND)?;
+            let server_pipe_from_worker =
+                create_named_pipe_server(&pipe_name_from_worker, PIPE_ACCESS_INBOUND)?;
             Ok(Self {
-                pipe_name: Some(pipe_name),
-                server_pipe: Some(server_pipe),
+                pipe_name_to_worker: Some(pipe_name_to_worker),
+                pipe_name_from_worker: Some(pipe_name_from_worker),
+                server_pipe_to_worker: Some(server_pipe_to_worker),
+                server_pipe_from_worker: Some(server_pipe_from_worker),
             })
         }
         #[cfg(not(any(target_family = "unix", target_family = "windows")))]
@@ -631,15 +644,22 @@ impl IpcServer {
 
     #[cfg(target_family = "windows")]
     pub fn connect(self, handle: IpcHandle, handlers: IpcHandlers) -> io::Result<()> {
-        let Some(server_pipe) = self.server_pipe else {
-            return Err(io::Error::other("missing ipc named pipe handle"));
+        let Some(server_pipe_to_worker) = self.server_pipe_to_worker else {
+            return Err(io::Error::other(
+                "missing ipc named pipe handle (to-worker)",
+            ));
         };
-        connect_named_pipe(&server_pipe)?;
-        let reader = server_pipe.try_clone()?;
+        let Some(server_pipe_from_worker) = self.server_pipe_from_worker else {
+            return Err(io::Error::other(
+                "missing ipc named pipe handle (from-worker)",
+            ));
+        };
+        connect_named_pipe(&server_pipe_to_worker)?;
+        connect_named_pipe(&server_pipe_from_worker)?;
         let conn = ServerIpcConnection::new(
             IpcTransport {
-                reader: Box::new(reader),
-                writer: Box::new(server_pipe),
+                reader: Box::new(server_pipe_from_worker),
+                writer: Box::new(server_pipe_to_worker),
             },
             handlers,
         )?;
@@ -649,8 +669,10 @@ impl IpcServer {
     }
 
     #[cfg(target_family = "windows")]
-    pub fn take_pipe_name(&mut self) -> Option<String> {
-        self.pipe_name.take()
+    pub fn take_pipe_names(&mut self) -> Option<(String, String)> {
+        let to_worker = self.pipe_name_to_worker.take()?;
+        let from_worker = self.pipe_name_from_worker.take()?;
+        Some((to_worker, from_worker))
     }
 }
 
@@ -710,7 +732,10 @@ fn to_wide_nul(value: &str) -> Vec<u16> {
 }
 
 #[cfg(target_family = "windows")]
-fn create_named_pipe_server(pipe_name: &str) -> io::Result<File> {
+fn create_named_pipe_server(
+    pipe_name: &str,
+    access_mode: windows_sys::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES,
+) -> io::Result<File> {
     let wide = to_wide_nul(pipe_name);
     let mut security_descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
     let init_ok = unsafe {
@@ -740,7 +765,7 @@ fn create_named_pipe_server(pipe_name: &str) -> io::Result<File> {
     let handle = unsafe {
         CreateNamedPipeW(
             wide.as_ptr(),
-            PIPE_ACCESS_DUPLEX,
+            access_mode,
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
             1,
             64 * 1024,
@@ -768,12 +793,12 @@ fn connect_named_pipe(server_pipe: &File) -> io::Result<()> {
 }
 
 #[cfg(target_family = "windows")]
-fn open_named_pipe_client(pipe_name: &str) -> io::Result<File> {
+fn open_named_pipe_client(pipe_name: &str, access: u32) -> io::Result<File> {
     let wide = to_wide_nul(pipe_name);
     let handle = unsafe {
         CreateFileW(
             wide.as_ptr(),
-            FILE_GENERIC_READ | FILE_GENERIC_WRITE,
+            access,
             0,
             std::ptr::null_mut(),
             OPEN_EXISTING,
@@ -820,19 +845,28 @@ pub fn connect_from_env(_timeout: Duration) -> io::Result<WorkerIpcConnection> {
     #[cfg(target_family = "windows")]
     {
         let timeout = _timeout;
-        let pipe_name = std::env::var(IPC_PIPE_NAME_ENV)
-            .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "IPC pipe name missing"))?;
+        let pipe_to_worker = std::env::var(IPC_PIPE_TO_WORKER_ENV)
+            .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "IPC to-worker pipe missing"))?;
+        let pipe_from_worker = std::env::var(IPC_PIPE_FROM_WORKER_ENV)
+            .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "IPC from-worker pipe missing"))?;
         let deadline = Instant::now() + timeout;
         loop {
-            match open_named_pipe_client(&pipe_name) {
-                Ok(stream) => {
-                    let reader = stream.try_clone()?;
+            match (
+                open_named_pipe_client(&pipe_to_worker, FILE_GENERIC_READ),
+                open_named_pipe_client(&pipe_from_worker, FILE_GENERIC_WRITE),
+            ) {
+                (Ok(reader), Ok(writer)) => {
                     return WorkerIpcConnection::new(IpcTransport {
                         reader: Box::new(reader),
-                        writer: Box::new(stream),
+                        writer: Box::new(writer),
                     });
                 }
-                Err(err) => {
+                (reader_res, writer_res) => {
+                    let err = match (reader_res, writer_res) {
+                        (Err(err), _) => err,
+                        (_, Err(err)) => err,
+                        (Ok(_), Ok(_)) => unreachable!(),
+                    };
                     if !should_retry_pipe_open(&err)
                         || timeout.is_zero()
                         || Instant::now() >= deadline

@@ -16,7 +16,7 @@ use std::time::Duration;
 use crate::backend::Backend;
 use crate::input_protocol::format_input_frame_header;
 #[cfg(target_family = "windows")]
-use crate::ipc::IPC_PIPE_NAME_ENV;
+use crate::ipc::{IPC_PIPE_FROM_WORKER_ENV, IPC_PIPE_TO_WORKER_ENV};
 #[cfg(target_family = "unix")]
 use crate::ipc::{IPC_READ_FD_ENV, IPC_WRITE_FD_ENV};
 use crate::ipc::{
@@ -96,14 +96,11 @@ impl RBackendDriver {
     }
 }
 
-fn driver_on_input_start(text: &str, ipc: &ServerIpcConnection) {
+fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) {
     ipc.clear_request_end_events();
     ipc.clear_readline_tracking();
     ipc.clear_prompt_history();
     ipc.clear_echo_events();
-    let _ = ipc.send(ServerToWorkerIpcMessage::StdinWrite {
-        text: text.to_string(),
-    });
 }
 
 const REQUEST_END_FALLBACK_WAIT: Duration = Duration::from_millis(20);
@@ -654,9 +651,7 @@ impl WorkerManager {
         if self.pending_request {
             match self.wait_for_request_completion(timeout) {
                 Ok(info) => {
-                    self.pending_request = false;
-                    self.pending_request_started_at = None;
-                    self.guardrail.busy.store(false, Ordering::Relaxed);
+                    self.clear_pending_request_state();
                     if info.session_end_seen {
                         self.note_session_end(true);
                     }
@@ -665,8 +660,19 @@ impl WorkerManager {
                     end_offset = self.output.end_offset().unwrap_or(end_offset);
                 }
                 Err(WorkerError::Timeout(_)) => {
-                    timed_out = true;
                     end_offset = self.output.end_offset().unwrap_or(end_offset);
+                    let worker_exited = match self.process.as_mut() {
+                        Some(process) => !process.is_running()?,
+                        None => true,
+                    };
+                    if worker_exited {
+                        self.note_session_end(true);
+                        self.clear_pending_request_state();
+                        completion.session_end_seen = true;
+                        completed_request = true;
+                    } else {
+                        timed_out = true;
+                    }
                 }
                 Err(err) => return Err(err),
             }
@@ -1024,7 +1030,33 @@ impl WorkerManager {
             .get()
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
         let start = std::time::Instant::now();
-        let result = self.driver.wait_for_completion(timeout, ipc);
+        let mut result = self.driver.wait_for_completion(timeout, ipc);
+        if matches!(
+            &result,
+            Err(WorkerError::Protocol(message))
+                if message.contains("ipc disconnected while waiting for request completion")
+        ) {
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            let mut worker_exited = self.process.is_none();
+            while !worker_exited {
+                worker_exited = match self.process.as_mut() {
+                    Some(process) => !process.is_running()?,
+                    None => true,
+                };
+                if worker_exited || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            if worker_exited {
+                result = Ok(CompletionInfo {
+                    prompt: None,
+                    prompt_variants: None,
+                    echo_events: Vec::new(),
+                    session_end_seen: true,
+                });
+            }
+        }
         // Best-effort: after IPC completion, give the output reader threads a brief window to
         // drain any bytes already written by the worker before we snapshot the ring.
         let elapsed = start.elapsed();
@@ -1482,18 +1514,30 @@ impl WorkerManager {
                 self.settle_output_after_request_end(Duration::from_millis(120));
                 let offset = self.output.end_offset().unwrap_or(0);
                 crate::output_capture::update_last_reply_marker_offset_max(offset);
-                self.pending_request = false;
-                self.pending_request_started_at = None;
-                self.guardrail.busy.store(false, Ordering::Relaxed);
+                self.clear_pending_request_state();
             }
             Err(IpcWaitError::SessionEnd) => {
                 self.note_session_end(true);
-                self.pending_request = false;
-                self.pending_request_started_at = None;
-                self.guardrail.busy.store(false, Ordering::Relaxed);
+                self.clear_pending_request_state();
             }
-            Err(IpcWaitError::Timeout | IpcWaitError::Disconnected) => {}
+            Err(IpcWaitError::Timeout | IpcWaitError::Disconnected) => {
+                let worker_exited = self
+                    .process
+                    .as_mut()
+                    .and_then(|process| process.is_running().ok())
+                    .is_some_and(|running| !running);
+                if worker_exited {
+                    self.note_session_end(true);
+                    self.clear_pending_request_state();
+                }
+            }
         }
+    }
+
+    fn clear_pending_request_state(&mut self) {
+        self.pending_request = false;
+        self.pending_request_started_at = None;
+        self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
     fn build_session_reset_reply(&mut self, page_bytes: u64, meta: &str) -> ReplyWithOffset {
@@ -2469,12 +2513,13 @@ impl WorkerProcess {
             command.env(IPC_WRITE_FD_ENV, client_fds.write_fd.to_string());
         }
         #[cfg(target_family = "windows")]
-        let pipe_name = ipc_server.take_pipe_name().ok_or_else(|| {
-            WorkerError::Protocol("IPC pipe setup failed; missing pipe name".to_string())
+        let (pipe_to_worker, pipe_from_worker) = ipc_server.take_pipe_names().ok_or_else(|| {
+            WorkerError::Protocol("IPC pipe setup failed; missing pipe names".to_string())
         })?;
         #[cfg(target_family = "windows")]
         {
-            command.env(IPC_PIPE_NAME_ENV, pipe_name);
+            command.env(IPC_PIPE_TO_WORKER_ENV, pipe_to_worker);
+            command.env(IPC_PIPE_FROM_WORKER_ENV, pipe_from_worker);
         }
         apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
         #[cfg(target_family = "unix")]
@@ -2782,7 +2827,7 @@ impl WorkerProcess {
     fn is_running(&mut self) -> Result<bool, WorkerError> {
         if let Some(status) = self.child.try_wait()? {
             self.exit_status = Some(status);
-            let should_log = !self.expected_exit || !status.success();
+            let should_log = !status.success() && !self.expected_exit;
             if should_log {
                 #[cfg(target_family = "unix")]
                 if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
