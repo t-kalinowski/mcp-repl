@@ -152,6 +152,23 @@ pub(crate) fn clear_pending_input() -> bool {
     had_pending
 }
 
+pub(crate) fn complete_active_request_if_idle() -> bool {
+    let Some(state) = SESSION_STATE.get() else {
+        return false;
+    };
+    let mut guard = state.inner.lock().unwrap();
+    if !guard.input_queue.is_empty() {
+        return false;
+    }
+    let active = guard.active_request.take();
+    let had_active = active.is_some();
+    drop(guard);
+    if had_active {
+        complete_active_request(state, active, false);
+    }
+    had_active
+}
+
 pub(crate) fn request_interrupt() -> bool {
     let Some(state) = SESSION_STATE.get() else {
         return false;
@@ -623,19 +640,9 @@ pub extern "C-unwind" fn r_show_message(buf: *const c_char) {
 pub extern "C-unwind" fn r_busy(which: c_int) {
     #[cfg(target_family = "windows")]
     {
-        if which != 0 {
-            return;
+        if which == 0 {
+            let _ = complete_active_request_if_idle();
         }
-        let Some(state) = SESSION_STATE.get() else {
-            return;
-        };
-        let mut guard = state.inner.lock().unwrap();
-        if !guard.input_queue.is_empty() {
-            return;
-        }
-        let active = guard.active_request.take();
-        drop(guard);
-        complete_active_request(state, active, false);
     }
 
     #[cfg(not(target_family = "windows"))]
@@ -818,7 +825,10 @@ pub(crate) fn push_plot_image(
 #[cfg(target_family = "windows")]
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn r_yes_no_cancel(_question: *const c_char) -> c_int {
-    0
+    // In embedded Windows sessions this callback can be reached during cleanup
+    // when R asks whether to save the workspace image. Returning -1 requests
+    // "no save", which keeps shutdown non-interactive.
+    -1
 }
 
 #[cfg(target_family = "windows")]

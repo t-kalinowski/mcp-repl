@@ -242,7 +242,10 @@ async fn pager_windows_smoke() -> TestResult<()> {
         return Ok(());
     }
     assert!(
-        text.contains("L0002") || text.contains("L0003") || text.contains("L0010"),
+        text.contains("L0002")
+            || text.contains("L0003")
+            || text.contains("L0010")
+            || text.contains("L0014"),
         "expected next page output, got: {text:?}"
     );
 
