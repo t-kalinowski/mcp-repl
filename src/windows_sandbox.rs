@@ -101,17 +101,26 @@ fn should_apply_network_block(policy: &SandboxPolicy) -> bool {
     !policy.has_full_network_access()
 }
 
+fn upsert_env_case_insensitive(env_map: &mut HashMap<String, String>, key: &str, value: &str) {
+    let removals: Vec<String> = env_map
+        .keys()
+        .filter(|existing| existing.eq_ignore_ascii_case(key) && existing.as_str() != key)
+        .cloned()
+        .collect();
+    for existing in removals {
+        env_map.remove(&existing);
+    }
+    env_map.insert(key.to_string(), value.to_string());
+}
+
 fn apply_no_network_to_env(env_map: &mut HashMap<String, String>) {
-    env_map.insert("HTTP_PROXY".to_string(), "http://127.0.0.1:9".to_string());
-    env_map.insert("HTTPS_PROXY".to_string(), "http://127.0.0.1:9".to_string());
-    env_map.insert("ALL_PROXY".to_string(), "http://127.0.0.1:9".to_string());
-    env_map.insert(
-        "NO_PROXY".to_string(),
-        "localhost,127.0.0.1,::1".to_string(),
-    );
-    env_map.insert("CARGO_NET_OFFLINE".to_string(), "true".to_string());
-    env_map.insert("NPM_CONFIG_OFFLINE".to_string(), "true".to_string());
-    env_map.insert("PIP_NO_INDEX".to_string(), "1".to_string());
+    upsert_env_case_insensitive(env_map, "HTTP_PROXY", "http://127.0.0.1:9");
+    upsert_env_case_insensitive(env_map, "HTTPS_PROXY", "http://127.0.0.1:9");
+    upsert_env_case_insensitive(env_map, "ALL_PROXY", "http://127.0.0.1:9");
+    upsert_env_case_insensitive(env_map, "NO_PROXY", "localhost,127.0.0.1,::1");
+    upsert_env_case_insensitive(env_map, "CARGO_NET_OFFLINE", "true");
+    upsert_env_case_insensitive(env_map, "NPM_CONFIG_OFFLINE", "true");
+    upsert_env_case_insensitive(env_map, "PIP_NO_INDEX", "1");
 }
 
 fn canonicalize_or_identity(path: &Path) -> PathBuf {
@@ -1175,6 +1184,50 @@ mod tests {
         );
         assert_eq!(env_map.get("CARGO_NET_OFFLINE"), Some(&"true".to_string()));
         assert_eq!(env_map.get("NPM_CONFIG_OFFLINE"), Some(&"true".to_string()));
+        assert_eq!(env_map.get("PIP_NO_INDEX"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn apply_no_network_to_env_removes_case_variant_proxy_keys() {
+        let mut env_map = HashMap::new();
+        env_map.insert(
+            "http_proxy".to_string(),
+            "http://proxy.example:8080".to_string(),
+        );
+        env_map.insert(
+            "Https_Proxy".to_string(),
+            "http://proxy.example:8080".to_string(),
+        );
+        env_map.insert(
+            "all_proxy".to_string(),
+            "http://proxy.example:8080".to_string(),
+        );
+        env_map.insert("no_proxy".to_string(), "example.com".to_string());
+        env_map.insert("pip_no_index".to_string(), "0".to_string());
+
+        apply_no_network_to_env(&mut env_map);
+
+        assert!(!env_map.contains_key("http_proxy"));
+        assert!(!env_map.contains_key("Https_Proxy"));
+        assert!(!env_map.contains_key("all_proxy"));
+        assert!(!env_map.contains_key("no_proxy"));
+        assert!(!env_map.contains_key("pip_no_index"));
+        assert_eq!(
+            env_map.get("HTTP_PROXY"),
+            Some(&"http://127.0.0.1:9".to_string())
+        );
+        assert_eq!(
+            env_map.get("HTTPS_PROXY"),
+            Some(&"http://127.0.0.1:9".to_string())
+        );
+        assert_eq!(
+            env_map.get("ALL_PROXY"),
+            Some(&"http://127.0.0.1:9".to_string())
+        );
+        assert_eq!(
+            env_map.get("NO_PROXY"),
+            Some(&"localhost,127.0.0.1,::1".to_string())
+        );
         assert_eq!(env_map.get("PIP_NO_INDEX"), Some(&"1".to_string()));
     }
 

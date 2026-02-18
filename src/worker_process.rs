@@ -2752,8 +2752,7 @@ impl WorkerProcess {
         }
         #[cfg(not(target_family = "unix"))]
         {
-            self.child.kill()?;
-            Ok(())
+            request_soft_termination(&mut self.child)
         }
     }
 
@@ -3260,6 +3259,13 @@ fn handle_windows_ipc_connect_result(
     }
 }
 
+#[cfg(target_family = "windows")]
+fn request_soft_termination(_child: &mut Child) -> Result<(), WorkerError> {
+    // The Windows child is the sandbox wrapper. Let it exit naturally so it can
+    // roll back temporary ACL state before process teardown.
+    Ok(())
+}
+
 #[cfg(target_family = "unix")]
 fn set_command_arg0(command: &mut Command, arg0: &str) {
     command.arg0(arg0);
@@ -3386,5 +3392,25 @@ mod tests {
             status.is_some(),
             "child should be terminated on connect error"
         );
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_soft_termination_does_not_kill_child() {
+        let mut child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .spawn()
+            .expect("spawn test child process");
+
+        request_soft_termination(&mut child).expect("soft terminate call should succeed");
+
+        let status = child.try_wait().expect("query child status");
+        assert!(
+            status.is_none(),
+            "child should still be running after soft termination request"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
