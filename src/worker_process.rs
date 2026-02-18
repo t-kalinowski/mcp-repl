@@ -296,6 +296,8 @@ impl std::error::Error for WorkerError {
 }
 
 const BACKEND_INFO_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_family = "windows")]
+const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(600);
 const COMPLETION_METADATA_SETTLE_MAX: Duration = Duration::from_millis(30);
 const COMPLETION_METADATA_SETTLE_POLL: Duration = Duration::from_millis(5);
 const COMPLETION_METADATA_STABLE: Duration = Duration::from_millis(10);
@@ -2424,7 +2426,7 @@ impl WorkerProcess {
 
         let mut ipc_server = IpcServer::bind().map_err(WorkerError::Io)?;
         let SpawnedWorker {
-            child,
+            mut child,
             stdin_tx,
             session_tmpdir,
             #[cfg(target_os = "macos")]
@@ -2455,8 +2457,18 @@ impl WorkerProcess {
                     );
                 })),
             };
+            #[cfg(target_family = "unix")]
             ipc_server
                 .connect(ipc.clone(), handlers)
+                .map_err(WorkerError::Io)?;
+            #[cfg(target_family = "windows")]
+            ipc_server
+                .connect(
+                    ipc.clone(),
+                    handlers,
+                    &mut child,
+                    WINDOWS_IPC_CONNECT_MAX_WAIT,
+                )
                 .map_err(WorkerError::Io)?;
         }
 

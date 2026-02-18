@@ -9,7 +9,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::sandbox::SandboxPolicy;
+use crate::sandbox::{R_SESSION_TMPDIR_ENV, SandboxPolicy};
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
@@ -133,6 +133,7 @@ fn compute_allow_deny_paths(
     policy: &SandboxPolicy,
     policy_cwd: &Path,
     command_cwd: &Path,
+    session_temp_dir: Option<&Path>,
     env_map: &HashMap<String, String>,
 ) -> AllowDenyPaths {
     let mut allow = HashSet::new();
@@ -167,6 +168,12 @@ fn compute_allow_deny_paths(
         for root in writable_roots {
             add_writable_root(root.clone());
         }
+    }
+
+    if let Some(path) = session_temp_dir
+        && path.exists()
+    {
+        allow.insert(canonicalize_or_identity(path));
     }
 
     if include_tmp_env_vars {
@@ -237,6 +244,7 @@ pub fn run_sandboxed_command(
         if should_apply_network_block(policy) {
             apply_no_network_to_env(&mut env_map);
         }
+        let session_temp_dir = env_map.get(R_SESSION_TMPDIR_ENV).map(PathBuf::from);
 
         let cap_sid = make_random_cap_sid_string();
         let psid_capability = convert_string_sid_to_sid(&cap_sid)
@@ -257,8 +265,13 @@ pub fn run_sandboxed_command(
 
         let mut acl_guards: Vec<(PathBuf, *mut c_void)> = Vec::new();
         if matches!(policy, SandboxPolicy::WorkspaceWrite { .. }) {
-            let paths =
-                compute_allow_deny_paths(policy, sandbox_policy_cwd, sandbox_policy_cwd, &env_map);
+            let paths = compute_allow_deny_paths(
+                policy,
+                sandbox_policy_cwd,
+                sandbox_policy_cwd,
+                session_temp_dir.as_deref(),
+                &env_map,
+            );
             for path in &paths.allow {
                 match add_allow_ace(path, psid_capability) {
                     Ok(true) => acl_guards.push((path.clone(), psid_capability)),
@@ -1158,7 +1171,8 @@ mod tests {
         std::fs::create_dir_all(&extra_root).expect("extra dir");
 
         let policy = workspace_policy(vec![extra_root.clone()], false, true);
-        let paths = compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, &HashMap::new());
+        let paths =
+            compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, None, &HashMap::new());
 
         assert!(
             paths
@@ -1180,7 +1194,7 @@ mod tests {
         let policy = workspace_policy(Vec::new(), false, true);
         let mut env_map = HashMap::new();
         env_map.insert("TEMP".to_string(), temp_dir.to_string_lossy().to_string());
-        let paths = compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, &env_map);
+        let paths = compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, None, &env_map);
 
         assert!(
             paths
@@ -1189,6 +1203,40 @@ mod tests {
         );
         assert!(!paths.allow.contains(&canonicalize_or_identity(&temp_dir)));
         assert!(paths.deny.is_empty());
+    }
+
+    #[test]
+    fn compute_allow_paths_includes_session_temp_dir_when_tmp_env_vars_excluded() {
+        let tmp = tempdir().expect("tempdir");
+        let command_cwd = tmp.path().join("workspace");
+        let temp_dir = tmp.path().join("temp");
+        let session_temp_dir = tmp.path().join("session-temp");
+        std::fs::create_dir_all(&command_cwd).expect("workspace dir");
+        std::fs::create_dir_all(&temp_dir).expect("temp dir");
+        std::fs::create_dir_all(&session_temp_dir).expect("session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, true);
+        let mut env_map = HashMap::new();
+        env_map.insert("TEMP".to_string(), temp_dir.to_string_lossy().to_string());
+        let paths = compute_allow_deny_paths(
+            &policy,
+            &command_cwd,
+            &command_cwd,
+            Some(&session_temp_dir),
+            &env_map,
+        );
+
+        assert!(
+            paths
+                .allow
+                .contains(&canonicalize_or_identity(&command_cwd))
+        );
+        assert!(!paths.allow.contains(&canonicalize_or_identity(&temp_dir)));
+        assert!(
+            paths
+                .allow
+                .contains(&canonicalize_or_identity(&session_temp_dir))
+        );
     }
 
     #[test]
@@ -1201,7 +1249,8 @@ mod tests {
         std::fs::create_dir_all(&git_dir).expect("git dir");
 
         let policy = workspace_policy(vec![extra_root.clone()], false, true);
-        let paths = compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, &HashMap::new());
+        let paths =
+            compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, None, &HashMap::new());
 
         assert!(
             paths
@@ -1223,7 +1272,8 @@ mod tests {
         std::fs::write(&git_file, "gitdir: .git/worktrees/example").expect("git file");
 
         let policy = workspace_policy(vec![extra_root.clone()], false, true);
-        let paths = compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, &HashMap::new());
+        let paths =
+            compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, None, &HashMap::new());
 
         assert!(
             paths
@@ -1243,7 +1293,8 @@ mod tests {
         std::fs::create_dir_all(&extra_root).expect("extra dir");
 
         let policy = workspace_policy(vec![extra_root.clone()], false, true);
-        let paths = compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, &HashMap::new());
+        let paths =
+            compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, None, &HashMap::new());
 
         assert_eq!(paths.allow.len(), 2);
         assert!(
@@ -1263,7 +1314,8 @@ mod tests {
         std::fs::create_dir_all(&git_dir).expect("git dir");
 
         let policy = workspace_policy(Vec::new(), false, true);
-        let paths = compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, &HashMap::new());
+        let paths =
+            compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, None, &HashMap::new());
 
         assert_eq!(paths.allow.len(), 1);
         assert!(

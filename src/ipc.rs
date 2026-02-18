@@ -48,6 +48,8 @@ use windows_sys::Win32::Storage::FileSystem::{
     PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND,
 };
 #[cfg(target_family = "windows")]
+use windows_sys::Win32::System::IO::CancelIoEx;
+#[cfg(target_family = "windows")]
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
@@ -656,7 +658,13 @@ impl IpcServer {
     }
 
     #[cfg(target_family = "windows")]
-    pub fn connect(self, handle: IpcHandle, handlers: IpcHandlers) -> io::Result<()> {
+    pub fn connect(
+        self,
+        handle: IpcHandle,
+        handlers: IpcHandlers,
+        child: &mut std::process::Child,
+        max_wait: Duration,
+    ) -> io::Result<()> {
         let Some(server_pipe_to_worker) = self.server_pipe_to_worker else {
             return Err(io::Error::other(
                 "missing ipc named pipe handle (to-worker)",
@@ -667,8 +675,10 @@ impl IpcServer {
                 "missing ipc named pipe handle (from-worker)",
             ));
         };
-        connect_named_pipe(&server_pipe_to_worker)?;
-        connect_named_pipe(&server_pipe_from_worker)?;
+        let start = Instant::now();
+        connect_named_pipe_with_process_retry(&server_pipe_to_worker, child, max_wait)?;
+        let remaining = max_wait.saturating_sub(start.elapsed());
+        connect_named_pipe_with_process_retry(&server_pipe_from_worker, child, remaining)?;
         let conn = ServerIpcConnection::new(
             IpcTransport {
                 reader: Box::new(server_pipe_from_worker),
@@ -919,15 +929,77 @@ fn create_named_pipe_server(
 }
 
 #[cfg(target_family = "windows")]
-fn connect_named_pipe(server_pipe: &File) -> io::Result<()> {
-    let ok = unsafe { ConnectNamedPipe(server_pipe.as_raw_handle() as _, std::ptr::null_mut()) };
-    if ok == 0 {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() != Some(ERROR_PIPE_CONNECTED as i32) {
-            return Err(err);
+fn connect_named_pipe(server_pipe: &File, timeout: Duration) -> io::Result<()> {
+    let pipe = server_pipe.try_clone()?;
+    let (tx, rx) = mpsc::sync_channel(1);
+    let connector = thread::spawn(move || {
+        let ok = unsafe { ConnectNamedPipe(pipe.as_raw_handle() as _, std::ptr::null_mut()) };
+        let result = if ok != 0 {
+            Ok(())
+        } else {
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(ERROR_PIPE_CONNECTED as i32) {
+                Ok(())
+            } else {
+                Err(err)
+            }
+        };
+        let _ = tx.send(result);
+    });
+
+    match rx.recv_timeout(timeout) {
+        Ok(result) => {
+            let _ = connector.join();
+            result
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            unsafe {
+                let _ = CancelIoEx(server_pipe.as_raw_handle() as _, std::ptr::null_mut());
+            }
+            let _ = connector.join();
+            Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for IPC named pipe client connection",
+            ))
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let _ = connector.join();
+            Err(io::Error::other(
+                "ipc named pipe connector thread exited unexpectedly",
+            ))
         }
     }
-    Ok(())
+}
+
+#[cfg(target_family = "windows")]
+fn connect_named_pipe_with_process_retry(
+    server_pipe: &File,
+    child: &mut std::process::Child,
+    max_wait: Duration,
+) -> io::Result<()> {
+    const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(500);
+    let deadline = Instant::now() + max_wait;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "worker exited before IPC named pipe connection",
+            ));
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for IPC named pipe client connection",
+            ));
+        }
+        let timeout = CONNECT_ATTEMPT_TIMEOUT.min(deadline.saturating_duration_since(now));
+        match connect_named_pipe(server_pipe, timeout) {
+            Ok(()) => return Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::TimedOut => continue,
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 #[cfg(target_family = "windows")]
