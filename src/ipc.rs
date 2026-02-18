@@ -24,12 +24,23 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::Foundation::{
-    ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_FILE_NOT_FOUND, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, ERROR_SUCCESS,
+    HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
+};
+#[cfg(target_family = "windows")]
+use windows_sys::Win32::Security::Authorization::{
+    EXPLICIT_ACCESS_W, GRANT_ACCESS, SetEntriesInAclW, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN,
+    TRUSTEE_W,
+};
+#[cfg(target_family = "windows")]
+use windows_sys::Win32::Security::Cryptography::{
+    BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::Security::{
-    InitializeSecurityDescriptor, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
-    SetSecurityDescriptorDacl,
+    ACL, CopySid, GetLengthSid, GetTokenInformation, InitializeSecurityDescriptor,
+    SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR, SetSecurityDescriptorDacl, TOKEN_GROUPS, TOKEN_QUERY,
+    TokenLogonSid,
 };
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::Storage::FileSystem::{
@@ -40,6 +51,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::Pipes::{
     ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_WAIT,
 };
+#[cfg(target_family = "windows")]
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 #[cfg(target_family = "unix")]
 pub const IPC_READ_FD_ENV: &str = "MCP_CONSOLE_IPC_READ_FD";
@@ -594,7 +607,7 @@ impl IpcServer {
         }
         #[cfg(target_family = "windows")]
         {
-            let base = next_pipe_name();
+            let base = next_pipe_name()?;
             let pipe_name_to_worker = format!("{base}-to-worker");
             let pipe_name_from_worker = format!("{base}-from-worker");
             let server_pipe_to_worker =
@@ -719,9 +732,32 @@ fn create_pipe_pair() -> io::Result<(std::io::PipeReader, std::io::PipeWriter, R
 static PIPE_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[cfg(target_family = "windows")]
-fn next_pipe_name() -> String {
+fn random_pipe_suffix() -> io::Result<String> {
+    let mut bytes = [0u8; 16];
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            bytes.as_mut_ptr(),
+            bytes.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status < 0 {
+        return Err(io::Error::other(format!(
+            "BCryptGenRandom failed with NTSTATUS 0x{status:08x}"
+        )));
+    }
+    Ok(bytes.iter().map(|value| format!("{value:02x}")).collect())
+}
+
+#[cfg(target_family = "windows")]
+fn next_pipe_name() -> io::Result<String> {
     let nonce = PIPE_COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!(r"\\.\pipe\mcp-console-ipc-{}-{nonce}", std::process::id())
+    let random = random_pipe_suffix()?;
+    Ok(format!(
+        r"\\.\pipe\mcp-console-ipc-{}-{nonce}-{random}",
+        std::process::id()
+    ))
 }
 
 #[cfg(target_family = "windows")]
@@ -732,29 +768,126 @@ fn to_wide_nul(value: &str) -> Vec<u16> {
 }
 
 #[cfg(target_family = "windows")]
+fn current_logon_sid() -> io::Result<Vec<u8>> {
+    let mut token = std::ptr::null_mut();
+    let open_ok = unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) };
+    if open_ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    struct TokenGuard(*mut c_void);
+    impl Drop for TokenGuard {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    CloseHandle(self.0);
+                }
+            }
+        }
+    }
+    let _guard = TokenGuard(token);
+
+    let mut required_len = 0u32;
+    unsafe {
+        let _ = GetTokenInformation(
+            token,
+            TokenLogonSid,
+            std::ptr::null_mut(),
+            0,
+            &mut required_len,
+        );
+    }
+    if required_len == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut info = vec![0u8; required_len as usize];
+    let info_ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenLogonSid,
+            info.as_mut_ptr() as *mut c_void,
+            required_len,
+            &mut required_len,
+        )
+    };
+    if info_ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let groups = unsafe { &*(info.as_ptr() as *const TOKEN_GROUPS) };
+    if groups.GroupCount == 0 {
+        return Err(io::Error::other("token has no logon SID"));
+    }
+    let sid = groups.Groups[0].Sid;
+    if sid.is_null() {
+        return Err(io::Error::other("logon SID pointer was null"));
+    }
+
+    let sid_len = unsafe { GetLengthSid(sid) };
+    if sid_len == 0 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let mut sid_copy = vec![0u8; sid_len as usize];
+    let copy_ok = unsafe { CopySid(sid_len, sid_copy.as_mut_ptr() as *mut c_void, sid) };
+    if copy_ok == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(sid_copy)
+}
+
+#[cfg(target_family = "windows")]
 fn create_named_pipe_server(
     pipe_name: &str,
     access_mode: windows_sys::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES,
 ) -> io::Result<File> {
     let wide = to_wide_nul(pipe_name);
+    let mut logon_sid = current_logon_sid()?;
+    let mut explicit: EXPLICIT_ACCESS_W = unsafe { std::mem::zeroed() };
+    explicit.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+    explicit.grfAccessMode = GRANT_ACCESS;
+    explicit.grfInheritance = 0;
+    explicit.Trustee = TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: 0,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        ptstrName: logon_sid.as_mut_ptr() as *mut u16,
+    };
+
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let acl_status = unsafe { SetEntriesInAclW(1, &explicit, std::ptr::null_mut(), &mut dacl) };
+    if acl_status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(acl_status as i32));
+    }
+
     let mut security_descriptor: SECURITY_DESCRIPTOR = unsafe { std::mem::zeroed() };
     let init_ok = unsafe {
         InitializeSecurityDescriptor(&mut security_descriptor as *mut _ as *mut c_void, 1)
     };
     if init_ok == 0 {
+        if !dacl.is_null() {
+            unsafe {
+                let _ = LocalFree(dacl as HLOCAL);
+            }
+        }
         return Err(io::Error::last_os_error());
     }
-    // Use a null DACL so the restricted worker token created by the Windows sandbox runner can
-    // connect to this private, randomly named pipe endpoint.
     let dacl_ok = unsafe {
         SetSecurityDescriptorDacl(
             &mut security_descriptor as *mut _ as *mut c_void,
             1,
-            std::ptr::null_mut(),
+            dacl,
             0,
         )
     };
     if dacl_ok == 0 {
+        if !dacl.is_null() {
+            unsafe {
+                let _ = LocalFree(dacl as HLOCAL);
+            }
+        }
         return Err(io::Error::last_os_error());
     }
     let security_attributes = SECURITY_ATTRIBUTES {
@@ -774,6 +907,11 @@ fn create_named_pipe_server(
             &security_attributes,
         )
     };
+    if !dacl.is_null() {
+        unsafe {
+            let _ = LocalFree(dacl as HLOCAL);
+        }
+    }
     if handle == INVALID_HANDLE_VALUE {
         return Err(io::Error::last_os_error());
     }
@@ -850,32 +988,49 @@ pub fn connect_from_env(_timeout: Duration) -> io::Result<WorkerIpcConnection> {
         let pipe_from_worker = std::env::var(IPC_PIPE_FROM_WORKER_ENV)
             .map_err(|_| io::Error::new(io::ErrorKind::NotFound, "IPC from-worker pipe missing"))?;
         let deadline = Instant::now() + timeout;
+        let mut reader: Option<File> = None;
+        let mut writer: Option<File> = None;
+        let mut last_err: Option<io::Error> = None;
         loop {
-            match (
-                open_named_pipe_client(&pipe_to_worker, FILE_GENERIC_READ),
-                open_named_pipe_client(&pipe_from_worker, FILE_GENERIC_WRITE),
-            ) {
-                (Ok(reader), Ok(writer)) => {
-                    return WorkerIpcConnection::new(IpcTransport {
-                        reader: Box::new(reader),
-                        writer: Box::new(writer),
-                    });
-                }
-                (reader_res, writer_res) => {
-                    let err = match (reader_res, writer_res) {
-                        (Err(err), _) => err,
-                        (_, Err(err)) => err,
-                        (Ok(_), Ok(_)) => unreachable!(),
-                    };
-                    if !should_retry_pipe_open(&err)
-                        || timeout.is_zero()
-                        || Instant::now() >= deadline
-                    {
-                        return Err(err);
+            if reader.is_none() {
+                match open_named_pipe_client(&pipe_to_worker, FILE_GENERIC_READ) {
+                    Ok(file) => reader = Some(file),
+                    Err(err) => {
+                        if !should_retry_pipe_open(&err) {
+                            return Err(err);
+                        }
+                        last_err = Some(err);
                     }
-                    thread::sleep(Duration::from_millis(10));
                 }
             }
+            if writer.is_none() {
+                match open_named_pipe_client(&pipe_from_worker, FILE_GENERIC_WRITE) {
+                    Ok(file) => writer = Some(file),
+                    Err(err) => {
+                        if !should_retry_pipe_open(&err) {
+                            return Err(err);
+                        }
+                        last_err = Some(err);
+                    }
+                }
+            }
+
+            if let (Some(reader), Some(writer)) = (reader.take(), writer.take()) {
+                return WorkerIpcConnection::new(IpcTransport {
+                    reader: Box::new(reader),
+                    writer: Box::new(writer),
+                });
+            }
+
+            if timeout.is_zero() || Instant::now() >= deadline {
+                return Err(last_err.unwrap_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out connecting to IPC named pipes",
+                    )
+                }));
+            }
+            thread::sleep(Duration::from_millis(10));
         }
     }
     #[cfg(not(any(target_family = "unix", target_family = "windows")))]
