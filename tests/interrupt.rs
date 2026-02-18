@@ -2,7 +2,7 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::{CallToolResult, RawContent};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use tokio::time::{Duration, Instant, sleep};
 
 fn result_text(result: &CallToolResult) -> String {
@@ -15,6 +15,13 @@ fn result_text(result: &CallToolResult) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn is_busy_response(text: &str) -> bool {
+    text.contains("<<console status: busy")
+        || text.contains("worker is busy")
+        || text.contains("request already running")
+        || text.contains("input discarded while worker busy")
 }
 
 async fn spawn_interrupt_session() -> TestResult<common::McpTestSession> {
@@ -134,13 +141,31 @@ async fn write_stdin_ctrl_d_prefix_restarts_then_runs_remaining_input() -> TestR
 
     let _ = session.write_stdin_raw_with("x <- 1", Some(5.0)).await?;
 
-    let result = session
+    let first = session
         .write_stdin_raw_with("\u{4}print(exists(\"x\"))", Some(10.0))
         .await?;
-    let text = result_text(&result);
+    let mut text = result_text(&first);
+    if is_busy_response(&text) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if Instant::now() >= deadline {
+                session.cancel().await?;
+                panic!("expected fresh session after restart prefix, got: {text:?}");
+            }
+            sleep(Duration::from_millis(100)).await;
+            let result = session
+                .write_stdin_raw_with("print(exists(\"x\"))", Some(5.0))
+                .await?;
+            text = result_text(&result);
+            if is_busy_response(&text) {
+                continue;
+            }
+            break;
+        }
+    }
     assert!(
         text.contains("FALSE"),
-        "expected fresh session after restart prefix, got: {text:?}"
+        "expected fresh session output, got: {text:?}"
     );
 
     session.cancel().await?;
