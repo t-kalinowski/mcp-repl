@@ -102,27 +102,16 @@ fn should_apply_network_block(policy: &SandboxPolicy) -> bool {
 }
 
 fn apply_no_network_to_env(env_map: &mut HashMap<String, String>) {
-    env_map
-        .entry("HTTP_PROXY".to_string())
-        .or_insert_with(|| "http://127.0.0.1:9".to_string());
-    env_map
-        .entry("HTTPS_PROXY".to_string())
-        .or_insert_with(|| "http://127.0.0.1:9".to_string());
-    env_map
-        .entry("ALL_PROXY".to_string())
-        .or_insert_with(|| "http://127.0.0.1:9".to_string());
-    env_map
-        .entry("NO_PROXY".to_string())
-        .or_insert_with(|| "localhost,127.0.0.1,::1".to_string());
-    env_map
-        .entry("CARGO_NET_OFFLINE".to_string())
-        .or_insert_with(|| "true".to_string());
-    env_map
-        .entry("NPM_CONFIG_OFFLINE".to_string())
-        .or_insert_with(|| "true".to_string());
-    env_map
-        .entry("PIP_NO_INDEX".to_string())
-        .or_insert_with(|| "1".to_string());
+    env_map.insert("HTTP_PROXY".to_string(), "http://127.0.0.1:9".to_string());
+    env_map.insert("HTTPS_PROXY".to_string(), "http://127.0.0.1:9".to_string());
+    env_map.insert("ALL_PROXY".to_string(), "http://127.0.0.1:9".to_string());
+    env_map.insert(
+        "NO_PROXY".to_string(),
+        "localhost,127.0.0.1,::1".to_string(),
+    );
+    env_map.insert("CARGO_NET_OFFLINE".to_string(), "true".to_string());
+    env_map.insert("NPM_CONFIG_OFFLINE".to_string(), "true".to_string());
+    env_map.insert("PIP_NO_INDEX".to_string(), "1".to_string());
 }
 
 fn canonicalize_or_identity(path: &Path) -> PathBuf {
@@ -1144,6 +1133,49 @@ mod tests {
     #[test]
     fn applies_network_block_for_read_only() {
         assert!(should_apply_network_block(&SandboxPolicy::ReadOnly));
+    }
+
+    #[test]
+    fn apply_no_network_to_env_overrides_existing_values() {
+        let mut env_map = HashMap::new();
+        env_map.insert(
+            "HTTP_PROXY".to_string(),
+            "http://proxy.example:8080".to_string(),
+        );
+        env_map.insert(
+            "HTTPS_PROXY".to_string(),
+            "http://proxy.example:8080".to_string(),
+        );
+        env_map.insert(
+            "ALL_PROXY".to_string(),
+            "http://proxy.example:8080".to_string(),
+        );
+        env_map.insert("NO_PROXY".to_string(), "example.com".to_string());
+        env_map.insert("CARGO_NET_OFFLINE".to_string(), "false".to_string());
+        env_map.insert("NPM_CONFIG_OFFLINE".to_string(), "false".to_string());
+        env_map.insert("PIP_NO_INDEX".to_string(), "0".to_string());
+
+        apply_no_network_to_env(&mut env_map);
+
+        assert_eq!(
+            env_map.get("HTTP_PROXY"),
+            Some(&"http://127.0.0.1:9".to_string())
+        );
+        assert_eq!(
+            env_map.get("HTTPS_PROXY"),
+            Some(&"http://127.0.0.1:9".to_string())
+        );
+        assert_eq!(
+            env_map.get("ALL_PROXY"),
+            Some(&"http://127.0.0.1:9".to_string())
+        );
+        assert_eq!(
+            env_map.get("NO_PROXY"),
+            Some(&"localhost,127.0.0.1,::1".to_string())
+        );
+        assert_eq!(env_map.get("CARGO_NET_OFFLINE"), Some(&"true".to_string()));
+        assert_eq!(env_map.get("NPM_CONFIG_OFFLINE"), Some(&"true".to_string()));
+        assert_eq!(env_map.get("PIP_NO_INDEX"), Some(&"1".to_string()));
     }
 
     #[test]

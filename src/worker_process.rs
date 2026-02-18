@@ -2462,14 +2462,15 @@ impl WorkerProcess {
                 .connect(ipc.clone(), handlers)
                 .map_err(WorkerError::Io)?;
             #[cfg(target_family = "windows")]
-            ipc_server
-                .connect(
+            handle_windows_ipc_connect_result(
+                ipc_server.connect(
                     ipc.clone(),
                     handlers,
                     &mut child,
                     WINDOWS_IPC_CONNECT_MAX_WAIT,
-                )
-                .map_err(WorkerError::Io)?;
+                ),
+                &mut child,
+            )?;
         }
 
         #[cfg(target_family = "unix")]
@@ -3244,6 +3245,21 @@ fn shutdown_term_delay(timeout: Duration) -> Duration {
     by_fraction.min(by_remaining)
 }
 
+#[cfg(target_family = "windows")]
+fn handle_windows_ipc_connect_result(
+    connect_result: Result<(), std::io::Error>,
+    child: &mut Child,
+) -> Result<(), WorkerError> {
+    match connect_result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Err(WorkerError::Io(err))
+        }
+    }
+}
+
 #[cfg(target_family = "unix")]
 fn set_command_arg0(command: &mut Command, arg0: &str) {
     command.arg0(arg0);
@@ -3349,5 +3365,26 @@ mod tests {
             split_write_stdin_control_prefix("\u{4}\nprint(1)").expect("expected control prefix");
         assert!(matches!(action, WriteStdinControlAction::Restart));
         assert_eq!(remaining, "print(1)");
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_ipc_connect_error_kills_child() {
+        let mut child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .spawn()
+            .expect("spawn test child process");
+
+        let result = handle_windows_ipc_connect_result(
+            Err(std::io::Error::other("ipc connect failed")),
+            &mut child,
+        );
+        assert!(matches!(result, Err(WorkerError::Io(_))));
+
+        let status = child.try_wait().expect("query child status");
+        assert!(
+            status.is_some(),
+            "child should be terminated on connect error"
+        );
     }
 }
