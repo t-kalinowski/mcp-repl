@@ -1173,6 +1173,24 @@ pub fn emit_session_end() {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_connection_pair() -> io::Result<(ServerIpcConnection, WorkerIpcConnection)> {
+    let (server_read, worker_write) = std::io::pipe()?;
+    let (worker_read, server_write) = std::io::pipe()?;
+    let server = ServerIpcConnection::new(
+        IpcTransport {
+            reader: Box::new(server_read),
+            writer: Box::new(server_write),
+        },
+        IpcHandlers::default(),
+    )?;
+    let worker = WorkerIpcConnection::new(IpcTransport {
+        reader: Box::new(worker_read),
+        writer: Box::new(worker_write),
+    })?;
+    Ok((server, worker))
+}
+
 fn take_session_end(guard: &mut ServerIpcInbox) -> bool {
     if !guard.session_end {
         return false;

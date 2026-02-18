@@ -132,7 +132,9 @@ fn driver_wait_for_completion(
                 });
             }
             Err(IpcWaitError::Timeout) => {
-                if ipc.waiting_for_next_input(REQUEST_END_FALLBACK_WAIT) {
+                if ipc.waiting_for_next_input(REQUEST_END_FALLBACK_WAIT)
+                    && ipc.try_take_request_end()
+                {
                     let (prompt, prompt_variants, echo_events) = collect_completion_metadata(&ipc);
                     return Ok(CompletionInfo {
                         prompt,
@@ -3371,6 +3373,35 @@ mod tests {
             split_write_stdin_control_prefix("\u{4}\nprint(1)").expect("expected control prefix");
         assert!(matches!(action, WriteStdinControlAction::Restart));
         assert_eq!(remaining, "print(1)");
+    }
+
+    #[test]
+    fn completion_waits_for_request_end_event() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        driver_on_input_start("1+1", &server);
+
+        let sender = std::thread::spawn(move || {
+            let prompt = "> ".to_string();
+            let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+                prompt: prompt.clone(),
+            });
+            let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+                prompt: prompt.clone(),
+                line: "1+1\n".to_string(),
+            });
+            let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+                prompt: prompt.clone(),
+            });
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+        });
+
+        let result = driver_wait_for_completion(Duration::from_millis(75), server);
+        sender.join().expect("sender thread");
+        assert!(
+            matches!(result, Err(WorkerError::Timeout(_))),
+            "expected timeout before request-end"
+        );
     }
 
     #[cfg(target_family = "windows")]
