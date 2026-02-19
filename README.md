@@ -97,16 +97,11 @@ command = "/Users/alice/.cargo/bin/mcp-console"
 # - /Users/alice/Library/Preferences/org.R-project.R/R
 # Re-run `mcp-console install-codex` to refresh this list.
 args = [
-  "--sandbox-mode",
-  "workspace-write",
-  "--sandbox-network-access",
-  "restricted",
-  "--writable-root",
-  "/Users/alice/Library/Caches/org.R-project.R/R",
-  "--writable-root",
-  "/Users/alice/Library/Application Support/org.R-project.R/R",
-  "--writable-root",
-  "/Users/alice/Library/Preferences/org.R-project.R/R",
+  "--sandbox-mode", "workspace-write",
+  "--sandbox-network-access", "restricted",
+  "--writable-root", "/Users/alice/Library/Caches/org.R-project.R/R",
+  "--writable-root", "/Users/alice/Library/Application Support/org.R-project.R/R",
+  "--writable-root", "/Users/alice/Library/Preferences/org.R-project.R/R",
 ]
 ```
 
@@ -182,7 +177,6 @@ The full operator guide for `write_stdin` is in
 - Tool behavior and usage guidance: `docs/tool-descriptions/write_stdin_tool.md`
 - Sandbox behavior and configuration: `docs/sandbox.md`
 - Worker sideband protocol: `docs/worker_sideband_protocol.md`
-- Deferred ideas / future work: `docs/deferred-work/external-mcp-console-config.md`
 
 ## License
 
