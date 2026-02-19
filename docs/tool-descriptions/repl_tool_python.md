@@ -3,9 +3,11 @@
 Arguments:
 - `input` (string): bytes to write to backend stdin.
 - `timeout_ms` (number, optional): maximum milliseconds to wait before returning.
+  Timeout bounds only this response window; it does not cancel backend work.
 
 Python REPL affordances:
-- Session state persists across calls.
+- Session state persists across calls; treat persistence as an iteration aid, not a correctness guarantee.
+- While work is still running, concurrent non-empty input is discarded; use empty `input` to poll.
 - Pager mode activates on large output. While active, backend input is blocked; use pager commands (for example `:q`, `:/pattern`, `:n`, empty input for next page).
 - Plot images are returned as image content (for example matplotlib output).
 - Help flows are in-band (`help()`, `dir()`, `pydoc.help`).

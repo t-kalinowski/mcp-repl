@@ -15,6 +15,12 @@ It should be treated as source material for:
 - a dedicated REPL skill
 - dynamic runtime selection of extras by active backend
 
+## Recovered backend-selection guidance
+
+- Default backend: `r`.
+- CLI backend selection: `mcp-repl --backend r|python`.
+- Environment backend selection: `MCP_REPL_BACKEND=r|python`.
+
 ## Recovered shared guidance
 
 ### Operating model
@@ -34,7 +40,9 @@ It should be treated as source material for:
 
 - Use short non-blocking/near-non-blocking calls to launch long work, then poll.
 - Treat timeout return as partial progress, not cancellation.
+- Timeout replies surface explicit busy status markers (`<<console status: busy, write_stdin timeout reached; elapsed_ms=...>>`).
 - While work is active, reject/discard concurrent non-empty input and poll until completion.
+- Empty-input poll while idle can return `<<console status: idle>>`.
 - After completion, resume normal interactive flow.
 
 ## Recovered R-specific guidance
@@ -63,6 +71,7 @@ It should be treated as source material for:
 
 - Use `browser()`, `debug()`, `debugonce()`, `trace()` to inspect execution points.
 - In debugger frames, inspect with `ls.str()` and `sys.calls()`.
+- In browser mode, `?` prints debugger commands.
 - Use browser-driven development:
   - start with a minimal stub and `browser()`
   - trigger real call sites
@@ -105,8 +114,10 @@ It should be treated as source material for:
 - While pager is active, backend input is blocked.
 - Empty input advances one page.
 - Non-empty pager commands must be `:`-prefixed.
+- Non-empty non-command input is rejected while pager is active.
 - Backend prompt is suppressed during pager mode and restored after exit.
 - Pager output de-duplicates already shown content within a pager session.
+- Pager mode can emit compact input summaries such as `[mcp-console] input: ... [TRUNCATED]`; this is not a backend prompt.
 
 ### Pager commands
 
@@ -127,7 +138,7 @@ It should be treated as source material for:
 
 - `options(console.plot.width = ..., console.plot.height = ...)`
 - `options(console.plot.units = "in" | "cm" | "mm" | "px")`
-- `options(console.plot.dpi = ...)`
+- `options(console.plot.dpi = ...)` (alias: `console.plot.res`)
 
 ## Recovered sandbox guidance
 
@@ -150,11 +161,13 @@ It should be treated as source material for:
 ### Session exit and crashes
 
 - EOF or runtime exit leads to worker respawn for the next request.
+- `quit("no")`, `quit()`, and `quit("yes")` end the current session; the next request runs in a fresh worker.
+- Save-workspace prompts in R are auto-answered `no` to avoid hangs.
 - Mid-request worker exit/crash should return captured output and a terminal error line.
 
-## Intentionally omitted from recovery
+## Recovered feedback loop
 
-- Legacy workspace-save prompt behavior details are intentionally excluded because they are no longer current or relevant to the cleaned surface.
+- If tool behavior is confusing, surprising, or error-prone, report it and capture concrete wording improvements for the extras draft.
 
 ## Delivery plan
 
