@@ -2,11 +2,22 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::RawContent;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 fn test_mutex() -> &'static Mutex<()> {
     static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
     TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+fn lock_mutex(mutex: &Mutex<()>) -> MutexGuard<'_, ()> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn lock_test_mutex() -> MutexGuard<'static, ()> {
+    lock_mutex(test_mutex())
 }
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
@@ -48,9 +59,7 @@ async fn spawn_behavior_session() -> TestResult<common::McpTestSession> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_discards_when_busy() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "write_stdin_behavior test mutex poisoned")?;
+    let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
     let _ = session
@@ -78,9 +87,7 @@ async fn write_stdin_discards_when_busy() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_trims_continuation_echo() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "write_stdin_behavior test mutex poisoned")?;
+    let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
     let result = session.write_stdin_raw_with("1+\n1", Some(30.0)).await?;
@@ -110,9 +117,7 @@ async fn write_stdin_trims_continuation_echo() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_mixed_stdout_stderr() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "write_stdin_behavior test mutex poisoned")?;
+    let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
     let result = session
@@ -140,9 +145,7 @@ async fn write_stdin_mixed_stdout_stderr() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_normalizes_error_prompt() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "write_stdin_behavior test mutex poisoned")?;
+    let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
     let result = session
@@ -170,4 +173,15 @@ async fn write_stdin_normalizes_error_prompt() -> TestResult<()> {
     );
     assert_ne!(result.is_error, Some(true));
     Ok(())
+}
+
+#[test]
+fn lock_mutex_handles_poisoned_mutex() {
+    let mutex = Mutex::new(());
+    let _ = std::panic::catch_unwind(|| {
+        let _guard = mutex.lock().expect("lock");
+        panic!("poison mutex");
+    });
+
+    let _guard = lock_mutex(&mutex);
 }

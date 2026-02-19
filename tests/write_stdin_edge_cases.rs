@@ -3,11 +3,18 @@ mod common;
 use common::TestResult;
 use rmcp::model::RawContent;
 use rmcp::service::ServiceError;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 fn test_mutex() -> &'static Mutex<()> {
     static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
     TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+fn lock_test_mutex() -> MutexGuard<'static, ()> {
+    match test_mutex().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
@@ -49,9 +56,7 @@ fn assert_invalid_timeout(err: ServiceError) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_timeout_zero_is_non_blocking() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "write_stdin_edge_cases test mutex poisoned")?;
+    let _guard = lock_test_mutex();
     let mut session = common::spawn_server().await?;
 
     let timeout_result = session
@@ -96,9 +101,7 @@ async fn write_stdin_timeout_zero_is_non_blocking() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_accepts_crlf_input() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "write_stdin_edge_cases test mutex poisoned")?;
+    let _guard = lock_test_mutex();
     let mut session = common::spawn_server().await?;
 
     let input = "cat('A\\n')\r\ncat('B\\n')";
@@ -123,9 +126,7 @@ async fn write_stdin_accepts_crlf_input() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_without_trailing_newline_runs() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "write_stdin_edge_cases test mutex poisoned")?;
+    let _guard = lock_test_mutex();
     let mut session = common::spawn_server().await?;
 
     let result = session
@@ -147,9 +148,7 @@ async fn write_stdin_without_trailing_newline_runs() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_empty_returns_prompt() -> TestResult<()> {
-    let _guard = test_mutex()
-        .lock()
-        .map_err(|_| "write_stdin_edge_cases test mutex poisoned")?;
+    let _guard = lock_test_mutex();
     let mut session = common::spawn_server().await?;
 
     let result = session

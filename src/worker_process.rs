@@ -299,7 +299,7 @@ impl std::error::Error for WorkerError {
 
 const BACKEND_INFO_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(target_family = "windows")]
-const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(600);
+const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(120);
 const COMPLETION_METADATA_SETTLE_MAX: Duration = Duration::from_millis(30);
 const COMPLETION_METADATA_SETTLE_POLL: Duration = Duration::from_millis(5);
 const COMPLETION_METADATA_STABLE: Duration = Duration::from_millis(10);
@@ -3471,5 +3471,15 @@ mod tests {
 
         let _ = child.kill();
         let _ = child.wait();
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_ipc_connect_timeout_is_bounded() {
+        assert!(
+            WINDOWS_IPC_CONNECT_MAX_WAIT <= Duration::from_secs(120),
+            "windows IPC connect max wait should fail fast, got {:?}",
+            WINDOWS_IPC_CONNECT_MAX_WAIT
+        );
     }
 }

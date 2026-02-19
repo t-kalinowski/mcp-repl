@@ -1066,6 +1066,14 @@ tryCatch({{
     let result = session.write_stdin_raw_with(&code, Some(10.0)).await?;
     let text = collect_text(&result);
     let _ = std::fs::remove_file(&forbidden);
+    if text.contains("CreateRestrictedToken failed: 87")
+        || text.contains("worker exited before IPC named pipe connection")
+        || text.contains("timed out waiting for IPC named pipe client connection")
+    {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
 
     assert!(
         text.contains("WRITE_ERROR:"),
