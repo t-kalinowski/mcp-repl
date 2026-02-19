@@ -263,7 +263,6 @@ fn probe_r_writable_roots() -> Vec<PathBuf> {
     let output = Command::new("R")
         .stdin(Stdio::null())
         .arg("-s")
-        .arg("--vanilla")
         .arg("-e")
         .arg(
             r#"cat(
@@ -315,8 +314,7 @@ fn parse_r_writable_roots_probe_output(stdout: &str) -> Vec<PathBuf> {
 fn codex_r_writable_roots_comment(additional_writable_roots: &[PathBuf]) -> String {
     let mut lines = vec![
         "".to_string(),
-        "# mcp-console additional writable roots outside cwd (install-time R --vanilla probe):"
-            .to_string(),
+        "# mcp-console additional writable roots outside cwd (install-time R probe):".to_string(),
     ];
     if additional_writable_roots.is_empty() {
         lines.push("# - none discovered".to_string());

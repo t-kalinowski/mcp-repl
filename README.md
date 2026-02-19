@@ -81,10 +81,26 @@ mcp-console install-claude
 mcp-console install
 ```
 
-`install-codex` also runs a one-time `R --vanilla` probe and annotates
+`install-codex` also runs a one-time `R` probe and annotates
 `~/.codex/config.toml` with additional writable roots (outside `cwd`) commonly needed for R
 tooling (`cache`, `data`, `config`). When no explicit sandbox state arg is already set, those roots
 are injected into the installed `--sandbox-state` args.
+
+Example generated Codex config (paths vary by OS/user):
+
+```toml
+[mcp_servers.console]
+command = "/Users/alice/.cargo/bin/mcp-console"
+# mcp-console additional writable roots outside cwd (install-time R probe):
+# - /Users/alice/Library/Caches/org.R-project.R/R
+# - /Users/alice/Library/Application Support/org.R-project.R/R
+# - /Users/alice/Library/Preferences/org.R-project.R/R
+# Re-run `mcp-console install-codex` to refresh this list.
+args = [
+  "--sandbox-state",
+  '{"sandboxPolicy":{"type":"workspace-write","network_access":false,"writable_roots":["/Users/alice/Library/Caches/org.R-project.R/R","/Users/alice/Library/Application Support/org.R-project.R/R","/Users/alice/Library/Preferences/org.R-project.R/R"]}}',
+]
+```
 
 For manual Codex config, the entry looks like:
 
