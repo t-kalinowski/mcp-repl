@@ -251,7 +251,9 @@ impl BackendDriver for PythonBackendDriver {
     fn on_input_start(&mut self, text: &str, ipc: &ServerIpcConnection) {
         driver_on_input_start(text, ipc);
         let _ = ipc.send(ServerToWorkerIpcMessage::StdinWrite {
-            text: text.to_string(),
+            // Python-side IPC only needs a request-start signal; avoid duplicating large stdin
+            // payloads on the control channel so interrupt/session-end messages stay responsive.
+            text: String::new(),
         });
     }
 
@@ -3425,6 +3427,28 @@ mod tests {
             matches!(result, Err(WorkerError::Timeout(_))),
             "expected timeout before request-end"
         );
+    }
+
+    #[test]
+    fn python_driver_uses_small_ipc_request_start_signal() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        let mut driver = PythonBackendDriver::new();
+        let big_input = "x".repeat(256 * 1024);
+
+        driver.on_input_start(&big_input, &server);
+
+        let msg = worker
+            .recv(Some(Duration::from_millis(200)))
+            .expect("expected stdin_write control message");
+        match msg {
+            ServerToWorkerIpcMessage::StdinWrite { text } => {
+                assert!(
+                    text.is_empty(),
+                    "expected request-start signal without copying stdin payload"
+                );
+            }
+            _ => panic!("expected stdin_write control message"),
+        }
     }
 
     #[cfg(target_family = "windows")]
