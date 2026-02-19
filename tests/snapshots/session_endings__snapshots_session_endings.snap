@@ -243,11 +243,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> quit(\"no\")"
-    },
-    {
-      "type": "text",
-      "text": "worker error: worker protocol error: ipc disconnected while waiting for request completion"
+      "text": "> quit(\"no\")\n[mcp-console] session ended"
     }
   ]
 }
@@ -313,11 +309,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> quit()"
-    },
-    {
-      "type": "text",
-      "text": "worker error: worker protocol error: ipc disconnected while waiting for request completion"
+      "text": "> quit()\n[mcp-console] session ended"
     }
   ]
 }
@@ -383,11 +375,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> quit(\"yes\")"
-    },
-    {
-      "type": "text",
-      "text": "worker error: worker protocol error: ipc disconnected while waiting for request completion"
+      "text": "> quit(\"yes\")\n[mcp-console] session ended"
     }
   ]
 }

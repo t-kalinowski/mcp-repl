@@ -19,6 +19,10 @@ response:
   "content": [
     {
       "type": "text",
+      "text": "> cat(\"start\\n\"); flush.console(); Sys.sleep(1); cat(\"end\\n\")\nstart"
+    },
+    {
+      "type": "text",
       "text": "<<console status: busy, write_stdin timeout reached; elapsed_ms=500>>"
     }
   ]
@@ -39,7 +43,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "start\nend"
+      "text": "end"
     },
     {
       "type": "text",

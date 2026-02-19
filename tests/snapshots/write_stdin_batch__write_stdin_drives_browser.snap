@@ -67,7 +67,7 @@ response:
     },
     {
       "type": "text",
-      "text": "Browse[2]> "
+      "text": "Browse[1]> "
     }
   ]
 }
@@ -91,7 +91,7 @@ response:
     },
     {
       "type": "text",
-      "text": "Browse[2]> "
+      "text": "Browse[1]> "
     }
   ]
 }

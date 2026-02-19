@@ -250,6 +250,9 @@ impl BackendDriver for PythonBackendDriver {
 
     fn on_input_start(&mut self, text: &str, ipc: &ServerIpcConnection) {
         driver_on_input_start(text, ipc);
+        let _ = ipc.send(ServerToWorkerIpcMessage::StdinWrite {
+            text: text.to_string(),
+        });
     }
 
     fn wait_for_completion(
