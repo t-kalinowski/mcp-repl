@@ -298,7 +298,7 @@ async fn spawn_server_with_sandbox_state(state: String) -> TestResult<common::Mc
     .await
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 async fn spawn_server_with_sandbox_state_and_env(
     state: String,
     env: Vec<(String, String)>,
@@ -453,6 +453,116 @@ async fn sandbox_workspace_write_allows_workspace_writes() -> TestResult<()> {
         "expected write to succeed, got: {text}"
     );
     session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_workspace_write_allows_r_package_cache_root_from_config() -> TestResult<()> {
+    if !sandbox_available() {
+        eprintln!("sandbox-exec unavailable; skipping");
+        return Ok(());
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return Ok(());
+    };
+    let home = PathBuf::from(home);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let root = home.join(format!(".mcp-console-sandbox-r-cache-probe-{nanos}"));
+
+    let xdg_cache_home = root.join("xdg-cache");
+    let r_package_cache_root = xdg_cache_home.join("R");
+    let reticulate_uv_cache_root = r_package_cache_root.join("reticulate").join("uv");
+    let another_pkg_cache_root = r_package_cache_root.join("otherpkg");
+    for path in [&reticulate_uv_cache_root, &another_pkg_cache_root] {
+        std::fs::create_dir_all(path)?;
+    }
+
+    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write_with_roots(
+        false,
+        vec![r_package_cache_root.clone()],
+    ))
+    .await?;
+
+    let targets = vec![
+        unique_path(&reticulate_uv_cache_root, "reticulate-uv-cache-root"),
+        unique_path(&another_pkg_cache_root, "other-package-cache-root"),
+    ];
+    for target in &targets {
+        let result = session
+            .write_stdin_raw_with(write_test_code(target), Some(10.0))
+            .await?;
+        let text = collect_text(&result);
+        assert!(
+            text.contains("WRITE_OK"),
+            "expected write to succeed for {} got: {text}",
+            target.display()
+        );
+        let _ = std::fs::remove_file(target);
+    }
+
+    session.cancel().await?;
+    let _ = std::fs::remove_dir_all(root);
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_read_only_blocks_r_package_cache_root_writes() -> TestResult<()> {
+    if !sandbox_available() {
+        eprintln!("sandbox-exec unavailable; skipping");
+        return Ok(());
+    }
+    let Some(home) = std::env::var_os("HOME") else {
+        return Ok(());
+    };
+    let home = PathBuf::from(home);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let root = home.join(format!(
+        ".mcp-console-sandbox-r-cache-probe-read-only-{nanos}"
+    ));
+
+    let xdg_cache_home = root.join("xdg-cache");
+    let r_package_cache_root = xdg_cache_home.join("R");
+    let reticulate_uv_cache_root = r_package_cache_root.join("reticulate").join("uv");
+    std::fs::create_dir_all(&reticulate_uv_cache_root)?;
+
+    let env = vec![(
+        "R_USER_CACHE_DIR".to_string(),
+        xdg_cache_home.to_string_lossy().to_string(),
+    )];
+    let mut session =
+        spawn_server_with_sandbox_state_and_env(sandbox_state_read_only(), env).await?;
+
+    let target = unique_path(
+        &reticulate_uv_cache_root,
+        "reticulate-uv-cache-root-read-only",
+    );
+    let result = session
+        .write_stdin_raw_with(write_test_code(&target), Some(10.0))
+        .await?;
+    let text = collect_text(&result);
+
+    assert!(
+        text.contains("WRITE_ERROR:"),
+        "expected read-only mode to block write to {} got: {text}",
+        target.display()
+    );
+    assert!(
+        !text.contains("WRITE_OK"),
+        "write unexpectedly succeeded in read-only mode for {}: {text}",
+        target.display()
+    );
+
+    session.cancel().await?;
+    let _ = std::fs::remove_file(&target);
+    let _ = std::fs::remove_dir_all(root);
     Ok(())
 }
 
