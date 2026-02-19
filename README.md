@@ -83,8 +83,8 @@ mcp-console install
 
 `install-codex` also runs a one-time `R` probe and annotates
 `~/.codex/config.toml` with additional writable roots (outside `cwd`) commonly needed for R
-tooling (`cache`, `data`, `config`). When no explicit sandbox state arg is already set, those roots
-are injected into the installed `--sandbox-state` args.
+tooling (`cache`, `data`, `config`). When no explicit sandbox configuration flags are already set,
+those roots are injected into readable repeatable CLI flags.
 
 Example generated Codex config (paths vary by OS/user):
 
@@ -97,8 +97,16 @@ command = "/Users/alice/.cargo/bin/mcp-console"
 # - /Users/alice/Library/Preferences/org.R-project.R/R
 # Re-run `mcp-console install-codex` to refresh this list.
 args = [
-  "--sandbox-state",
-  '{"sandboxPolicy":{"type":"workspace-write","network_access":false,"writable_roots":["/Users/alice/Library/Caches/org.R-project.R/R","/Users/alice/Library/Application Support/org.R-project.R/R","/Users/alice/Library/Preferences/org.R-project.R/R"]}}',
+  "--sandbox-mode",
+  "workspace-write",
+  "--sandbox-network-access",
+  "restricted",
+  "--writable-root",
+  "/Users/alice/Library/Caches/org.R-project.R/R",
+  "--writable-root",
+  "/Users/alice/Library/Application Support/org.R-project.R/R",
+  "--writable-root",
+  "/Users/alice/Library/Preferences/org.R-project.R/R",
 ]
 ```
 
@@ -174,6 +182,7 @@ The full operator guide for `write_stdin` is in
 - Tool behavior and usage guidance: `docs/tool-descriptions/write_stdin_tool.md`
 - Sandbox behavior and configuration: `docs/sandbox.md`
 - Worker sideband protocol: `docs/worker_sideband_protocol.md`
+- Deferred ideas / future work: `docs/deferred-work/external-mcp-console-config.md`
 
 ## License
 

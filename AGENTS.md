@@ -6,7 +6,7 @@
   - cargo test
   - cargo +nightly fmt
 
-- Project convention: do not pass `--vanilla` to `R`/`Rscript` commands unless the user explicitly asks for it.
+- Project convention: never pass `--vanilla` to `R`/`Rscript` commands unless the user explicitly asks for it.
 
 - Snapshot tests (insta):
   - Preferred local loop:

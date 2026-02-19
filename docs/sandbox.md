@@ -17,8 +17,9 @@ The worker also gets a per-session temp directory, exported as:
 
 ## Configure sandbox policy
 
-- CLI: `mcp-console --sandbox-state read-only|workspace-write|danger-full-access`
-- CLI JSON: `mcp-console --sandbox-state '{"sandboxPolicy": ...}'`
+- CLI mode: `mcp-console --sandbox-mode read-only|workspace-write|danger-full-access`
+- CLI network toggle (workspace-write only): `mcp-console --sandbox-network-access restricted|enabled`
+- CLI writable roots (workspace-write only, repeatable): `mcp-console --writable-root /absolute/path`
 - MCP custom method: `codex/sandbox-state/update` (experimental capability `codex/sandbox-state`)
 
 ## macOS behavior
