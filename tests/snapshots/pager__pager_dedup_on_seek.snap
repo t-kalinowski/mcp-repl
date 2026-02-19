@@ -6,10 +6,10 @@ expression: snapshot.render()
 -- step 1 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "line <- paste(rep(\"x\", 120), collapse = \"\"); for (i in 1:40) cat(sprintf(\"line%02d %s\\n\", i, line))\n",
-    "timeout": 30.0
+    "input": "line <- paste(rep(\"x\", 120), collapse = \"\"); for (i in 1:40) cat(sprintf(\"line%02d %s\\n\", i, line))\n",
+    "timeout_ms": 30000
   }
 }
 response:
@@ -30,10 +30,10 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": ":next\n",
-    "timeout": 30.0
+    "input": ":next\n",
+    "timeout_ms": 30000
   }
 }
 response:
@@ -54,10 +54,10 @@ response:
 -- step 3 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": ":seek 0\n",
-    "timeout": 30.0
+    "input": ":seek 0\n",
+    "timeout_ms": 30000
   }
 }
 response:
@@ -82,10 +82,10 @@ response:
 -- step 4 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": ":next\n",
-    "timeout": 30.0
+    "input": ":next\n",
+    "timeout_ms": 30000
   }
 }
 response:
@@ -106,10 +106,10 @@ response:
 -- step 5 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": ":q\n",
-    "timeout": 30.0
+    "input": ":q\n",
+    "timeout_ms": 30000
   }
 }
 response:

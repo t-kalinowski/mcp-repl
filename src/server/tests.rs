@@ -111,6 +111,31 @@ fn cleanup_echo_only_sequences(
     cleaned
 }
 
+#[test]
+fn repl_tool_descriptions_are_backend_specific() {
+    let r = super::repl_tool_description_for_backend(crate::backend::Backend::R);
+    let python = super::repl_tool_description_for_backend(crate::backend::Backend::Python);
+
+    assert_ne!(r, python, "expected backend-specific repl descriptions");
+    assert!(r.contains("R REPL"));
+    assert!(python.contains("Python REPL"));
+}
+
+#[test]
+fn repl_tool_descriptions_include_language_specific_affordances() {
+    let r = super::repl_tool_description_for_backend(crate::backend::Backend::R);
+    let python = super::repl_tool_description_for_backend(crate::backend::Backend::Python);
+
+    for description in [r, python] {
+        let lower = description.to_lowercase();
+        assert!(lower.contains("pager"));
+        assert!(lower.contains("images"));
+        assert!(lower.contains("debug"));
+    }
+    assert!(r.contains("help()"));
+    assert!(python.contains("help()"));
+}
+
 fn split_lines(text: &str) -> Vec<String> {
     if text.is_empty() {
         return Vec::new();

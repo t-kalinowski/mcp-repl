@@ -6,10 +6,10 @@ expression: snapshot.render()
 -- step 1 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "\nset.seed(1)\ncat(\"# Title\\n\")\nfor (i in 1:60) cat(\"alpha line \", i, \"\\n\", sep = \"\")\nplot(1:5, type = \"l\")\nfor (i in 1:60) cat(\"beta line \", i, \"\\n\", sep = \"\")\nplot(5:1, type = \"l\")\nfor (i in 1:60) cat(\"gamma line \", i, \"\\n\", sep = \"\")\n",
-    "timeout": 10.0
+    "input": "\nset.seed(1)\ncat(\"# Title\\n\")\nfor (i in 1:60) cat(\"alpha line \", i, \"\\n\", sep = \"\")\nplot(1:5, type = \"l\")\nfor (i in 1:60) cat(\"beta line \", i, \"\\n\", sep = \"\")\nplot(5:1, type = \"l\")\nfor (i in 1:60) cat(\"gamma line \", i, \"\\n\", sep = \"\")\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -30,10 +30,10 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "hits alpha\n",
-    "timeout": 10.0
+    "input": "hits alpha\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -54,10 +54,10 @@ response:
 -- step 3 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "seek 0\n",
-    "timeout": 10.0
+    "input": "seek 0\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -78,10 +78,10 @@ response:
 -- step 4 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "hits beta\n",
-    "timeout": 10.0
+    "input": "hits beta\n",
+    "timeout_ms": 10000
   }
 }
 response:

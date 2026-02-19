@@ -6,10 +6,10 @@ expression: snapshot.render()
 -- step 1 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "\ncat(paste(rep(\"x\", 2200000), collapse = \"\"))\ncat(\"\\nEND\\n\")\n",
-    "timeout": 20.0
+    "input": "\ncat(paste(rep(\"x\", 2200000), collapse = \"\"))\ncat(\"\\nEND\\n\")\n",
+    "timeout_ms": 20000
   }
 }
 response:
@@ -30,10 +30,10 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "tail 8k\n",
-    "timeout": 10.0
+    "input": "tail 8k\n",
+    "timeout_ms": 10000
   }
 }
 response:

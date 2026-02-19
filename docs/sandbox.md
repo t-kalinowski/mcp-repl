@@ -1,6 +1,6 @@
 # Sandbox
 
-`mcp-console` applies an OS sandbox to worker processes unless the sandbox policy is
+`mcp-repl` applies an OS sandbox to worker processes unless the sandbox policy is
 `danger-full-access` (or `external-sandbox`).
 
 ## Default policy
@@ -17,9 +17,9 @@ The worker also gets a per-session temp directory, exported as:
 
 ## Configure sandbox policy
 
-- CLI mode: `mcp-console --sandbox-mode read-only|workspace-write|danger-full-access`
-- CLI network toggle (workspace-write only): `mcp-console --sandbox-network-access restricted|enabled`
-- CLI writable roots (workspace-write only, repeatable): `mcp-console --writable-root /absolute/path`
+- CLI mode: `mcp-repl --sandbox-mode read-only|workspace-write|danger-full-access`
+- CLI network toggle (workspace-write only): `mcp-repl --sandbox-network-access restricted|enabled`
+- CLI writable roots (workspace-write only, repeatable): `mcp-repl --writable-root /absolute/path`
 - MCP custom method: `codex/sandbox-state/update` (experimental capability `codex/sandbox-state`)
 
 ## macOS behavior
@@ -30,7 +30,7 @@ For `workspace-write`, writable roots include:
 
 - configured `writable_roots` (absolute paths only),
 - current working directory,
-- R `cache`/`data`/`config` roots configured in client policy (for Codex configs installed via `mcp-console install-codex`, this is auto-populated at install time via a one-time `R` probe),
+- R `cache`/`data`/`config` roots configured in client policy (for Codex configs installed via `mcp-repl install-codex`, this is auto-populated at install time via a one-time `R` probe),
 - temp roots (`/tmp`, `TMPDIR` when absolute), and
 - the per-session temp directory.
 

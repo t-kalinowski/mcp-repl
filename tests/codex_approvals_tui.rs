@@ -102,6 +102,9 @@ mod unix_impl {
     }
 
     fn resolve_mcp_console_path() -> TestResult<PathBuf> {
+        if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-repl") {
+            return Ok(PathBuf::from(path));
+        }
         if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-console") {
             return Ok(PathBuf::from(path));
         }
@@ -109,20 +112,21 @@ mod unix_impl {
         let mut path = std::env::current_exe()?;
         path.pop();
         path.pop();
-        path.push("mcp-console");
-        if cfg!(windows) {
-            path.set_extension("exe");
+        for candidate in ["mcp-repl", "mcp-console"] {
+            let mut candidate_path = path.clone();
+            candidate_path.push(candidate);
+            if cfg!(windows) {
+                candidate_path.set_extension("exe");
+            }
+            if candidate_path.exists() {
+                return Ok(candidate_path);
+            }
         }
-
-        if path.exists() {
-            Ok(path)
-        } else {
-            Err("unable to locate mcp-console test binary".into())
-        }
+        Err("unable to locate mcp-repl test binary".into())
     }
 
     fn tool_name() -> String {
-        "mcp__r__write_stdin".to_string()
+        "mcp__r__repl".to_string()
     }
 
     fn codex_config(mcp_console: &Path, repo_root: &Path) -> String {
@@ -265,10 +269,10 @@ trust_level = "trusted"
             }
 
             let trimmed = line.trim_start();
-            if trimmed.starts_with("└ r.write_stdin(") {
+            if trimmed.starts_with("└ r.repl(") {
                 // This line may wrap differently between Codex versions; keep the structure but
                 // omit the unstable argument rendering.
-                lines.push("  └ r.write_stdin(<omitted>)".to_string());
+                lines.push("  └ r.repl(<omitted>)".to_string());
                 skipping_wrapped_tool_args = true;
                 continue;
             }

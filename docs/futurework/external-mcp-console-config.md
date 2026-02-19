@@ -1,8 +1,8 @@
-# Deferred: External `mcp-console` Config File
+# Deferred: External `mcp-repl` Config File
 
 ## Summary
 
-Potential future feature: support `mcp-console --config /path/to/mcp-console.toml`
+Potential future feature: support `mcp-repl --config /path/to/mcp-repl.toml`
 to keep sandbox policy in a dedicated file instead of long CLI arg lists.
 
 ## Motivation
@@ -16,12 +16,12 @@ to keep sandbox policy in a dedicated file instead of long CLI arg lists.
 `~/.codex/config.toml`:
 
 ```toml
-[mcp_servers.console]
-command = "/Users/alice/.cargo/bin/mcp-console"
-args = ["--config", "/Users/alice/.codex/mcp-console.toml"]
+[mcp_servers.repl]
+command = "/Users/alice/.cargo/bin/mcp-repl"
+args = ["--config", "/Users/alice/.codex/mcp-repl.toml"]
 ```
 
-`/Users/alice/.codex/mcp-console.toml`:
+`/Users/alice/.codex/mcp-repl.toml`:
 
 ```toml
 [sandbox]

@@ -43,9 +43,10 @@ fn assert_invalid_timeout(err: ServiceError) {
     match err {
         ServiceError::McpError(error) => {
             assert!(
-                error
-                    .message
-                    .contains("timeout for write_stdin must be a non-negative number"),
+                error.message.contains("timeout_ms")
+                    || error.message.contains("non-negative")
+                    || error.message.contains("expected u64")
+                    || error.message.contains("invalid value"),
                 "unexpected error message: {}",
                 error.message
             );

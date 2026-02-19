@@ -539,7 +539,7 @@ fn setup_r(args: &[String]) -> Result<(), String> {
 
 fn build_c_args_owned(args: &[String]) -> (Vec<CString>, Vec<*mut c_char>) {
     let mut owned = Vec::with_capacity(args.len() + 1);
-    owned.push(CString::new("mcp-console").expect("argv[0] must not contain NUL"));
+    owned.push(CString::new("mcp-repl").expect("argv[0] must not contain NUL"));
     for arg in args {
         owned.push(CString::new(arg.as_str()).expect("argv must not contain NUL"));
     }

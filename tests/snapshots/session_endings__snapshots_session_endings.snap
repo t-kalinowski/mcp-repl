@@ -6,10 +6,10 @@ expression: snapshot.render()
 -- step 1 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "x <- 1\n",
-    "timeout": 10.0
+    "input": "x <- 1\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -26,10 +26,10 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "\u0004\n",
-    "timeout": 0.0
+    "input": "\u0004\n",
+    "timeout_ms": 0
   }
 }
 response:
@@ -46,10 +46,10 @@ response:
 -- step 3 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "print(exists(\"x\"))\n",
-    "timeout": 10.0
+    "input": "print(exists(\"x\"))\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -72,10 +72,10 @@ response:
 -- step 1 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "x <- 1\n",
-    "timeout": 10.0
+    "input": "x <- 1\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -92,10 +92,10 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "\u0004\n",
-    "timeout": 30.0
+    "input": "\u0004\n",
+    "timeout_ms": 30000
   }
 }
 response:
@@ -112,10 +112,10 @@ response:
 -- step 3 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "print(exists(\"x\"))\n",
-    "timeout": 10.0
+    "input": "print(exists(\"x\"))\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -138,10 +138,10 @@ response:
 -- step 1 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "\u0004\n",
-    "timeout": 10.0
+    "input": "\u0004\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -158,10 +158,10 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "1+1\n",
-    "timeout": 10.0
+    "input": "1+1\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -184,10 +184,10 @@ response:
 -- step 1 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "\u0004\n1+1\n",
-    "timeout": 10.0
+    "input": "\u0004\n1+1\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -210,10 +210,10 @@ response:
 -- step 1 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "x <- 1\n",
-    "timeout": 10.0
+    "input": "x <- 1\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -230,10 +230,10 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "quit(\"no\")\n",
-    "timeout": 10.0
+    "input": "quit(\"no\")\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -250,10 +250,10 @@ response:
 -- step 3 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "1+1\n",
-    "timeout": 10.0
+    "input": "1+1\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -276,10 +276,10 @@ response:
 -- step 1 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "x <- 1\n",
-    "timeout": 10.0
+    "input": "x <- 1\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -296,10 +296,10 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "quit()\n",
-    "timeout": 10.0
+    "input": "quit()\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -316,10 +316,10 @@ response:
 -- step 3 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "1+1\n",
-    "timeout": 10.0
+    "input": "1+1\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -342,10 +342,10 @@ response:
 -- step 1 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "setwd(tempdir()); x <- 1\n",
-    "timeout": 10.0
+    "input": "setwd(tempdir()); x <- 1\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -362,10 +362,10 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "quit(\"yes\")\n",
-    "timeout": 10.0
+    "input": "quit(\"yes\")\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -382,10 +382,10 @@ response:
 -- step 3 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "1+1\n",
-    "timeout": 10.0
+    "input": "1+1\n",
+    "timeout_ms": 10000
   }
 }
 response:

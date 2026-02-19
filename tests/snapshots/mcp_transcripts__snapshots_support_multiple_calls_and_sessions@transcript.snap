@@ -3,19 +3,19 @@ source: tests/mcp_transcripts.rs
 expression: snapshot.render_transcript()
 ---
 == session: session_1 ==
-1) write_stdin timeout=10.0
+1) repl timeout_ms=10000
 >>> x <- 40 + 2
 
-2) write_stdin timeout=10.0
+2) repl timeout_ms=10000
 >>> x
 <<< [1] 42
 
-3) write_stdin
+3) repl
 >>> 
 <<< [mcp-console] new session started
 
 == session: session_2 ==
-1) write_stdin timeout=10.0
+1) repl timeout_ms=10000
 >>> x
 <<< 
 <<< stderr: Error: object 'x' not found

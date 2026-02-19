@@ -270,7 +270,7 @@ fn parse_install_args(
     mut targets: Vec<install::InstallTarget>,
     allow_positional_targets: bool,
 ) -> Result<install::InstallOptions, Box<dyn std::error::Error>> {
-    let mut server_name = "console".to_string();
+    let mut server_name = "repl".to_string();
     let mut command = None;
     let mut args = Vec::new();
 
@@ -454,12 +454,12 @@ fn sandbox_state_from_cli_args(
 fn print_usage() {
     println!(
         "Usage:\n\
-mcp-console [--debug-repl] [--backend <r|python>] [--sandbox-mode <mode>] [--sandbox-network-access <restricted|enabled>] [--writable-root <abs-path>]...\n\
-mcp-console install [codex] [claude] [--server-name <name>] [--command <path>] [--arg <value>]...\n\
-mcp-console install-codex [--server-name <name>] [--command <path>] [--arg <value>]...\n\
-mcp-console install-claude [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
+mcp-repl [--debug-repl] [--backend <r|python>] [--sandbox-mode <mode>] [--sandbox-network-access <restricted|enabled>] [--writable-root <abs-path>]...\n\
+mcp-repl install [codex] [claude] [--server-name <name>] [--command <path>] [--arg <value>]...\n\
+mcp-repl install-codex [--server-name <name>] [--command <path>] [--arg <value>]...\n\
+mcp-repl install-claude [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
 --debug-repl: run an interactive debug REPL over stdio\n\
---backend: choose REPL backend (default: r; env MCP_CONSOLE_BACKEND)\n\
+--backend: choose REPL backend (default: r; env MCP_REPL_BACKEND)\n\
 --sandbox-mode: read-only | workspace-write | danger-full-access (default: workspace-write when sandbox flags are provided)\n\
 --sandbox-network-access: restricted | enabled (workspace-write only; default: restricted)\n\
 --writable-root: additional absolute writable path (repeatable; workspace-write only)\n\
@@ -470,9 +470,9 @@ install: update MCP config for existing agent homes only (does not create ~/.cod
 fn print_install_usage() {
     println!(
         "Usage:\n\
-mcp-console install [codex] [claude] [--server-name <name>] [--command <path>] [--arg <value>]...\n\
-mcp-console install-codex [--server-name <name>] [--command <path>] [--arg <value>]...\n\
-mcp-console install-claude [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
+mcp-repl install [codex] [claude] [--server-name <name>] [--command <path>] [--arg <value>]...\n\
+mcp-repl install-codex [--server-name <name>] [--command <path>] [--arg <value>]...\n\
+mcp-repl install-claude [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
 If no target is specified for `install`, all existing agent homes are used:\n\
 - codex: $CODEX_HOME or ~/.codex\n\
 - claude: ~/.claude\n\
@@ -519,7 +519,7 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_state_from_cli_args_rejects_mixed_legacy_and_new_flags() {
+    fn sandbox_state_from_cli_args_rejects_mixed_sandbox_state_flags() {
         let err = sandbox_state_from_cli_args(SandboxCliArgs {
             sandbox_state: Some("read-only".to_string()),
             mode: Some(SandboxModeArg::ReadOnly),

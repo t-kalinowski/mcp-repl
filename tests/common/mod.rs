@@ -291,11 +291,14 @@ impl McpTestSession {
         let timeout = normalized_test_timeout(timeout);
 
         let mut args = serde_json::Map::new();
-        args.insert("chars".to_string(), Value::String(input));
+        args.insert("input".to_string(), Value::String(input));
         if let Some(timeout) = timeout {
-            args.insert("timeout".to_string(), json!(timeout));
+            args.insert(
+                "timeout_ms".to_string(),
+                json!((timeout * 1000.0).round() as i64),
+            );
         }
-        self.call_tool("write_stdin", Value::Object(args)).await;
+        self.call_tool("repl", Value::Object(args)).await;
     }
 
     pub async fn call_tool(&mut self, tool: impl Into<String>, arguments: Value) {
@@ -349,6 +352,32 @@ impl McpTestSession {
         });
     }
 
+    pub async fn call_tool_raw(
+        &mut self,
+        tool: impl Into<String>,
+        arguments: Value,
+    ) -> Result<rmcp::model::CallToolResult, ServiceError> {
+        let tool = tool.into();
+        let arguments = match arguments {
+            Value::Null => None,
+            Value::Object(map) => Some(map.into_iter().collect()),
+            _ => {
+                return Err(ServiceError::McpError(rmcp::ErrorData::invalid_params(
+                    "tool arguments must be a JSON object",
+                    None,
+                )));
+            }
+        };
+        self.service
+            .call_tool(CallToolRequestParams {
+                meta: None,
+                name: tool.into(),
+                arguments,
+                task: None,
+            })
+            .await
+    }
+
     pub async fn write_stdin_raw_with(
         &mut self,
         input: impl Into<String>,
@@ -361,15 +390,18 @@ impl McpTestSession {
         let timeout = normalized_test_timeout(timeout);
 
         let mut args = serde_json::Map::new();
-        args.insert("chars".to_string(), Value::String(input));
+        args.insert("input".to_string(), Value::String(input));
         if let Some(timeout) = timeout {
-            args.insert("timeout".to_string(), json!(timeout));
+            args.insert(
+                "timeout_ms".to_string(),
+                json!((timeout * 1000.0).round() as i64),
+            );
         }
 
         self.service
             .call_tool(CallToolRequestParams {
                 meta: None,
-                name: "write_stdin".into(),
+                name: "repl".into(),
                 arguments: Some(args.into_iter().collect()),
                 task: None,
             })
@@ -384,15 +416,18 @@ impl McpTestSession {
         let input = input.into();
         let timeout = normalized_test_timeout(timeout);
         let mut args = serde_json::Map::new();
-        args.insert("chars".to_string(), Value::String(input));
+        args.insert("input".to_string(), Value::String(input));
         if let Some(timeout) = timeout {
-            args.insert("timeout".to_string(), json!(timeout));
+            args.insert(
+                "timeout_ms".to_string(),
+                json!((timeout * 1000.0).round() as i64),
+            );
         }
 
         self.service
             .call_tool(CallToolRequestParams {
                 meta: None,
-                name: "write_stdin".into(),
+                name: "repl".into(),
                 arguments: Some(args.into_iter().collect()),
                 task: None,
             })
@@ -659,15 +694,15 @@ fn format_snapshot_call(call: &SnapshotCall) -> (String, Vec<String>) {
 
     if let Some(Value::Object(map)) = &call.arguments {
         match call.tool.as_str() {
-            "write_stdin" => {
-                if let Some(Value::String(input)) = map.get("chars") {
+            "repl" => {
+                if let Some(Value::String(input)) = map.get("input") {
                     input_lines = split_input_lines(input);
                 }
-                if let Some(timeout) = map.get("timeout") {
-                    params.push(format!("timeout={}", format_arg_value(timeout)));
+                if let Some(timeout_ms) = map.get("timeout_ms") {
+                    params.push(format!("timeout_ms={}", format_arg_value(timeout_ms)));
                 }
                 for (key, value) in map {
-                    if key == "chars" || key == "timeout" {
+                    if key == "input" || key == "timeout_ms" {
                         continue;
                     }
                     params.push(format!("{key}={}", format_arg_value(value)));
@@ -721,7 +756,7 @@ fn format_snapshot_response_lines(response: &SnapshotResponse, tool: &str) -> Ve
                 match content {
                     SnapshotContent::Text { text } => {
                         for line in split_text_lines(text) {
-                            if tool == "write_stdin" && is_prompt_line(&line) {
+                            if tool == "repl" && is_prompt_line(&line) {
                                 continue;
                             }
                             lines.push(line);
@@ -916,6 +951,9 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
 }
 
 fn resolve_server_path() -> TestResult<PathBuf> {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-repl") {
+        return Ok(PathBuf::from(path));
+    }
     if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-console") {
         return Ok(PathBuf::from(path));
     }
@@ -923,16 +961,17 @@ fn resolve_server_path() -> TestResult<PathBuf> {
     let mut path = std::env::current_exe()?;
     path.pop();
     path.pop();
-    path.push("mcp-console");
-    if cfg!(windows) {
-        path.set_extension("exe");
+    for candidate in ["mcp-repl", "mcp-console"] {
+        let mut candidate_path = path.clone();
+        candidate_path.push(candidate);
+        if cfg!(windows) {
+            candidate_path.set_extension("exe");
+        }
+        if candidate_path.exists() {
+            return Ok(candidate_path);
+        }
     }
-
-    if path.exists() {
-        Ok(path)
-    } else {
-        Err("unable to locate mcp-console test binary".into())
-    }
+    Err("unable to locate mcp-repl test binary".into())
 }
 
 #[cfg(unix)]
