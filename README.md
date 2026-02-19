@@ -81,6 +81,11 @@ mcp-console install-claude
 mcp-console install
 ```
 
+`install-codex` also runs a one-time `R --vanilla` probe and annotates
+`~/.codex/config.toml` with additional writable roots (outside `cwd`) commonly needed for R
+tooling (`cache`, `data`, `config`). When no explicit sandbox state arg is already set, those roots
+are injected into the installed `--sandbox-state` args.
+
 For manual Codex config, the entry looks like:
 
 ```toml

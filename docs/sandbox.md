@@ -29,6 +29,7 @@ For `workspace-write`, writable roots include:
 
 - configured `writable_roots` (absolute paths only),
 - current working directory,
+- R `cache`/`data`/`config` roots configured in client policy (for Codex configs installed via `mcp-console install-codex`, this is auto-populated at install time via a one-time `R --vanilla` probe),
 - temp roots (`/tmp`, `TMPDIR` when absolute), and
 - the per-session temp directory.
 
