@@ -1,4 +1,4 @@
-pub const BACKEND_ENV: &str = "MCP_CONSOLE_BACKEND";
+pub const BACKEND_ENV: &str = "MCP_REPL_BACKEND";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {

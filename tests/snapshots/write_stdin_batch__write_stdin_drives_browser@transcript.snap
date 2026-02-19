@@ -3,21 +3,21 @@ source: tests/write_stdin_batch.rs
 expression: snapshot.render_transcript()
 ---
 == session: browser_queue ==
-1) write_stdin timeout=10.0
+1) repl timeout_ms=10000
 >>> f <- function() { browser(); x <- 1; x <- x + 1; x }
 
-2) write_stdin timeout=10.0
+2) repl timeout_ms=10000
 >>> f()
 <<< Called from: f()
 
-3) write_stdin timeout=10.0
+3) repl timeout_ms=10000
 >>> n
 <<< debug at #1: x <- 1
 
-4) write_stdin timeout=10.0
+4) repl timeout_ms=10000
 >>> n
 <<< debug at #1: x <- x + 1
 
-5) write_stdin timeout=10.0
+5) repl timeout_ms=10000
 >>> c
 <<< [1] 2

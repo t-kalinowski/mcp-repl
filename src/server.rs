@@ -11,6 +11,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 mod response;
 #[cfg(test)]
@@ -26,31 +27,28 @@ use crate::backend::Backend;
 use crate::sandbox::{SANDBOX_STATE_CAPABILITY, SANDBOX_STATE_METHOD, SandboxStateUpdate};
 use crate::worker_process::{WorkerError, WorkerManager};
 
-#[derive(Clone)]
-struct ConsoleToolServer {
-    worker: Arc<Mutex<WorkerManager>>,
-    tool_router: ToolRouter<Self>,
+#[cfg(test)]
+fn repl_tool_description_for_backend(backend: Backend) -> &'static str {
+    match backend {
+        Backend::R => include_str!("../docs/tool-descriptions/repl_tool_r.md"),
+        Backend::Python => include_str!("../docs/tool-descriptions/repl_tool_python.md"),
+    }
 }
 
-#[tool_router]
-impl ConsoleToolServer {
+#[derive(Clone)]
+struct SharedServer {
+    worker: Arc<Mutex<WorkerManager>>,
+}
+
+impl SharedServer {
     fn new(backend: Backend) -> Result<Self, WorkerError> {
-        let worker = WorkerManager::new(backend)?;
         Ok(Self {
-            worker: Arc::new(Mutex::new(worker)),
-            tool_router: Self::tool_router(),
+            worker: Arc::new(Mutex::new(WorkerManager::new(backend)?)),
         })
     }
 
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo {
-            protocol_version: ProtocolVersion::V_2025_06_18,
-            capabilities: ServerCapabilities::builder()
-                .enable_tools()
-                .enable_experimental_with(sandbox_capabilities())
-                .build(),
-            ..ServerInfo::default()
-        }
+    fn worker(&self) -> Arc<Mutex<WorkerManager>> {
+        Arc::clone(&self.worker)
     }
 
     async fn run_worker<T, F>(&self, f: F) -> Result<T, McpError>
@@ -67,52 +65,22 @@ impl ConsoleToolServer {
         .map_err(|err| McpError::internal_error(err.to_string(), None))
     }
 
-    #[doc = include_str!("../docs/tool-descriptions/write_stdin_tool.md")]
-    #[tool(name = "write_stdin")]
-    async fn write_stdin(
+    async fn run_write_input(
         &self,
-        params: Parameters<WriteStdinArgs>,
+        input: String,
+        timeout: Duration,
     ) -> Result<CallToolResult, McpError> {
-        let WriteStdinArgs { chars, timeout } = params.0;
-        let timeout = parse_timeout(timeout, "write_stdin", true)?;
         let worker_timeout = apply_tool_call_margin(timeout);
         let server_timeout = apply_safety_margin(timeout);
         let result = self
             .run_worker(move |worker| {
-                worker.write_stdin(chars, worker_timeout, server_timeout, None, false)
+                worker.write_stdin(input, worker_timeout, server_timeout, None, false)
             })
             .await?;
-
-        let mut contents = Vec::new();
-        let mut is_error = false;
-        match result {
-            Ok(reply) => {
-                let (mut reply_contents, reply_error) = worker_reply_to_contents(reply);
-                is_error |= reply_error;
-                contents.append(&mut reply_contents);
-                Ok(finalize_batch(contents, is_error))
-            }
-            Err(err) => {
-                eprintln!("worker write stdin error: {err}");
-                contents.push(Content::text(format!("worker error: {err}")));
-                is_error = true;
-                Ok(finalize_batch(contents, is_error))
-            }
-        }
-    }
-}
-
-#[tool_handler]
-impl ServerHandler for ConsoleToolServer {
-    fn get_info(&self) -> ServerInfo {
-        ConsoleToolServer::get_info(self)
+        worker_result_to_call_tool_result(result)
     }
 
-    async fn on_custom_request(
-        &self,
-        request: CustomRequest,
-        _context: rmcp::service::RequestContext<RoleServer>,
-    ) -> Result<CustomResult, McpError> {
+    async fn on_custom_request(&self, request: CustomRequest) -> Result<CustomResult, McpError> {
         if std::env::var_os("MCP_CONSOLE_DEBUG_MCP").is_some() {
             eprintln!("custom request: {}", request.method);
         }
@@ -140,11 +108,7 @@ impl ServerHandler for ConsoleToolServer {
         Ok(CustomResult::new(json!({})))
     }
 
-    async fn on_custom_notification(
-        &self,
-        notification: CustomNotification,
-        _context: rmcp::service::NotificationContext<RoleServer>,
-    ) {
+    async fn on_custom_notification(&self, notification: CustomNotification) {
         crate::sandbox::log_sandbox_state_event(&notification.method, notification.params.as_ref());
         if notification.method != SANDBOX_STATE_METHOD {
             return;
@@ -177,10 +141,133 @@ impl ServerHandler for ConsoleToolServer {
     }
 }
 
+fn server_info() -> ServerInfo {
+    ServerInfo {
+        protocol_version: ProtocolVersion::V_2025_06_18,
+        capabilities: ServerCapabilities::builder()
+            .enable_tools()
+            .enable_experimental_with(sandbox_capabilities())
+            .build(),
+        ..ServerInfo::default()
+    }
+}
+
+macro_rules! define_backend_tool_server {
+    ($server_ty:ident, $repl_doc_path:literal) => {
+        #[derive(Clone)]
+        struct $server_ty {
+            shared: SharedServer,
+            tool_router: ToolRouter<Self>,
+        }
+
+        #[tool_router]
+        impl $server_ty {
+            fn new(backend: Backend) -> Result<Self, WorkerError> {
+                Ok(Self {
+                    shared: SharedServer::new(backend)?,
+                    tool_router: Self::tool_router(),
+                })
+            }
+
+            fn get_info(&self) -> ServerInfo {
+                server_info()
+            }
+
+            #[doc = include_str!($repl_doc_path)]
+            #[tool(name = "repl")]
+            async fn repl(&self, params: Parameters<ReplArgs>) -> Result<CallToolResult, McpError> {
+                let ReplArgs { input, timeout_ms } = params.0;
+                let timeout = resolve_timeout_ms(timeout_ms, "repl", true)?;
+                self.shared.run_write_input(input, timeout).await
+            }
+
+            #[doc = include_str!("../docs/tool-descriptions/repl_reset_tool.md")]
+            #[tool(name = "repl_reset")]
+            async fn repl_reset(
+                &self,
+                _params: Parameters<ReplResetArgs>,
+            ) -> Result<CallToolResult, McpError> {
+                let timeout = parse_timeout(None, "repl_reset", false)?;
+                let worker_timeout = apply_tool_call_margin(timeout);
+                let result = self
+                    .shared
+                    .run_worker(move |worker| worker.restart(worker_timeout))
+                    .await?;
+                worker_result_to_call_tool_result(result)
+            }
+        }
+
+        #[tool_handler]
+        impl ServerHandler for $server_ty {
+            fn get_info(&self) -> ServerInfo {
+                $server_ty::get_info(self)
+            }
+
+            async fn on_custom_request(
+                &self,
+                request: CustomRequest,
+                _context: rmcp::service::RequestContext<RoleServer>,
+            ) -> Result<CustomResult, McpError> {
+                self.shared.on_custom_request(request).await
+            }
+
+            async fn on_custom_notification(
+                &self,
+                notification: CustomNotification,
+                _context: rmcp::service::NotificationContext<RoleServer>,
+            ) {
+                self.shared.on_custom_notification(notification).await
+            }
+        }
+    };
+}
+
+define_backend_tool_server!(RToolServer, "../docs/tool-descriptions/repl_tool_r.md");
+define_backend_tool_server!(
+    PythonToolServer,
+    "../docs/tool-descriptions/repl_tool_python.md"
+);
+
 #[derive(Deserialize, JsonSchema)]
-struct WriteStdinArgs {
-    chars: String,
-    timeout: Option<f64>,
+#[serde(deny_unknown_fields)]
+struct ReplArgs {
+    input: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+#[derive(Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+struct ReplResetArgs {}
+
+fn resolve_timeout_ms(
+    timeout_ms: Option<u64>,
+    tool_name: &str,
+    allow_zero: bool,
+) -> Result<Duration, McpError> {
+    let timeout_secs = timeout_ms.map(|value| Duration::from_millis(value).as_secs_f64());
+    parse_timeout(timeout_secs, tool_name, allow_zero)
+}
+
+fn worker_result_to_call_tool_result(
+    result: Result<crate::worker_protocol::WorkerReply, WorkerError>,
+) -> Result<CallToolResult, McpError> {
+    let mut contents = Vec::new();
+    let mut is_error = false;
+    match result {
+        Ok(reply) => {
+            let (mut reply_contents, reply_error) = worker_reply_to_contents(reply);
+            is_error |= reply_error;
+            contents.append(&mut reply_contents);
+            Ok(finalize_batch(contents, is_error))
+        }
+        Err(err) => {
+            eprintln!("worker write stdin error: {err}");
+            contents.push(Content::text(format!("worker error: {err}")));
+            is_error = true;
+            Ok(finalize_batch(contents, is_error))
+        }
+    }
 }
 
 fn sandbox_capabilities() -> BTreeMap<String, JsonObject> {
@@ -191,13 +278,16 @@ fn sandbox_capabilities() -> BTreeMap<String, JsonObject> {
     experimental
 }
 
-pub async fn run(backend: Backend) -> Result<(), Box<dyn std::error::Error>> {
-    eprintln!("starting mcp-console server");
-    let service = ConsoleToolServer::new(backend)?;
-    let worker = service.worker.clone();
-    let shutdown_worker = service.worker.clone();
+async fn run_backend_server<S>(
+    service: S,
+    shutdown_worker: Arc<Mutex<WorkerManager>>,
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: ServerHandler + Send + Sync + Clone + 'static,
+{
+    let warm_worker = shutdown_worker.clone();
     thread::spawn(move || {
-        let mut worker = worker.lock().unwrap();
+        let mut worker = warm_worker.lock().unwrap();
         if let Err(err) = worker.warm_start() {
             eprintln!("worker warm start error: {err}");
         }
@@ -212,9 +302,24 @@ pub async fn run(backend: Backend) -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|err| err.into())
     }
     .await;
+
     {
         let mut worker = shutdown_worker.lock().unwrap();
         worker.shutdown();
     }
     result
+}
+
+pub async fn run(backend: Backend) -> Result<(), Box<dyn std::error::Error>> {
+    eprintln!("starting mcp-repl server");
+    match backend {
+        Backend::R => {
+            let service = RToolServer::new(backend)?;
+            run_backend_server(service.clone(), service.shared.worker()).await
+        }
+        Backend::Python => {
+            let service = PythonToolServer::new(backend)?;
+            run_backend_server(service.clone(), service.shared.worker()).await
+        }
+    }
 }

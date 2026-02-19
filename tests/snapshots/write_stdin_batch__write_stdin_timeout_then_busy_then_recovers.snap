@@ -6,10 +6,10 @@ expression: snapshot.render()
 -- step 1 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "Sys.sleep(5)\n",
-    "timeout": 2.0
+    "input": "Sys.sleep(5)\n",
+    "timeout_ms": 2000
   }
 }
 response:
@@ -30,10 +30,10 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "1+1\n",
-    "timeout": 1.0
+    "input": "1+1\n",
+    "timeout_ms": 1000
   }
 }
 response:
@@ -54,10 +54,10 @@ response:
 -- step 3 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "1+1\n",
-    "timeout": 10.0
+    "input": "1+1\n",
+    "timeout_ms": 10000
   }
 }
 response:

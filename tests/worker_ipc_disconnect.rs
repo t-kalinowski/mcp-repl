@@ -40,6 +40,9 @@ mod unix {
     }
 
     fn resolve_exe() -> TestResult<PathBuf> {
+        if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-repl") {
+            return Ok(PathBuf::from(path));
+        }
         if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-console") {
             return Ok(PathBuf::from(path));
         }
@@ -47,8 +50,14 @@ mod unix {
         let mut path = std::env::current_exe()?;
         path.pop();
         path.pop();
-        path.push("mcp-console");
-        Ok(path)
+        for candidate in ["mcp-repl", "mcp-console"] {
+            let mut candidate_path = path.clone();
+            candidate_path.push(candidate);
+            if candidate_path.exists() {
+                return Ok(candidate_path);
+            }
+        }
+        Err("unable to locate mcp-repl test binary".into())
     }
 
     #[tokio::test]

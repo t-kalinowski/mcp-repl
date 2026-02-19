@@ -1,11 +1,15 @@
 [package]
-name = "mcp-console"
+name = "mcp-repl"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "MCP server exposing a long-lived interactive console (R or Python backend) over stdio."
-repository = "https://github.com/t-kalinowski/mcp-console"
+description = "MCP server exposing a long-lived interactive REPL runtime (R or Python backend) over stdio."
+repository = "https://github.com/t-kalinowski/mcp-repl"
 license = "Apache-2.0"
+
+[[bin]]
+name = "mcp-repl"
+path = "src/main.rs"
 
 [dependencies]
 ctor = "0.6.3"

@@ -6,10 +6,10 @@ expression: snapshot.render()
 -- step 1 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "cat('# Title\\n\\n## Alpha\\n'); for (i in 1:20) cat(sprintf('alpha line %02d foo\\n', i)); cat('\\n## Beta\\n'); for (i in 1:20) cat(sprintf('beta line %02d foo\\n', i))\n",
-    "timeout": 30.0
+    "input": "cat('# Title\\n\\n## Alpha\\n'); for (i in 1:20) cat(sprintf('alpha line %02d foo\\n', i)); cat('\\n## Beta\\n'); for (i in 1:20) cat(sprintf('beta line %02d foo\\n', i))\n",
+    "timeout_ms": 30000
   }
 }
 response:
@@ -30,10 +30,10 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": ":matches foo\n",
-    "timeout": 30.0
+    "input": ":matches foo\n",
+    "timeout_ms": 30000
   }
 }
 response:
@@ -58,10 +58,10 @@ response:
 -- step 3 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": ":matches -C 1 foo\n",
-    "timeout": 30.0
+    "input": ":matches -C 1 foo\n",
+    "timeout_ms": 30000
   }
 }
 response:
@@ -86,10 +86,10 @@ response:
 -- step 4 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": ":q\n",
-    "timeout": 30.0
+    "input": ":q\n",
+    "timeout_ms": 30000
   }
 }
 response:

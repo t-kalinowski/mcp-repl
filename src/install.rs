@@ -102,7 +102,7 @@ fn default_command() -> String {
     env::current_exe()
         .ok()
         .and_then(|path| path.into_os_string().into_string().ok())
-        .unwrap_or_else(|| "mcp-console".to_string())
+        .unwrap_or_else(|| "mcp-repl".to_string())
 }
 
 fn resolve_target_roots(
@@ -312,7 +312,7 @@ fn parse_r_writable_roots_probe_output(stdout: &str) -> Vec<PathBuf> {
 fn codex_r_writable_roots_comment(additional_writable_roots: &[PathBuf]) -> String {
     let mut lines = vec![
         "".to_string(),
-        "# mcp-console additional writable roots outside cwd (install-time R probe):".to_string(),
+        "# mcp-repl additional writable roots outside cwd (install-time R probe):".to_string(),
     ];
     if additional_writable_roots.is_empty() {
         lines.push("# - none discovered".to_string());
@@ -321,7 +321,7 @@ fn codex_r_writable_roots_comment(additional_writable_roots: &[PathBuf]) -> Stri
             lines.push(format!("# - {}", root.display()));
         }
     }
-    lines.push("# Re-run `mcp-console install-codex` to refresh this list.".to_string());
+    lines.push("# Re-run `mcp-repl install-codex` to refresh this list.".to_string());
     lines.join("\n") + "\n"
 }
 

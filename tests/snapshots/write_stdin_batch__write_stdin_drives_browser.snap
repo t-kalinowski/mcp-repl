@@ -6,10 +6,10 @@ expression: snapshot.render()
 -- step 1 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "f <- function() { browser(); x <- 1; x <- x + 1; x }\n",
-    "timeout": 10.0
+    "input": "f <- function() { browser(); x <- 1; x <- x + 1; x }\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -26,10 +26,10 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "f()\n",
-    "timeout": 10.0
+    "input": "f()\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -50,10 +50,10 @@ response:
 -- step 3 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "n\n",
-    "timeout": 10.0
+    "input": "n\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -74,10 +74,10 @@ response:
 -- step 4 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "n\n",
-    "timeout": 10.0
+    "input": "n\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -98,10 +98,10 @@ response:
 -- step 5 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "c\n",
-    "timeout": 10.0
+    "input": "c\n",
+    "timeout_ms": 10000
   }
 }
 response:

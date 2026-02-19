@@ -907,7 +907,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mcp-console"
+name = "mcp-repl"
 version = "0.1.0"
 dependencies = [
  "base64",

@@ -3,13 +3,13 @@ source: tests/refactor_coverage.rs
 expression: snapshot.render_transcript()
 ---
 == session: restart_interrupt ==
-1) write_stdin timeout=10.0
+1) repl timeout_ms=10000
 >>> 
 >>> set.seed(1)
 >>> plot(1:5, type = "l")
 <<< [image/png len=0]
 
-2) write_stdin timeout=10.0
+2) repl timeout_ms=10000
 >>> 
 >>> plot(5:1, type = "l")
 >>> cat("plots_done\n")
@@ -17,22 +17,22 @@ expression: snapshot.render_transcript()
 <<< plots_done
 <<< [image/png len=0]
 
-3) write_stdin
+3) repl
 >>> 
 <<< [mcp-console] new session started
 
-4) write_stdin timeout=10.0
+4) repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2
 
-5) write_stdin timeout=0.2
+5) repl timeout_ms=200
 >>> Sys.sleep(5)
 <<< <<console status: busy, write_stdin timeout reached; elapsed_ms=200>>
 
-6) write_stdin timeout=5.0
+6) repl timeout_ms=5000
 >>> 
 <<< stderr: 
 
-7) write_stdin timeout=10.0
+7) repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2

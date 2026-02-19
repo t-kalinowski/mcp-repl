@@ -6,10 +6,10 @@ expression: snapshot.render()
 -- step 1 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "\nset.seed(1)\nplot(1:5, type = \"l\")\n",
-    "timeout": 10.0
+    "input": "\nset.seed(1)\nplot(1:5, type = \"l\")\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -31,10 +31,10 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "\nplot(5:1, type = \"l\")\ncat(\"plots_done\\n\")\n",
-    "timeout": 10.0
+    "input": "\nplot(5:1, type = \"l\")\ncat(\"plots_done\\n\")\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -60,9 +60,9 @@ response:
 -- step 3 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "\u0004\n"
+    "input": "\u0004\n"
   }
 }
 response:
@@ -79,10 +79,10 @@ response:
 -- step 4 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "1+1\n",
-    "timeout": 10.0
+    "input": "1+1\n",
+    "timeout_ms": 10000
   }
 }
 response:
@@ -103,10 +103,10 @@ response:
 -- step 5 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "Sys.sleep(5)\n",
-    "timeout": 0.2
+    "input": "Sys.sleep(5)\n",
+    "timeout_ms": 200
   }
 }
 response:
@@ -127,10 +127,10 @@ response:
 -- step 6 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "\u0003\n",
-    "timeout": 5.0
+    "input": "\u0003\n",
+    "timeout_ms": 5000
   }
 }
 response:
@@ -151,10 +151,10 @@ response:
 -- step 7 --
 call:
 {
-  "tool": "write_stdin",
+  "tool": "repl",
   "arguments": {
-    "chars": "1+1\n",
-    "timeout": 10.0
+    "input": "1+1\n",
+    "timeout_ms": 10000
   }
 }
 response:

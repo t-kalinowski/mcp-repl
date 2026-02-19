@@ -1,8 +1,8 @@
-# mcp-console
+# mcp-repl
 
-`mcp-console` is an MCP server that exposes a long-lived interactive REPL over stdio through one tool: `write_stdin`.
+`mcp-repl` is an MCP server that exposes a long-lived interactive REPL runtime over stdio.
 
-The backend is R by default, with an opt-in Python backend (`--backend python`).
+It is backend-agnostic in design. The default backend is R, with an opt-in Python backend (`--backend python`).
 Session state persists across calls, so agents can iterate in place, inspect intermediate values, debug, and read docs in-band.
 
 ## Why use it
@@ -15,11 +15,11 @@ Session state persists across calls, so agents can iterate in place, inspect int
 
 ### Safe by default
 
-Like a shell, R and Python are powerful. Without guardrails, an LLM can do real damage on the host (both accidental and prompt-induced). To reduce this risk, `mcp-console` runs the backend process in a sandboxed environment. By default, network is disabled and writes are constrained to workspace roots and temp paths required by the worker. Sandbox policy is enforced with OS primitives at the process level, not command-specific runtime rules. On Unix backends, `mcp-console` also enforces a memory guardrail on the child process tree and kills the worker if it exceeds the configured threshold.
+Like a shell, R and Python are powerful. Without guardrails, an LLM can do real damage on the host (both accidental and prompt-induced). To reduce this risk, `mcp-repl` runs the backend process in a sandboxed environment. By default, network is disabled and writes are constrained to workspace roots and temp paths required by the worker. Sandbox policy is enforced with OS primitives at the process level, not command-specific runtime rules. On Unix backends, `mcp-repl` also enforces a memory resource guardrail on the child process tree and kills the worker if it exceeds the configured threshold.
 
 ### Token efficient
 
-`mcp-console` can be substantially more token efficient for an LLM than a standard persistent shell call. It includes affordances tailored to common LLM workflow strengths and weaknesses. For example:
+`mcp-repl` can be substantially more token efficient for an LLM than a standard persistent shell call. It includes affordances tailored to common LLM workflow strengths and weaknesses. For example:
 - There is rarely a need to repeatedly poll, since the console is embedded in the backend and normally returns as soon as evaluation is complete.
 - Echoed inputs are automatically pruned or elided so output is easy to attribute.
 - A rich pager, purpose-built for an LLM, prevents context floods while supporting search and controlled navigation.
@@ -39,7 +39,7 @@ These affordances are all driven by observed LLM workflows and aim to reduce tok
 
 ### Plots
 
-`mcp-console` provides a private space for the LLM to easily visualize plots of data. This allows it to iterate safely and privately, without demanding your attention until it can return with a grounded, verified result.
+`mcp-repl` provides a private space for the LLM to easily visualize plots of data. This allows it to iterate safely and privately, without demanding your attention until it can return with a grounded, verified result.
 
 ## Quickstart
 
@@ -57,28 +57,28 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 #### Install with cargo (from GitHub)
 
 ```sh
-cargo install --git https://github.com/t-kalinowski/mcp-console --locked
+cargo install --git https://github.com/t-kalinowski/mcp-repl --locked
 ```
 
-This installs `mcp-console` into Cargo’s bin directory (typically `~/.cargo/bin`). Ensure that directory is on your `PATH`.
+This installs `mcp-repl` into Cargo’s bin directory (typically `~/.cargo/bin`). Ensure that directory is on your `PATH`.
 
 ### 2) Wire into your MCP client
 
-Point your MCP client at the binary (either via `PATH` or by using an explicit path like `~/.cargo/bin/mcp-console` or `target/release/mcp-console`).
+Point your MCP client at the binary (either via `PATH` or by using an explicit path like `~/.cargo/bin/mcp-repl` or `target/release/mcp-repl`).
 
 You can auto-install into existing agent config files:
 
 ```sh
 # update existing ~/.codex/config.toml
-mcp-console install-codex
+mcp-repl install-codex
 
 # update existing ~/.claude/settings.json (or ~/.claude/config.json)
 # Note: there may be some rough edges with Claude.
 # This has been primarily developed and tested with Codex.
-mcp-console install-claude
+mcp-repl install-claude
 
 # install to all existing agent homes (does not create ~/.codex or ~/.claude)
-mcp-console install
+mcp-repl install
 ```
 
 `install-codex` also runs a one-time `R` probe and annotates
@@ -89,13 +89,13 @@ those roots are injected into readable repeatable CLI flags.
 Example generated Codex config (paths vary by OS/user):
 
 ```toml
-[mcp_servers.console]
-command = "/Users/alice/.cargo/bin/mcp-console"
-# mcp-console additional writable roots outside cwd (install-time R probe):
+[mcp_servers.repl]
+command = "/Users/alice/.cargo/bin/mcp-repl"
+# mcp-repl additional writable roots outside cwd (install-time R probe):
 # - /Users/alice/Library/Caches/org.R-project.R/R
 # - /Users/alice/Library/Application Support/org.R-project.R/R
 # - /Users/alice/Library/Preferences/org.R-project.R/R
-# Re-run `mcp-console install-codex` to refresh this list.
+# Re-run `mcp-repl install-codex` to refresh this list.
 args = [
   "--sandbox-mode", "workspace-write",
   "--sandbox-network-access", "restricted",
@@ -108,29 +108,29 @@ args = [
 For manual Codex config, the entry looks like:
 
 ```toml
-[mcp_servers.console]
-command = "mcp-console"
+[mcp_servers.repl]
+command = "mcp-repl"
 ```
 
 ### 3) Pick backend (optional)
 
 - Default backend: R
-- CLI: `mcp-console --backend r|python`
-- Environment: `MCP_CONSOLE_BACKEND=r|python`
+- CLI: `mcp-repl --backend r|python`
+- Environment: `MCP_REPL_BACKEND=r|python`
 
 ## Runtime discovery
 
 ### Backend selection order
 
-`mcp-console` chooses backend in this order:
+`mcp-repl` chooses backend in this order:
 - `--backend <r|python>` (if provided)
-- `MCP_CONSOLE_BACKEND`
+- `MCP_REPL_BACKEND`
 - default: `r`
 
 ### R backend: which R installation is used
 
-- To force a specific R installation, set `R_HOME` in the environment that launches `mcp-console`.
-- If `R_HOME` is not set, `mcp-console` discovers it from `R` on `PATH` (via `R RHOME`).
+- To force a specific R installation, set `R_HOME` in the environment that launches `mcp-repl`.
+- If `R_HOME` is not set, `mcp-repl` discovers it from `R` on `PATH` (via `R RHOME`).
 - To verify which R is active, run `R.home()` in the console session.
 
 ### Python backend: which Python installation is used
@@ -161,20 +161,26 @@ See `docs/sandbox.md` for precise behavior, runtime updates, and OS-specific det
 
 ## MCP surface
 
-- `write_stdin` -> `{ "chars": "1+1\n", "timeout": 60 }`
+Primary REPL-aligned tools:
+- `repl` -> `{ "input": "1+1\n", "timeout_ms": 10000 }`
+- `repl_reset` -> `{}`
 
-The full operator guide for `write_stdin` is in
-`docs/tool-descriptions/write_stdin_tool.md`.
+Tool guides:
+- `docs/tool-descriptions/repl_tool_r.md`
+- `docs/tool-descriptions/repl_tool_python.md`
+- `docs/tool-descriptions/repl_reset_tool.md`
 
 ## Session endings
 
-- **Interrupt**: `write_stdin("\u0003")` (best-effort SIGINT), session continues when successful.
-- **Restart**: `write_stdin("\u0004")`, worker respawns.
-- **EOF / `quit()`**: forwarded to R; output is returned, save prompts auto-answer `no`, and a fresh worker starts next request.
+- **Interrupt**: `repl` with input prefixed by `\u0003` (best-effort SIGINT), session continues when successful.
+- **Reset**: use `repl_reset`.
+- **EOF / `quit()`**: forwarded to R; output is returned, and a fresh worker starts next request.
 
 ## Docs
 
-- Tool behavior and usage guidance: `docs/tool-descriptions/write_stdin_tool.md`
+- Tool behavior and usage guidance:
+- `docs/tool-descriptions/repl_tool_r.md`
+- `docs/tool-descriptions/repl_tool_python.md`
 - Sandbox behavior and configuration: `docs/sandbox.md`
 - Worker sideband protocol: `docs/worker_sideband_protocol.md`
 
