@@ -151,6 +151,10 @@ fn resolve_home_dir_from_env(
 
     let homedrive = homedrive.filter(|value| !value.is_empty())?;
     let homepath = homepath.filter(|value| !value.is_empty())?;
+    let absolute_homepath = PathBuf::from(&homepath);
+    if absolute_homepath.is_absolute() {
+        return Some(absolute_homepath);
+    }
     let needs_separator = !matches!(homepath.to_str(), Some(value) if value.starts_with('\\') || value.starts_with('/'));
     let mut combined = homedrive;
     if needs_separator {
@@ -338,5 +342,17 @@ mod tests {
     fn resolve_home_dir_returns_none_when_all_sources_missing() {
         let resolved = resolve_home_dir_from_env(None, None, None, None);
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_home_dir_uses_absolute_homepath_without_prefixing_homedrive() {
+        let resolved = resolve_home_dir_from_env(
+            None,
+            None,
+            Some(OsString::from("D:")),
+            Some(OsString::from(r"C:\Users\example_user")),
+        )
+        .expect("home dir");
+        assert_eq!(resolved, PathBuf::from(r"C:\Users\example_user"));
     }
 }

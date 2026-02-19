@@ -167,9 +167,6 @@ fn compute_allow_deny_paths(
             } else {
                 policy_cwd.join(root)
             };
-            if !candidate.exists() {
-                return;
-            }
             let canonical = canonicalize_or_identity(&candidate);
             allow.insert(canonical.clone());
             let git_entry = canonical.join(".git");
@@ -611,6 +608,11 @@ fn quote_windows_arg(arg: &str) -> String {
 }
 
 unsafe fn add_allow_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
+    if !path.exists() {
+        std::fs::create_dir_all(path)
+            .map_err(|err| format!("create_dir_all failed for '{}': {err}", path.display()))?;
+    }
+
     let mut security_descriptor: *mut c_void = std::ptr::null_mut();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let code = GetNamedSecurityInfoW(
@@ -1497,5 +1499,29 @@ mod tests {
                 .contains(&canonicalize_or_identity(&command_cwd))
         );
         assert!(paths.deny.contains(&canonicalize_or_identity(&git_dir)));
+    }
+
+    #[test]
+    fn compute_allow_paths_keeps_nonexistent_declared_writable_root() {
+        let tmp = tempdir().expect("tempdir");
+        let command_cwd = tmp.path().join("workspace");
+        let missing_root = tmp.path().join("missing-root");
+        std::fs::create_dir_all(&command_cwd).expect("workspace dir");
+
+        let policy = workspace_policy(vec![missing_root.clone()], false, true);
+        let paths =
+            compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, None, &HashMap::new());
+
+        assert!(
+            paths
+                .allow
+                .contains(&canonicalize_or_identity(&command_cwd))
+        );
+        assert!(
+            paths
+                .allow
+                .contains(&canonicalize_or_identity(&missing_root)),
+            "declared writable root should remain allowed even before it exists"
+        );
     }
 }
