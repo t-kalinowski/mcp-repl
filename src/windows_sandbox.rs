@@ -1,35 +1,43 @@
-#![cfg(target_os = "windows")]
+#![allow(unsafe_op_in_unsafe_fn)]
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::ffi::c_void;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::sandbox::SandboxPolicy;
+use crate::sandbox::{R_SESSION_TMPDIR_ENV, SandboxPolicy};
 use windows_sys::Win32::Foundation::CloseHandle;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HLOCAL;
+use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::LUID;
 use windows_sys::Win32::Foundation::SetHandleInformation;
 use windows_sys::Win32::Foundation::WAIT_FAILED;
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
 use windows_sys::Win32::Security::ACL;
 use windows_sys::Win32::Security::AdjustTokenPrivileges;
+use windows_sys::Win32::Security::Authorization::ConvertStringSidToSidW;
 use windows_sys::Win32::Security::Authorization::EXPLICIT_ACCESS_W;
 use windows_sys::Win32::Security::Authorization::GRANT_ACCESS;
+use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
+use windows_sys::Win32::Security::Authorization::SE_FILE_OBJECT;
 use windows_sys::Win32::Security::Authorization::SetEntriesInAclW;
+use windows_sys::Win32::Security::Authorization::SetNamedSecurityInfoW;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_SID;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_IS_UNKNOWN;
 use windows_sys::Win32::Security::Authorization::TRUSTEE_W;
 use windows_sys::Win32::Security::CopySid;
 use windows_sys::Win32::Security::CreateRestrictedToken;
 use windows_sys::Win32::Security::CreateWellKnownSid;
+use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
 use windows_sys::Win32::Security::GetLengthSid;
 use windows_sys::Win32::Security::GetTokenInformation;
 use windows_sys::Win32::Security::LookupPrivilegeValueW;
-use windows_sys::Win32::Security::OpenProcessToken;
 use windows_sys::Win32::Security::SID_AND_ATTRIBUTES;
 use windows_sys::Win32::Security::SetTokenInformation;
 use windows_sys::Win32::Security::TOKEN_ADJUST_DEFAULT;
@@ -41,6 +49,15 @@ use windows_sys::Win32::Security::TOKEN_PRIVILEGES;
 use windows_sys::Win32::Security::TOKEN_QUERY;
 use windows_sys::Win32::Security::TokenDefaultDacl;
 use windows_sys::Win32::Security::TokenGroups;
+use windows_sys::Win32::Storage::FileSystem::DELETE;
+use windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA;
+use windows_sys::Win32::Storage::FileSystem::FILE_DELETE_CHILD;
+use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_EXECUTE;
+use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_READ;
+use windows_sys::Win32::Storage::FileSystem::FILE_GENERIC_WRITE;
+use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_ATTRIBUTES;
+use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_DATA;
+use windows_sys::Win32::Storage::FileSystem::FILE_WRITE_EA;
 use windows_sys::Win32::System::Console::GetStdHandle;
 use windows_sys::Win32::System::Console::STD_ERROR_HANDLE;
 use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
@@ -56,6 +73,7 @@ use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::INFINITE;
+use windows_sys::Win32::System::Threading::OpenProcessToken;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
 use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
 use windows_sys::Win32::System::Threading::STARTUPINFOW;
@@ -68,6 +86,160 @@ const GENERIC_ALL: u32 = 0x1000_0000;
 const WIN_WORLD_SID: i32 = 1;
 const SE_GROUP_LOGON_ID: u32 = 0xC0000000;
 const HANDLE_FLAG_INHERIT: u32 = 0x00000001;
+const DENY_ACCESS: i32 = 3;
+const REVOKE_ACCESS: i32 = 4;
+const CONTAINER_INHERIT_ACE: u32 = 0x2;
+const OBJECT_INHERIT_ACE: u32 = 0x1;
+
+#[derive(Debug, Default)]
+struct AllowDenyPaths {
+    allow: HashSet<PathBuf>,
+    deny: HashSet<PathBuf>,
+}
+
+fn should_apply_network_block(policy: &SandboxPolicy) -> bool {
+    !policy.has_full_network_access()
+}
+
+fn upsert_env_case_insensitive(env_map: &mut HashMap<String, String>, key: &str, value: &str) {
+    let removals: Vec<String> = env_map
+        .keys()
+        .filter(|existing| existing.eq_ignore_ascii_case(key) && existing.as_str() != key)
+        .cloned()
+        .collect();
+    for existing in removals {
+        env_map.remove(&existing);
+    }
+    env_map.insert(key.to_string(), value.to_string());
+}
+
+fn apply_no_network_to_env(env_map: &mut HashMap<String, String>) {
+    upsert_env_case_insensitive(env_map, "HTTP_PROXY", "http://127.0.0.1:9");
+    upsert_env_case_insensitive(env_map, "HTTPS_PROXY", "http://127.0.0.1:9");
+    upsert_env_case_insensitive(env_map, "ALL_PROXY", "http://127.0.0.1:9");
+    upsert_env_case_insensitive(env_map, "NO_PROXY", "localhost,127.0.0.1,::1");
+    upsert_env_case_insensitive(env_map, "CARGO_NET_OFFLINE", "true");
+    upsert_env_case_insensitive(env_map, "NPM_CONFIG_OFFLINE", "true");
+    upsert_env_case_insensitive(env_map, "PIP_NO_INDEX", "1");
+}
+
+fn env_get_case_insensitive<'a>(
+    env_map: &'a HashMap<String, String>,
+    key: &str,
+) -> Option<&'a str> {
+    env_map.get(key).map(String::as_str).or_else(|| {
+        env_map.iter().find_map(|(candidate, value)| {
+            if candidate.eq_ignore_ascii_case(key) {
+                Some(value.as_str())
+            } else {
+                None
+            }
+        })
+    })
+}
+
+fn canonicalize_or_identity(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn compute_allow_deny_paths(
+    policy: &SandboxPolicy,
+    policy_cwd: &Path,
+    command_cwd: &Path,
+    session_temp_dir: Option<&Path>,
+    env_map: &HashMap<String, String>,
+) -> AllowDenyPaths {
+    let mut allow = HashSet::new();
+    let mut deny = HashSet::new();
+
+    let include_tmp_env_vars = matches!(
+        policy,
+        SandboxPolicy::WorkspaceWrite {
+            exclude_tmpdir_env_var: false,
+            ..
+        }
+    );
+
+    if let SandboxPolicy::WorkspaceWrite { writable_roots, .. } = policy {
+        let mut add_writable_root = |root: PathBuf| {
+            let candidate = if root.is_absolute() {
+                root
+            } else {
+                policy_cwd.join(root)
+            };
+            let canonical = canonicalize_or_identity(&candidate);
+            allow.insert(canonical.clone());
+            let git_entry = canonical.join(".git");
+            if git_entry.exists() {
+                deny.insert(git_entry);
+            }
+            let codex_entry = canonical.join(".codex");
+            if codex_entry.is_dir() {
+                deny.insert(codex_entry);
+            }
+            let agents_entry = canonical.join(".agents");
+            if agents_entry.is_dir() {
+                deny.insert(agents_entry);
+            }
+        };
+        add_writable_root(command_cwd.to_path_buf());
+        for root in writable_roots {
+            add_writable_root(root.clone());
+        }
+    }
+
+    if let Some(path) = session_temp_dir
+        && path.exists()
+    {
+        allow.insert(canonicalize_or_identity(path));
+    }
+
+    if include_tmp_env_vars {
+        for key in ["TEMP", "TMP"] {
+            if let Some(value) = env_get_case_insensitive(env_map, key) {
+                let path = PathBuf::from(value);
+                if path.exists() {
+                    allow.insert(canonicalize_or_identity(&path));
+                }
+            } else if let Ok(value) = std::env::var(key) {
+                let path = PathBuf::from(value);
+                if path.exists() {
+                    allow.insert(canonicalize_or_identity(&path));
+                }
+            }
+        }
+    }
+
+    AllowDenyPaths { allow, deny }
+}
+
+unsafe fn convert_string_sid_to_sid(value: &str) -> Option<*mut c_void> {
+    let mut sid: *mut c_void = std::ptr::null_mut();
+    let ok = ConvertStringSidToSidW(to_wide(value).as_ptr(), &mut sid);
+    if ok != 0 { Some(sid) } else { None }
+}
+
+fn make_random_cap_sid_string() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let pid = std::process::id();
+    let a = (nanos as u32) ^ pid;
+    let b = ((nanos >> 32) as u32).wrapping_add(pid.rotate_left(7));
+    let c = ((nanos >> 64) as u32).wrapping_add(pid.rotate_left(13));
+    let d = ((nanos >> 96) as u32).wrapping_add(pid.rotate_left(19));
+    format!("S-1-5-21-{a}-{b}-{c}-{d}")
+}
+
+fn validate_windows_policy(policy: &SandboxPolicy) -> Result<(), String> {
+    match policy {
+        SandboxPolicy::ReadOnly | SandboxPolicy::WorkspaceWrite { .. } => Ok(()),
+        SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
+            Err("windows sandbox runner only supports read-only/workspace-write".to_string())
+        }
+    }
+}
 
 #[repr(C)]
 struct TokenDefaultDaclInfo {
@@ -83,28 +255,90 @@ pub fn run_sandboxed_command(
         return Err("no command specified to execute".to_string());
     }
 
-    match policy {
-        SandboxPolicy::ReadOnly | SandboxPolicy::WorkspaceWrite { .. } => {}
-        SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
-            return Err(
-                "windows sandbox runner only supports read-only/workspace-write".to_string(),
-            );
-        }
-    }
+    validate_windows_policy(policy)?;
 
     unsafe {
-        let base_token = get_current_token_for_restriction()?;
-        let token_result = create_restricted_token_for_policy(base_token, policy);
-        CloseHandle(base_token);
-        let restricted_token = token_result?;
+        let mut env_map = std::env::vars().collect::<HashMap<_, _>>();
+        if should_apply_network_block(policy) {
+            apply_no_network_to_env(&mut env_map);
+        }
+        let session_temp_dir =
+            env_get_case_insensitive(&env_map, R_SESSION_TMPDIR_ENV).map(PathBuf::from);
 
-        let env_map = std::env::vars().collect::<HashMap<_, _>>();
+        let cap_sid = make_random_cap_sid_string();
+        let psid_capability = convert_string_sid_to_sid(&cap_sid)
+            .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
+
+        let base_token = get_current_token_for_restriction()?;
+        let token_result = create_restricted_token_for_policy(base_token, &[psid_capability]);
+        CloseHandle(base_token);
+        let restricted_token = match token_result {
+            Ok(token) => token,
+            Err(err) => {
+                LocalFree(psid_capability as HLOCAL);
+                return Err(err);
+            }
+        };
+
+        let null_device_ace_applied = allow_null_device(psid_capability);
+
+        let mut acl_guards: Vec<(PathBuf, *mut c_void)> = Vec::new();
+        let paths = compute_allow_deny_paths(
+            policy,
+            sandbox_policy_cwd,
+            sandbox_policy_cwd,
+            session_temp_dir.as_deref(),
+            &env_map,
+        );
+        for path in &paths.allow {
+            match add_allow_ace(path, psid_capability) {
+                Ok(true) => acl_guards.push((path.clone(), psid_capability)),
+                Ok(false) => {}
+                Err(err) => {
+                    cleanup_capability_acl_state(
+                        &acl_guards,
+                        psid_capability,
+                        null_device_ace_applied,
+                    );
+                    CloseHandle(restricted_token);
+                    LocalFree(psid_capability as HLOCAL);
+                    return Err(format!(
+                        "failed to apply writable ACL to '{}': {err}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        if matches!(policy, SandboxPolicy::WorkspaceWrite { .. }) {
+            for path in &paths.deny {
+                match add_deny_write_ace(path, psid_capability) {
+                    Ok(true) => acl_guards.push((path.clone(), psid_capability)),
+                    Ok(false) => {}
+                    Err(err) => {
+                        cleanup_capability_acl_state(
+                            &acl_guards,
+                            psid_capability,
+                            null_device_ace_applied,
+                        );
+                        CloseHandle(restricted_token);
+                        LocalFree(psid_capability as HLOCAL);
+                        return Err(format!(
+                            "failed to apply deny ACL to '{}': {err}",
+                            path.display()
+                        ));
+                    }
+                }
+            }
+        }
+
         let spawn_result =
             create_process_as_user(restricted_token, command, sandbox_policy_cwd, &env_map);
         let (proc_info, _startup_info) = match spawn_result {
             Ok(value) => value,
             Err(err) => {
+                cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
                 CloseHandle(restricted_token);
+                LocalFree(psid_capability as HLOCAL);
                 return Err(err);
             }
         };
@@ -119,9 +353,11 @@ pub fn run_sandboxed_command(
             if let Some(job) = job_handle {
                 CloseHandle(job);
             }
+            cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
             CloseHandle(proc_info.hThread);
             CloseHandle(proc_info.hProcess);
             CloseHandle(restricted_token);
+            LocalFree(psid_capability as HLOCAL);
             return Err(format!(
                 "WaitForSingleObject failed: {}",
                 std::io::Error::last_os_error()
@@ -133,9 +369,11 @@ pub fn run_sandboxed_command(
             if let Some(job) = job_handle {
                 CloseHandle(job);
             }
+            cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
             CloseHandle(proc_info.hThread);
             CloseHandle(proc_info.hProcess);
             CloseHandle(restricted_token);
+            LocalFree(psid_capability as HLOCAL);
             return Err(format!(
                 "GetExitCodeProcess failed: {}",
                 std::io::Error::last_os_error()
@@ -145,17 +383,32 @@ pub fn run_sandboxed_command(
         if let Some(job) = job_handle {
             CloseHandle(job);
         }
+        cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
         CloseHandle(proc_info.hThread);
         CloseHandle(proc_info.hProcess);
         CloseHandle(restricted_token);
+        LocalFree(psid_capability as HLOCAL);
 
         Ok(exit_code as i32)
     }
 }
 
+unsafe fn cleanup_capability_acl_state(
+    acl_guards: &[(PathBuf, *mut c_void)],
+    capability_sid: *mut c_void,
+    null_device_ace_applied: bool,
+) {
+    for (path, sid) in acl_guards {
+        revoke_ace(path, *sid);
+    }
+    if null_device_ace_applied {
+        revoke_null_device_ace(capability_sid);
+    }
+}
+
 unsafe fn create_job_kill_on_close() -> Result<HANDLE, String> {
     let h = CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
-    if h == 0 {
+    if h.is_null() {
         return Err("CreateJobObjectW failed".to_string());
     }
     let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = std::mem::zeroed();
@@ -175,29 +428,34 @@ unsafe fn create_job_kill_on_close() -> Result<HANDLE, String> {
 
 unsafe fn create_restricted_token_for_policy(
     base_token: HANDLE,
-    policy: &SandboxPolicy,
+    capability_sids: &[*mut c_void],
 ) -> Result<HANDLE, String> {
+    if capability_sids.is_empty() {
+        return Err("no capability SIDs provided".to_string());
+    }
     let mut logon_sid_bytes = get_logon_sid_bytes(base_token)?;
     let psid_logon = logon_sid_bytes.as_mut_ptr() as *mut c_void;
     let mut everyone = world_sid()?;
     let psid_everyone = everyone.as_mut_ptr() as *mut c_void;
 
-    let mut restricted_sids: Vec<SID_AND_ATTRIBUTES> = Vec::new();
-    let mut flags = DISABLE_MAX_PRIVILEGE | LUA_TOKEN;
-
-    if matches!(policy, SandboxPolicy::ReadOnly) {
-        flags |= WRITE_RESTRICTED;
+    let mut restricted_sids: Vec<SID_AND_ATTRIBUTES> =
+        Vec::with_capacity(capability_sids.len() + 2);
+    for sid in capability_sids {
         restricted_sids.push(SID_AND_ATTRIBUTES {
-            Sid: psid_logon,
-            Attributes: 0,
-        });
-        restricted_sids.push(SID_AND_ATTRIBUTES {
-            Sid: psid_everyone,
+            Sid: *sid,
             Attributes: 0,
         });
     }
+    restricted_sids.push(SID_AND_ATTRIBUTES {
+        Sid: psid_logon,
+        Attributes: 0,
+    });
+    restricted_sids.push(SID_AND_ATTRIBUTES {
+        Sid: psid_everyone,
+        Attributes: 0,
+    });
 
-    let mut new_token: HANDLE = 0;
+    let mut new_token: HANDLE = std::ptr::null_mut();
     let sid_count = restricted_sids.len() as u32;
     let sid_ptr = if restricted_sids.is_empty() {
         std::ptr::null_mut()
@@ -206,7 +464,7 @@ unsafe fn create_restricted_token_for_policy(
     };
     let ok = CreateRestrictedToken(
         base_token,
-        flags,
+        DISABLE_MAX_PRIVILEGE | LUA_TOKEN | WRITE_RESTRICTED,
         0,
         std::ptr::null(),
         0,
@@ -219,7 +477,10 @@ unsafe fn create_restricted_token_for_policy(
         return Err(format!("CreateRestrictedToken failed: {}", GetLastError()));
     }
 
-    let dacl_sids = [psid_logon, psid_everyone];
+    let mut dacl_sids = Vec::with_capacity(capability_sids.len() + 2);
+    dacl_sids.push(psid_logon);
+    dacl_sids.push(psid_everyone);
+    dacl_sids.extend_from_slice(capability_sids);
     set_default_dacl(new_token, &dacl_sids)?;
     enable_single_privilege(new_token, "SeChangeNotifyPrivilege")?;
     Ok(new_token)
@@ -271,7 +532,7 @@ unsafe fn create_process_as_user(
 unsafe fn ensure_inheritable_stdio(startup_info: &mut STARTUPINFOW) -> Result<(), String> {
     for std_handle_kind in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
         let std_handle = GetStdHandle(std_handle_kind);
-        if std_handle == 0 {
+        if std_handle.is_null() || std_handle == INVALID_HANDLE_VALUE {
             return Err(format!(
                 "GetStdHandle failed: {}",
                 std::io::Error::last_os_error()
@@ -352,6 +613,302 @@ fn quote_windows_arg(arg: &str) -> String {
     }
     quoted.push('"');
     quoted
+}
+
+unsafe fn add_allow_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
+    if !path.exists() {
+        std::fs::create_dir_all(path)
+            .map_err(|err| format!("create_dir_all failed for '{}': {err}", path.display()))?;
+    }
+
+    let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let code = GetNamedSecurityInfoW(
+        to_wide(path).as_ptr(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &mut dacl,
+        std::ptr::null_mut(),
+        &mut security_descriptor,
+    );
+    if code != ERROR_SUCCESS {
+        return Err(format!("GetNamedSecurityInfoW failed: {code}"));
+    }
+
+    let trustee = TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: 0,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        ptstrName: sid as *mut u16,
+    };
+    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+    explicit.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+    explicit.grfAccessMode = GRANT_ACCESS;
+    explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+    explicit.Trustee = trustee;
+
+    let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    let set_acl_code = SetEntriesInAclW(1, &explicit, dacl, &mut new_dacl);
+    if set_acl_code != ERROR_SUCCESS {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return Err(format!("SetEntriesInAclW failed: {set_acl_code}"));
+    }
+
+    let set_security_code = SetNamedSecurityInfoW(
+        to_wide(path).as_ptr() as *mut u16,
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        new_dacl,
+        std::ptr::null_mut(),
+    );
+    if !new_dacl.is_null() {
+        LocalFree(new_dacl as HLOCAL);
+    }
+    if !security_descriptor.is_null() {
+        LocalFree(security_descriptor as HLOCAL);
+    }
+    if set_security_code != ERROR_SUCCESS {
+        return Err(format!("SetNamedSecurityInfoW failed: {set_security_code}"));
+    }
+    Ok(true)
+}
+
+unsafe fn add_deny_write_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
+    let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let code = GetNamedSecurityInfoW(
+        to_wide(path).as_ptr(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &mut dacl,
+        std::ptr::null_mut(),
+        &mut security_descriptor,
+    );
+    if code != ERROR_SUCCESS {
+        return Err(format!("GetNamedSecurityInfoW failed: {code}"));
+    }
+
+    let trustee = TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: 0,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        ptstrName: sid as *mut u16,
+    };
+    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+    explicit.grfAccessPermissions = FILE_GENERIC_WRITE
+        | FILE_WRITE_DATA
+        | FILE_APPEND_DATA
+        | FILE_WRITE_EA
+        | FILE_WRITE_ATTRIBUTES
+        | DELETE
+        | FILE_DELETE_CHILD;
+    explicit.grfAccessMode = DENY_ACCESS;
+    explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+    explicit.Trustee = trustee;
+
+    let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    let set_acl_code = SetEntriesInAclW(1, &explicit, dacl, &mut new_dacl);
+    if set_acl_code != ERROR_SUCCESS {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return Err(format!("SetEntriesInAclW failed: {set_acl_code}"));
+    }
+
+    let set_security_code = SetNamedSecurityInfoW(
+        to_wide(path).as_ptr() as *mut u16,
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        new_dacl,
+        std::ptr::null_mut(),
+    );
+    if !new_dacl.is_null() {
+        LocalFree(new_dacl as HLOCAL);
+    }
+    if !security_descriptor.is_null() {
+        LocalFree(security_descriptor as HLOCAL);
+    }
+    if set_security_code != ERROR_SUCCESS {
+        return Err(format!("SetNamedSecurityInfoW failed: {set_security_code}"));
+    }
+    Ok(true)
+}
+
+unsafe fn revoke_ace(path: &Path, sid: *mut c_void) {
+    let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let code = GetNamedSecurityInfoW(
+        to_wide(path).as_ptr(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &mut dacl,
+        std::ptr::null_mut(),
+        &mut security_descriptor,
+    );
+    if code != ERROR_SUCCESS {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return;
+    }
+
+    let trustee = TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: 0,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        ptstrName: sid as *mut u16,
+    };
+    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+    explicit.grfAccessPermissions = 0;
+    explicit.grfAccessMode = REVOKE_ACCESS;
+    explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
+    explicit.Trustee = trustee;
+
+    let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    let set_acl_code = SetEntriesInAclW(1, &explicit, dacl, &mut new_dacl);
+    if set_acl_code == ERROR_SUCCESS {
+        let _ = SetNamedSecurityInfoW(
+            to_wide(path).as_ptr() as *mut u16,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new_dacl,
+            std::ptr::null_mut(),
+        );
+        if !new_dacl.is_null() {
+            LocalFree(new_dacl as HLOCAL);
+        }
+    }
+    if !security_descriptor.is_null() {
+        LocalFree(security_descriptor as HLOCAL);
+    }
+}
+
+unsafe fn allow_null_device(sid: *mut c_void) -> bool {
+    let nul_path = to_wide(r"\\.\NUL");
+    let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let code = GetNamedSecurityInfoW(
+        nul_path.as_ptr(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &mut dacl,
+        std::ptr::null_mut(),
+        &mut security_descriptor,
+    );
+    if code != ERROR_SUCCESS {
+        return false;
+    }
+
+    let trustee = TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: 0,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        ptstrName: sid as *mut u16,
+    };
+    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+    explicit.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+    explicit.grfAccessMode = GRANT_ACCESS;
+    explicit.grfInheritance = 0;
+    explicit.Trustee = trustee;
+
+    let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    let set_acl_code = SetEntriesInAclW(1, &explicit, dacl, &mut new_dacl);
+    let set_security_code = if set_acl_code == ERROR_SUCCESS {
+        SetNamedSecurityInfoW(
+            nul_path.as_ptr() as *mut u16,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new_dacl,
+            std::ptr::null_mut(),
+        )
+    } else {
+        set_acl_code
+    };
+    if !new_dacl.is_null() {
+        LocalFree(new_dacl as HLOCAL);
+    }
+    if !security_descriptor.is_null() {
+        LocalFree(security_descriptor as HLOCAL);
+    }
+
+    set_security_code == ERROR_SUCCESS
+}
+
+unsafe fn revoke_null_device_ace(sid: *mut c_void) {
+    let nul_path = to_wide(r"\\.\NUL");
+    let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let code = GetNamedSecurityInfoW(
+        nul_path.as_ptr(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &mut dacl,
+        std::ptr::null_mut(),
+        &mut security_descriptor,
+    );
+    if code != ERROR_SUCCESS {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return;
+    }
+
+    let trustee = TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: 0,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        ptstrName: sid as *mut u16,
+    };
+    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+    explicit.grfAccessPermissions = 0;
+    explicit.grfAccessMode = REVOKE_ACCESS;
+    explicit.grfInheritance = 0;
+    explicit.Trustee = trustee;
+
+    let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    let set_acl_code = SetEntriesInAclW(1, &explicit, dacl, &mut new_dacl);
+    if set_acl_code == ERROR_SUCCESS {
+        let _ = SetNamedSecurityInfoW(
+            nul_path.as_ptr() as *mut u16,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            new_dacl,
+            std::ptr::null_mut(),
+        );
+        if !new_dacl.is_null() {
+            LocalFree(new_dacl as HLOCAL);
+        }
+    }
+    if !security_descriptor.is_null() {
+        LocalFree(security_descriptor as HLOCAL);
+    }
 }
 
 unsafe fn set_default_dacl(token: HANDLE, sids: &[*mut c_void]) -> Result<(), String> {
@@ -456,7 +1013,7 @@ unsafe fn get_current_token_for_restriction() -> Result<HANDLE, String> {
         | TOKEN_ADJUST_DEFAULT
         | TOKEN_ADJUST_SESSIONID
         | TOKEN_ADJUST_PRIVILEGES;
-    let mut token: HANDLE = 0;
+    let mut token: HANDLE = std::ptr::null_mut();
     let ok = OpenProcessToken(GetCurrentProcess(), desired_access, &mut token);
     if ok == 0 {
         return Err(format!("OpenProcessToken failed: {}", GetLastError()));
@@ -559,7 +1116,7 @@ unsafe fn get_logon_sid_bytes(token: HANDLE) -> Result<Vec<u8>, String> {
         );
         if ok != 0 {
             let linked = std::ptr::read_unaligned(linked_buf.as_ptr() as *const TokenLinkedToken);
-            if linked.linked_token != 0 {
+            if !linked.linked_token.is_null() {
                 let result = scan_token_groups_for_logon(linked.linked_token);
                 CloseHandle(linked.linked_token);
                 if let Some(logon_sid) = result {
@@ -570,4 +1127,438 @@ unsafe fn get_logon_sid_bytes(token: HANDLE) -> Result<Vec<u8>, String> {
     }
 
     Err("logon SID not present on token".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn workspace_policy(
+        writable_roots: Vec<PathBuf>,
+        network_access: bool,
+        exclude_tmpdir_env_var: bool,
+    ) -> SandboxPolicy {
+        SandboxPolicy::WorkspaceWrite {
+            writable_roots,
+            network_access,
+            exclude_tmpdir_env_var,
+            exclude_slash_tmp: false,
+        }
+    }
+
+    #[test]
+    fn applies_network_block_when_access_is_disabled() {
+        assert!(should_apply_network_block(&workspace_policy(
+            Vec::new(),
+            false,
+            false,
+        )));
+    }
+
+    #[test]
+    fn skips_network_block_when_access_is_allowed() {
+        assert!(!should_apply_network_block(&workspace_policy(
+            Vec::new(),
+            true,
+            false,
+        )));
+    }
+
+    #[test]
+    fn applies_network_block_for_read_only() {
+        assert!(should_apply_network_block(&SandboxPolicy::ReadOnly));
+    }
+
+    #[test]
+    fn apply_no_network_to_env_overrides_existing_values() {
+        let mut env_map = HashMap::new();
+        env_map.insert(
+            "HTTP_PROXY".to_string(),
+            "http://proxy.example:8080".to_string(),
+        );
+        env_map.insert(
+            "HTTPS_PROXY".to_string(),
+            "http://proxy.example:8080".to_string(),
+        );
+        env_map.insert(
+            "ALL_PROXY".to_string(),
+            "http://proxy.example:8080".to_string(),
+        );
+        env_map.insert("NO_PROXY".to_string(), "example.com".to_string());
+        env_map.insert("CARGO_NET_OFFLINE".to_string(), "false".to_string());
+        env_map.insert("NPM_CONFIG_OFFLINE".to_string(), "false".to_string());
+        env_map.insert("PIP_NO_INDEX".to_string(), "0".to_string());
+
+        apply_no_network_to_env(&mut env_map);
+
+        assert_eq!(
+            env_map.get("HTTP_PROXY"),
+            Some(&"http://127.0.0.1:9".to_string())
+        );
+        assert_eq!(
+            env_map.get("HTTPS_PROXY"),
+            Some(&"http://127.0.0.1:9".to_string())
+        );
+        assert_eq!(
+            env_map.get("ALL_PROXY"),
+            Some(&"http://127.0.0.1:9".to_string())
+        );
+        assert_eq!(
+            env_map.get("NO_PROXY"),
+            Some(&"localhost,127.0.0.1,::1".to_string())
+        );
+        assert_eq!(env_map.get("CARGO_NET_OFFLINE"), Some(&"true".to_string()));
+        assert_eq!(env_map.get("NPM_CONFIG_OFFLINE"), Some(&"true".to_string()));
+        assert_eq!(env_map.get("PIP_NO_INDEX"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn apply_no_network_to_env_removes_case_variant_proxy_keys() {
+        let mut env_map = HashMap::new();
+        env_map.insert(
+            "http_proxy".to_string(),
+            "http://proxy.example:8080".to_string(),
+        );
+        env_map.insert(
+            "Https_Proxy".to_string(),
+            "http://proxy.example:8080".to_string(),
+        );
+        env_map.insert(
+            "all_proxy".to_string(),
+            "http://proxy.example:8080".to_string(),
+        );
+        env_map.insert("no_proxy".to_string(), "example.com".to_string());
+        env_map.insert("pip_no_index".to_string(), "0".to_string());
+
+        apply_no_network_to_env(&mut env_map);
+
+        assert!(!env_map.contains_key("http_proxy"));
+        assert!(!env_map.contains_key("Https_Proxy"));
+        assert!(!env_map.contains_key("all_proxy"));
+        assert!(!env_map.contains_key("no_proxy"));
+        assert!(!env_map.contains_key("pip_no_index"));
+        assert_eq!(
+            env_map.get("HTTP_PROXY"),
+            Some(&"http://127.0.0.1:9".to_string())
+        );
+        assert_eq!(
+            env_map.get("HTTPS_PROXY"),
+            Some(&"http://127.0.0.1:9".to_string())
+        );
+        assert_eq!(
+            env_map.get("ALL_PROXY"),
+            Some(&"http://127.0.0.1:9".to_string())
+        );
+        assert_eq!(
+            env_map.get("NO_PROXY"),
+            Some(&"localhost,127.0.0.1,::1".to_string())
+        );
+        assert_eq!(env_map.get("PIP_NO_INDEX"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn env_get_case_insensitive_matches_mixed_case_keys() {
+        let mut env_map = HashMap::new();
+        env_map.insert("Temp".to_string(), r"C:\Temp\session".to_string());
+        assert_eq!(
+            env_get_case_insensitive(&env_map, "TEMP"),
+            Some(r"C:\Temp\session")
+        );
+        assert_eq!(
+            env_get_case_insensitive(&env_map, "temp"),
+            Some(r"C:\Temp\session")
+        );
+    }
+
+    #[test]
+    fn rejects_danger_full_access_policy() {
+        let err = validate_windows_policy(&SandboxPolicy::DangerFullAccess)
+            .expect_err("danger-full-access should be rejected");
+        assert!(err.contains("read-only/workspace-write"));
+    }
+
+    #[test]
+    fn rejects_external_sandbox_policy() {
+        let err = validate_windows_policy(&SandboxPolicy::ExternalSandbox {
+            network_access: crate::sandbox::NetworkAccess::Enabled,
+        })
+        .expect_err("external-sandbox should be rejected");
+        assert!(err.contains("read-only/workspace-write"));
+    }
+
+    #[test]
+    fn compute_allow_paths_includes_additional_writable_roots() {
+        let tmp = tempdir().expect("tempdir");
+        let command_cwd = tmp.path().join("workspace");
+        let extra_root = tmp.path().join("extra");
+        std::fs::create_dir_all(&command_cwd).expect("workspace dir");
+        std::fs::create_dir_all(&extra_root).expect("extra dir");
+
+        let policy = workspace_policy(vec![extra_root.clone()], false, true);
+        let paths =
+            compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, None, &HashMap::new());
+
+        assert!(
+            paths
+                .allow
+                .contains(&canonicalize_or_identity(&command_cwd))
+        );
+        assert!(paths.allow.contains(&canonicalize_or_identity(&extra_root)));
+        assert!(paths.deny.is_empty());
+    }
+
+    #[test]
+    fn compute_allow_paths_reads_temp_env_case_insensitively() {
+        let tmp = tempdir().expect("tempdir");
+        let command_cwd = tmp.path().join("workspace");
+        let mixed_case_temp = tmp.path().join("mixed-temp");
+        std::fs::create_dir_all(&command_cwd).expect("workspace dir");
+        std::fs::create_dir_all(&mixed_case_temp).expect("mixed temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let mut env_map = HashMap::new();
+        env_map.insert(
+            "Temp".to_string(),
+            mixed_case_temp.to_string_lossy().to_string(),
+        );
+        let paths = compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, None, &env_map);
+
+        assert!(
+            paths
+                .allow
+                .contains(&canonicalize_or_identity(&command_cwd))
+        );
+        assert!(
+            paths
+                .allow
+                .contains(&canonicalize_or_identity(&mixed_case_temp)),
+            "expected allow list to include Temp env path"
+        );
+    }
+
+    #[test]
+    fn compute_allow_paths_excludes_tmp_env_vars_when_requested() {
+        let tmp = tempdir().expect("tempdir");
+        let command_cwd = tmp.path().join("workspace");
+        let temp_dir = tmp.path().join("temp");
+        std::fs::create_dir_all(&command_cwd).expect("workspace dir");
+        std::fs::create_dir_all(&temp_dir).expect("temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, true);
+        let mut env_map = HashMap::new();
+        env_map.insert("TEMP".to_string(), temp_dir.to_string_lossy().to_string());
+        let paths = compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, None, &env_map);
+
+        assert!(
+            paths
+                .allow
+                .contains(&canonicalize_or_identity(&command_cwd))
+        );
+        assert!(!paths.allow.contains(&canonicalize_or_identity(&temp_dir)));
+        assert!(paths.deny.is_empty());
+    }
+
+    #[test]
+    fn compute_allow_paths_includes_session_temp_dir_when_tmp_env_vars_excluded() {
+        let tmp = tempdir().expect("tempdir");
+        let command_cwd = tmp.path().join("workspace");
+        let temp_dir = tmp.path().join("temp");
+        let session_temp_dir = tmp.path().join("session-temp");
+        std::fs::create_dir_all(&command_cwd).expect("workspace dir");
+        std::fs::create_dir_all(&temp_dir).expect("temp dir");
+        std::fs::create_dir_all(&session_temp_dir).expect("session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, true);
+        let mut env_map = HashMap::new();
+        env_map.insert("TEMP".to_string(), temp_dir.to_string_lossy().to_string());
+        let paths = compute_allow_deny_paths(
+            &policy,
+            &command_cwd,
+            &command_cwd,
+            Some(&session_temp_dir),
+            &env_map,
+        );
+
+        assert!(
+            paths
+                .allow
+                .contains(&canonicalize_or_identity(&command_cwd))
+        );
+        assert!(!paths.allow.contains(&canonicalize_or_identity(&temp_dir)));
+        assert!(
+            paths
+                .allow
+                .contains(&canonicalize_or_identity(&session_temp_dir))
+        );
+    }
+
+    #[test]
+    fn compute_allow_paths_for_read_only_includes_only_session_temp_dir() {
+        let tmp = tempdir().expect("tempdir");
+        let command_cwd = tmp.path().join("workspace");
+        let temp_dir = tmp.path().join("temp");
+        let session_temp_dir = tmp.path().join("session-temp");
+        std::fs::create_dir_all(&command_cwd).expect("workspace dir");
+        std::fs::create_dir_all(&temp_dir).expect("temp dir");
+        std::fs::create_dir_all(&session_temp_dir).expect("session temp dir");
+
+        let mut env_map = HashMap::new();
+        env_map.insert("TEMP".to_string(), temp_dir.to_string_lossy().to_string());
+        let paths = compute_allow_deny_paths(
+            &SandboxPolicy::ReadOnly,
+            &command_cwd,
+            &command_cwd,
+            Some(&session_temp_dir),
+            &env_map,
+        );
+
+        assert_eq!(paths.allow.len(), 1);
+        assert!(
+            paths
+                .allow
+                .contains(&canonicalize_or_identity(&session_temp_dir))
+        );
+        assert!(paths.deny.is_empty());
+    }
+
+    #[test]
+    fn compute_allow_paths_denies_git_dir_inside_writable_root() {
+        let tmp = tempdir().expect("tempdir");
+        let command_cwd = tmp.path().join("workspace");
+        let extra_root = tmp.path().join("extra");
+        let git_dir = extra_root.join(".git");
+        std::fs::create_dir_all(&command_cwd).expect("workspace dir");
+        std::fs::create_dir_all(&git_dir).expect("git dir");
+
+        let policy = workspace_policy(vec![extra_root.clone()], false, true);
+        let paths =
+            compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, None, &HashMap::new());
+
+        assert!(
+            paths
+                .allow
+                .contains(&canonicalize_or_identity(&command_cwd))
+        );
+        assert!(paths.allow.contains(&canonicalize_or_identity(&extra_root)));
+        assert!(paths.deny.contains(&canonicalize_or_identity(&git_dir)));
+    }
+
+    #[test]
+    fn compute_allow_paths_denies_codex_and_agents_dirs_inside_writable_root() {
+        let tmp = tempdir().expect("tempdir");
+        let command_cwd = tmp.path().join("workspace");
+        let codex_dir = command_cwd.join(".codex");
+        let agents_dir = command_cwd.join(".agents");
+        std::fs::create_dir_all(&codex_dir).expect("codex dir");
+        std::fs::create_dir_all(&agents_dir).expect("agents dir");
+
+        let policy = workspace_policy(Vec::new(), false, true);
+        let paths =
+            compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, None, &HashMap::new());
+
+        assert_eq!(paths.allow.len(), 1);
+        assert!(
+            paths
+                .allow
+                .contains(&canonicalize_or_identity(&command_cwd))
+        );
+        assert!(
+            paths.deny.contains(&canonicalize_or_identity(&codex_dir)),
+            "expected deny list to include .codex"
+        );
+        assert!(
+            paths.deny.contains(&canonicalize_or_identity(&agents_dir)),
+            "expected deny list to include .agents"
+        );
+    }
+
+    #[test]
+    fn compute_allow_paths_denies_git_file_inside_writable_root() {
+        let tmp = tempdir().expect("tempdir");
+        let command_cwd = tmp.path().join("workspace");
+        let extra_root = tmp.path().join("extra");
+        let git_file = extra_root.join(".git");
+        std::fs::create_dir_all(&command_cwd).expect("workspace dir");
+        std::fs::create_dir_all(&extra_root).expect("extra dir");
+        std::fs::write(&git_file, "gitdir: .git/worktrees/example").expect("git file");
+
+        let policy = workspace_policy(vec![extra_root.clone()], false, true);
+        let paths =
+            compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, None, &HashMap::new());
+
+        assert!(
+            paths
+                .allow
+                .contains(&canonicalize_or_identity(&command_cwd))
+        );
+        assert!(paths.allow.contains(&canonicalize_or_identity(&extra_root)));
+        assert!(paths.deny.contains(&canonicalize_or_identity(&git_file)));
+    }
+
+    #[test]
+    fn compute_allow_paths_skips_git_dir_when_missing() {
+        let tmp = tempdir().expect("tempdir");
+        let command_cwd = tmp.path().join("workspace");
+        let extra_root = tmp.path().join("extra");
+        std::fs::create_dir_all(&command_cwd).expect("workspace dir");
+        std::fs::create_dir_all(&extra_root).expect("extra dir");
+
+        let policy = workspace_policy(vec![extra_root.clone()], false, true);
+        let paths =
+            compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, None, &HashMap::new());
+
+        assert_eq!(paths.allow.len(), 2);
+        assert!(
+            paths
+                .allow
+                .contains(&canonicalize_or_identity(&command_cwd))
+        );
+        assert!(paths.allow.contains(&canonicalize_or_identity(&extra_root)));
+        assert!(paths.deny.is_empty());
+    }
+
+    #[test]
+    fn compute_allow_paths_includes_command_cwd_and_denies_its_git_dir() {
+        let tmp = tempdir().expect("tempdir");
+        let command_cwd = tmp.path().join("workspace");
+        let git_dir = command_cwd.join(".git");
+        std::fs::create_dir_all(&git_dir).expect("git dir");
+
+        let policy = workspace_policy(Vec::new(), false, true);
+        let paths =
+            compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, None, &HashMap::new());
+
+        assert_eq!(paths.allow.len(), 1);
+        assert!(
+            paths
+                .allow
+                .contains(&canonicalize_or_identity(&command_cwd))
+        );
+        assert!(paths.deny.contains(&canonicalize_or_identity(&git_dir)));
+    }
+
+    #[test]
+    fn compute_allow_paths_keeps_nonexistent_declared_writable_root() {
+        let tmp = tempdir().expect("tempdir");
+        let command_cwd = tmp.path().join("workspace");
+        let missing_root = tmp.path().join("missing-root");
+        std::fs::create_dir_all(&command_cwd).expect("workspace dir");
+
+        let policy = workspace_policy(vec![missing_root.clone()], false, true);
+        let paths =
+            compute_allow_deny_paths(&policy, &command_cwd, &command_cwd, None, &HashMap::new());
+
+        assert!(
+            paths
+                .allow
+                .contains(&canonicalize_or_identity(&command_cwd))
+        );
+        assert!(
+            paths
+                .allow
+                .contains(&canonicalize_or_identity(&missing_root)),
+            "declared writable root should remain allowed even before it exists"
+        );
+    }
 }

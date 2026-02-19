@@ -1,12 +1,11 @@
 ---
 source: tests/plot_images.rs
-assertion_line: 159
 expression: transcript
 ---
 == transcript ==
 1) write_stdin
 >>> par(mfrow = c(2, 1)); plot(1:10); plot(10:1)
-<<< [image/png blake3:709934cb4985dce96f6d6cf437d06f422027aa525901182b6b5c3e76167d6128]
+<<< [image/png blake3:d10529d949733ba6ce8ef0d591129e26da42a908d7e2a20bb474705b4360a6f8]
 
 2) write_stdin
 >>> 1+1

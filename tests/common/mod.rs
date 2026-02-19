@@ -22,6 +22,8 @@ pub type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const TEST_PAGER_PAGE_CHARS: u64 = 300;
 const PAGER_PAGE_CHARS_ENV: &str = "MCP_CONSOLE_PAGER_PAGE_CHARS";
+#[cfg(windows)]
+const WINDOWS_TEST_TIMEOUT_CAP_SECS: f64 = 60.0;
 
 #[cfg(target_os = "macos")]
 pub fn sandbox_exec_available() -> bool {
@@ -41,7 +43,17 @@ pub fn sandbox_exec_available() -> bool {
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+pub fn sandbox_exec_available() -> bool {
+    false
+}
+
+#[cfg(target_os = "linux")]
+pub fn sandbox_exec_available() -> bool {
+    true
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn sandbox_exec_available() -> bool {
     true
 }
@@ -188,6 +200,17 @@ fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| value.to_string())
 }
 
+fn normalized_test_timeout(timeout: Option<f64>) -> Option<f64> {
+    #[cfg(windows)]
+    {
+        timeout.map(|value| value.min(WINDOWS_TEST_TIMEOUT_CAP_SECS))
+    }
+    #[cfg(not(windows))]
+    {
+        timeout
+    }
+}
+
 fn service_error_snapshot(err: &ServiceError) -> SnapshotServiceError {
     match err {
         ServiceError::McpError(error) => SnapshotServiceError::McpError {
@@ -265,6 +288,7 @@ impl McpTestSession {
         if !input.ends_with('\n') {
             input.push('\n');
         }
+        let timeout = normalized_test_timeout(timeout);
 
         let mut args = serde_json::Map::new();
         args.insert("chars".to_string(), Value::String(input));
@@ -334,6 +358,7 @@ impl McpTestSession {
         if !input.ends_with('\n') {
             input.push('\n');
         }
+        let timeout = normalized_test_timeout(timeout);
 
         let mut args = serde_json::Map::new();
         args.insert("chars".to_string(), Value::String(input));
@@ -357,6 +382,7 @@ impl McpTestSession {
         timeout: Option<f64>,
     ) -> Result<rmcp::model::CallToolResult, ServiceError> {
         let input = input.into();
+        let timeout = normalized_test_timeout(timeout);
         let mut args = serde_json::Map::new();
         args.insert("chars".to_string(), Value::String(input));
         if let Some(timeout) = timeout {
@@ -823,18 +849,23 @@ pub async fn spawn_python_server() -> TestResult<McpTestSession> {
 }
 
 pub fn python_available() -> bool {
-    if !cfg!(unix) {
-        return false;
-    }
     python_program().is_some()
 }
 
-pub fn python_program() -> Option<&'static str> {
-    if !cfg!(unix) {
-        return None;
+pub(crate) fn python_program_with_checker(
+    mut ok: impl FnMut(&str) -> bool,
+) -> Option<&'static str> {
+    if ok("python3") {
+        return Some("python3");
     }
+    if ok("python") {
+        return Some("python");
+    }
+    None
+}
 
-    let ok = |program: &str| -> bool {
+pub fn python_program() -> Option<&'static str> {
+    python_program_with_checker(|program| {
         std::process::Command::new(program)
             .args(["-c", "import sys; sys.exit(0)"])
             .stdin(std::process::Stdio::null())
@@ -843,15 +874,7 @@ pub fn python_program() -> Option<&'static str> {
             .status()
             .map(|status| status.success())
             .unwrap_or(false)
-    };
-
-    if ok("python3") {
-        return Some("python3");
-    }
-    if ok("python") {
-        return Some("python");
-    }
-    None
+    })
 }
 
 pub async fn spawn_server_with_args_env_and_pager_page_chars(
@@ -934,5 +957,8 @@ fn terminate_process_tree(pid: u32) {
 fn terminate_process_tree(pid: u32) {
     let _ = std::process::Command::new("taskkill")
         .args(["/T", "/F", "/PID", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
 }

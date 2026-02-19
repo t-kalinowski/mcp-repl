@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 mod common;
 
 use base64::Engine as _;

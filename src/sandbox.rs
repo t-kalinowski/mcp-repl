@@ -106,6 +106,7 @@ pub struct WritableRoot {
 }
 
 impl SandboxPolicy {
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     pub fn has_full_disk_write_access(&self) -> bool {
         match self {
             SandboxPolicy::DangerFullAccess => true,
@@ -198,6 +199,7 @@ impl SandboxPolicy {
     }
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn ensure_absolute(path: PathBuf) -> Option<PathBuf> {
     if path.is_absolute() { Some(path) } else { None }
 }
@@ -210,6 +212,7 @@ fn env_var_truthy(key: &str) -> bool {
     })
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 fn temp_roots_from_system(exclude_tmpdir_env_var: bool, exclude_slash_tmp: bool) -> Vec<PathBuf> {
     let mut roots = Vec::new();
 
@@ -434,6 +437,7 @@ impl Default for SandboxState {
     }
 }
 
+#[cfg_attr(target_os = "windows", allow(dead_code))]
 pub struct PreparedCommand {
     pub program: PathBuf,
     pub args: Vec<String>,
@@ -461,6 +465,19 @@ pub fn prepare_worker_command(
         let temp_dir = state.session_temp_dir.to_string_lossy().to_string();
         env.insert("TMPDIR".to_string(), temp_dir.clone());
         env.insert(R_SESSION_TMPDIR_ENV.to_string(), temp_dir);
+        #[cfg(target_os = "windows")]
+        {
+            // Ensure Windows sandbox policy and runtime temp resolution both target the
+            // per-session temp directory instead of the full user TEMP tree.
+            env.insert(
+                "TEMP".to_string(),
+                state.session_temp_dir.to_string_lossy().to_string(),
+            );
+            env.insert(
+                "TMP".to_string(),
+                state.session_temp_dir.to_string_lossy().to_string(),
+            );
+        }
     }
 
     if !state.sandbox_policy.requires_sandbox() {
@@ -2071,7 +2088,14 @@ mod tests {
 
     #[test]
     fn session_temp_dir_rejects_outside_system_tmp() {
+        #[cfg(target_os = "windows")]
+        let outside = {
+            let system_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+            PathBuf::from(format!(r"{system_drive}\mcp-console-test"))
+        };
+        #[cfg(not(target_os = "windows"))]
         let base_tmp = std::env::temp_dir();
+        #[cfg(not(target_os = "windows"))]
         let outside = if base_tmp.starts_with("/tmp") {
             PathBuf::from("/var/mcp-console-test")
         } else {

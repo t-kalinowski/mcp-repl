@@ -1,3 +1,5 @@
+#![cfg_attr(not(target_family = "unix"), allow(dead_code))]
+
 use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};

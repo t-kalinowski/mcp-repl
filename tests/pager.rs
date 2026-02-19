@@ -1,7 +1,33 @@
 mod common;
 
-use common::{McpSnapshot, TestResult};
+#[cfg(not(windows))]
+use common::McpSnapshot;
+use common::TestResult;
+use rmcp::model::RawContent;
 
+fn result_text(result: &rmcp::model::CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|item| match &item.raw {
+            RawContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn backend_unavailable(text: &str) -> bool {
+    text.contains("Fatal error: cannot create 'R_TempDir'")
+        || text.contains("failed to start R session")
+        || text.contains("worker exited with status")
+        || text.contains("unable to initialize the JIT")
+        || text.contains(
+            "worker protocol error: ipc disconnected while waiting for request completion",
+        )
+}
+
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn paginates_large_output() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -22,6 +48,7 @@ async fn paginates_large_output() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_search_and_counts() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -43,6 +70,7 @@ async fn pager_search_and_counts() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_search_preserves_whitespace() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -67,6 +95,7 @@ async fn pager_search_preserves_whitespace() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_search_case_insensitive_prefix_parsing() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -93,6 +122,7 @@ async fn pager_search_case_insensitive_prefix_parsing() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_matches_with_headings() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -115,6 +145,7 @@ async fn pager_matches_with_headings() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_hits_mode() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -134,6 +165,7 @@ async fn pager_hits_mode() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_whitespace_only_input_advances_page() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -158,6 +190,7 @@ async fn pager_whitespace_only_input_advances_page() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn pager_dedup_on_seek() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -175,5 +208,59 @@ async fn pager_dedup_on_seek() -> TestResult<()> {
     insta::with_settings!({ snapshot_suffix => "transcript" }, {
         insta::assert_snapshot!("pager_dedup_on_seek", snapshot.render_transcript());
     });
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_windows_smoke() -> TestResult<()> {
+    let mut session = common::spawn_server_with_pager_page_chars(80).await?;
+
+    let result = session
+        .write_stdin_raw_with("for (i in 1:80) cat(sprintf(\"L%04d\\n\", i))", Some(120.0))
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("L0001"),
+        "expected first page output, got: {text:?}"
+    );
+    assert!(
+        text.contains("--More--"),
+        "expected pager footer, got: {text:?}"
+    );
+
+    let result = session.write_stdin_raw_with(":next", Some(60.0)).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("L0002")
+            || text.contains("L0003")
+            || text.contains("L0010")
+            || text.contains("L0014"),
+        "expected next page output, got: {text:?}"
+    );
+
+    let result = session.write_stdin_raw_with(":/L0031", Some(60.0)).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("L0031") || text.contains("next match"),
+        "expected search guidance/output, got: {text:?}"
+    );
+
+    session.cancel().await?;
     Ok(())
 }

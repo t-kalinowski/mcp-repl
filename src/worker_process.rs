@@ -1,5 +1,6 @@
 #[cfg(target_family = "unix")]
 use std::collections::{HashMap, HashSet};
+#[cfg(target_family = "unix")]
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -14,12 +15,16 @@ use std::time::Duration;
 
 use crate::backend::Backend;
 use crate::input_protocol::format_input_frame_header;
+#[cfg(target_family = "windows")]
+use crate::ipc::{IPC_PIPE_FROM_WORKER_ENV, IPC_PIPE_TO_WORKER_ENV};
 #[cfg(target_family = "unix")]
 use crate::ipc::{IPC_READ_FD_ENV, IPC_WRITE_FD_ENV};
 use crate::ipc::{
-    IpcEchoEvent, IpcHandle, IpcHandlers, IpcPlotImage, IpcServer, IpcWaitError,
-    ServerIpcConnection, ServerToWorkerIpcMessage, WorkerToServerIpcMessage,
+    IpcEchoEvent, IpcHandle, IpcServer, IpcWaitError, ServerIpcConnection,
+    ServerToWorkerIpcMessage, WorkerToServerIpcMessage,
 };
+#[cfg(any(target_family = "unix", target_family = "windows"))]
+use crate::ipc::{IpcHandlers, IpcPlotImage};
 use crate::output_capture::{
     OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEventKind, OutputRange, OutputTimeline,
     ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
@@ -91,14 +96,14 @@ impl RBackendDriver {
     }
 }
 
-fn driver_on_input_start(text: &str, ipc: &ServerIpcConnection) {
+fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) {
     ipc.clear_request_end_events();
+    ipc.clear_readline_tracking();
     ipc.clear_prompt_history();
     ipc.clear_echo_events();
-    let _ = ipc.send(ServerToWorkerIpcMessage::StdinWrite {
-        text: text.to_string(),
-    });
 }
+
+const REQUEST_END_FALLBACK_WAIT: Duration = Duration::from_millis(20);
 
 fn driver_wait_for_completion(
     timeout: Duration,
@@ -126,7 +131,20 @@ fn driver_wait_for_completion(
                     session_end_seen: false,
                 });
             }
-            Err(IpcWaitError::Timeout) => continue,
+            Err(IpcWaitError::Timeout) => {
+                if ipc.waiting_for_next_input(REQUEST_END_FALLBACK_WAIT)
+                    && ipc.try_take_request_end()
+                {
+                    let (prompt, prompt_variants, echo_events) = collect_completion_metadata(&ipc);
+                    return Ok(CompletionInfo {
+                        prompt,
+                        prompt_variants: Some(prompt_variants),
+                        echo_events,
+                        session_end_seen: false,
+                    });
+                }
+                continue;
+            }
             Err(IpcWaitError::SessionEnd) => {
                 return Ok(CompletionInfo {
                     prompt: None,
@@ -280,6 +298,8 @@ impl std::error::Error for WorkerError {
 }
 
 const BACKEND_INFO_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(target_family = "windows")]
+const WINDOWS_IPC_CONNECT_MAX_WAIT: Duration = Duration::from_secs(120);
 const COMPLETION_METADATA_SETTLE_MAX: Duration = Duration::from_millis(30);
 const COMPLETION_METADATA_SETTLE_POLL: Duration = Duration::from_millis(5);
 const COMPLETION_METADATA_STABLE: Duration = Duration::from_millis(10);
@@ -635,9 +655,7 @@ impl WorkerManager {
         if self.pending_request {
             match self.wait_for_request_completion(timeout) {
                 Ok(info) => {
-                    self.pending_request = false;
-                    self.pending_request_started_at = None;
-                    self.guardrail.busy.store(false, Ordering::Relaxed);
+                    self.clear_pending_request_state();
                     if info.session_end_seen {
                         self.note_session_end(true);
                     }
@@ -646,8 +664,19 @@ impl WorkerManager {
                     end_offset = self.output.end_offset().unwrap_or(end_offset);
                 }
                 Err(WorkerError::Timeout(_)) => {
-                    timed_out = true;
                     end_offset = self.output.end_offset().unwrap_or(end_offset);
+                    let worker_exited = match self.process.as_mut() {
+                        Some(process) => !process.is_running()?,
+                        None => true,
+                    };
+                    if worker_exited {
+                        self.note_session_end(true);
+                        self.clear_pending_request_state();
+                        completion.session_end_seen = true;
+                        completed_request = true;
+                    } else {
+                        timed_out = true;
+                    }
                 }
                 Err(err) => return Err(err),
             }
@@ -1005,7 +1034,33 @@ impl WorkerManager {
             .get()
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
         let start = std::time::Instant::now();
-        let result = self.driver.wait_for_completion(timeout, ipc);
+        let mut result = self.driver.wait_for_completion(timeout, ipc);
+        if matches!(
+            &result,
+            Err(WorkerError::Protocol(message))
+                if message.contains("ipc disconnected while waiting for request completion")
+        ) {
+            let deadline = std::time::Instant::now() + Duration::from_millis(500);
+            let mut worker_exited = self.process.is_none();
+            while !worker_exited {
+                worker_exited = match self.process.as_mut() {
+                    Some(process) => !process.is_running()?,
+                    None => true,
+                };
+                if worker_exited || std::time::Instant::now() >= deadline {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            if worker_exited {
+                result = Ok(CompletionInfo {
+                    prompt: None,
+                    prompt_variants: None,
+                    echo_events: Vec::new(),
+                    session_end_seen: true,
+                });
+            }
+        }
         // Best-effort: after IPC completion, give the output reader threads a brief window to
         // drain any bytes already written by the worker before we snapshot the ring.
         let elapsed = start.elapsed();
@@ -1463,18 +1518,30 @@ impl WorkerManager {
                 self.settle_output_after_request_end(Duration::from_millis(120));
                 let offset = self.output.end_offset().unwrap_or(0);
                 crate::output_capture::update_last_reply_marker_offset_max(offset);
-                self.pending_request = false;
-                self.pending_request_started_at = None;
-                self.guardrail.busy.store(false, Ordering::Relaxed);
+                self.clear_pending_request_state();
             }
             Err(IpcWaitError::SessionEnd) => {
                 self.note_session_end(true);
-                self.pending_request = false;
-                self.pending_request_started_at = None;
-                self.guardrail.busy.store(false, Ordering::Relaxed);
+                self.clear_pending_request_state();
             }
-            Err(IpcWaitError::Timeout | IpcWaitError::Disconnected) => {}
+            Err(IpcWaitError::Timeout | IpcWaitError::Disconnected) => {
+                let worker_exited = self
+                    .process
+                    .as_mut()
+                    .and_then(|process| process.is_running().ok())
+                    .is_some_and(|running| !running);
+                if worker_exited {
+                    self.note_session_end(true);
+                    self.clear_pending_request_state();
+                }
+            }
         }
+    }
+
+    fn clear_pending_request_state(&mut self) {
+        self.pending_request = false;
+        self.pending_request_started_at = None;
+        self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
     fn build_session_reset_reply(&mut self, page_bytes: u64, meta: &str) -> ReplyWithOffset {
@@ -2266,10 +2333,14 @@ struct SpawnedWorker {
 }
 
 impl WorkerProcess {
+    #[cfg(target_family = "unix")]
     const PYTHON_PROGRAM: &'static str = "python3";
+    #[cfg(target_family = "unix")]
     const PYTHON_PROGRAM_FALLBACK: &'static str = "python";
+    #[cfg(target_family = "unix")]
     const PYTHON_STARTUP_SNIPPET: &'static str = include_str!("../python/driver.py");
 
+    #[cfg(target_family = "unix")]
     fn resolve_python_program() -> PathBuf {
         // Prefer a local `.venv` (common with uv and other tooling) so the Python backend runs in
         // the project environment without requiring any explicit configuration.
@@ -2352,9 +2423,12 @@ impl WorkerProcess {
         output_timeline: OutputTimeline,
         guardrail: GuardrailShared,
     ) -> Result<Self, WorkerError> {
+        #[cfg(not(target_family = "unix"))]
+        let _ = &guardrail;
+
         let mut ipc_server = IpcServer::bind().map_err(WorkerError::Io)?;
         let SpawnedWorker {
-            child,
+            mut child,
             stdin_tx,
             session_tmpdir,
             #[cfg(target_os = "macos")]
@@ -2372,15 +2446,34 @@ impl WorkerProcess {
         };
 
         let ipc = IpcHandle::new();
-        let image_timeline = output_timeline.clone();
-        let handlers = IpcHandlers {
-            on_plot_image: Some(Arc::new(move |image: IpcPlotImage| {
-                image_timeline.append_image(image.id, image.mime_type, image.data, image.is_new);
-            })),
-        };
-        ipc_server
-            .connect(ipc.clone(), handlers)
-            .map_err(WorkerError::Io)?;
+        #[cfg(any(target_family = "unix", target_family = "windows"))]
+        {
+            let image_timeline = output_timeline.clone();
+            let handlers = IpcHandlers {
+                on_plot_image: Some(Arc::new(move |image: IpcPlotImage| {
+                    image_timeline.append_image(
+                        image.id,
+                        image.mime_type,
+                        image.data,
+                        image.is_new,
+                    );
+                })),
+            };
+            #[cfg(target_family = "unix")]
+            ipc_server
+                .connect(ipc.clone(), handlers)
+                .map_err(WorkerError::Io)?;
+            #[cfg(target_family = "windows")]
+            handle_windows_ipc_connect_result(
+                ipc_server.connect(
+                    ipc.clone(),
+                    handlers,
+                    &mut child,
+                    WINDOWS_IPC_CONNECT_MAX_WAIT,
+                ),
+                &mut child,
+            )?;
+        }
 
         #[cfg(target_family = "unix")]
         let (guardrail_stop, guardrail_thread, guardrail_thread_handle) =
@@ -2421,7 +2514,7 @@ impl WorkerProcess {
 
         let mut command = Command::new(&prepared.program);
         if let Some(arg0) = &prepared.arg0 {
-            command.arg0(arg0);
+            set_command_arg0(&mut command, arg0);
         }
         command.args(&prepared.args);
         command.envs(prepared.env.iter());
@@ -2433,6 +2526,15 @@ impl WorkerProcess {
         {
             command.env(IPC_READ_FD_ENV, client_fds.read_fd.to_string());
             command.env(IPC_WRITE_FD_ENV, client_fds.write_fd.to_string());
+        }
+        #[cfg(target_family = "windows")]
+        let (pipe_to_worker, pipe_from_worker) = ipc_server.take_pipe_names().ok_or_else(|| {
+            WorkerError::Protocol("IPC pipe setup failed; missing pipe names".to_string())
+        })?;
+        #[cfg(target_family = "windows")]
+        {
+            command.env(IPC_PIPE_TO_WORKER_ENV, pipe_to_worker);
+            command.env(IPC_PIPE_FROM_WORKER_ENV, pipe_from_worker);
         }
         apply_debug_startup_env(&mut command, session_tmpdir.as_ref());
         #[cfg(target_family = "unix")]
@@ -2485,6 +2587,7 @@ impl WorkerProcess {
         })
     }
 
+    #[cfg(target_family = "unix")]
     fn python_command_args() -> Vec<String> {
         vec![
             "-i".to_string(),
@@ -2505,9 +2608,9 @@ impl WorkerProcess {
             let _ = sandbox_state;
             let _ = output_timeline;
             let _ = ipc_server;
-            return Err(WorkerError::Protocol(
+            Err(WorkerError::Protocol(
                 "python backend requires a unix-style pty".to_string(),
-            ));
+            ))
         }
         #[cfg(target_family = "unix")]
         {
@@ -2523,7 +2626,7 @@ impl WorkerProcess {
 
             let mut command = Command::new(&prepared.program);
             if let Some(arg0) = &prepared.arg0 {
-                command.arg0(arg0);
+                set_command_arg0(&mut command, arg0);
             }
             command.args(&prepared.args);
             command.envs(prepared.env.iter());
@@ -2651,8 +2754,7 @@ impl WorkerProcess {
         }
         #[cfg(not(target_family = "unix"))]
         {
-            self.child.start_kill()?;
-            Ok(())
+            request_soft_termination(&mut self.child)
         }
     }
 
@@ -2663,7 +2765,7 @@ impl WorkerProcess {
         }
         #[cfg(not(target_family = "unix"))]
         {
-            self.child.start_kill()?;
+            self.child.kill()?;
             Ok(())
         }
     }
@@ -2739,7 +2841,7 @@ impl WorkerProcess {
     fn is_running(&mut self) -> Result<bool, WorkerError> {
         if let Some(status) = self.child.try_wait()? {
             self.exit_status = Some(status);
-            let should_log = !self.expected_exit || !status.success();
+            let should_log = !status.success() && !self.expected_exit;
             if should_log {
                 #[cfg(target_family = "unix")]
                 if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(&status) {
@@ -2780,9 +2882,9 @@ impl WorkerProcess {
         }
 
         if self.child.try_wait()?.is_none() {
-            let sig_ok = self.send_sigterm().is_ok();
+            let _sig_ok = self.send_sigterm().is_ok();
             #[cfg(target_family = "unix")]
-            if !sig_ok {
+            if !_sig_ok {
                 self.kill_process_tree_scan(libc::SIGTERM);
             }
             let term_deadline = std::cmp::min(
@@ -2795,9 +2897,9 @@ impl WorkerProcess {
                     break;
                 }
                 if std::time::Instant::now() >= term_deadline {
-                    let sig_ok = self.send_sigkill().is_ok();
+                    let _sig_ok = self.send_sigkill().is_ok();
                     #[cfg(target_family = "unix")]
-                    if !sig_ok {
+                    if !_sig_ok {
                         self.kill_process_tree_scan(libc::SIGKILL);
                     }
                     let _ = self.child.wait();
@@ -2813,9 +2915,9 @@ impl WorkerProcess {
     }
 
     fn kill(mut self) -> Result<(), WorkerError> {
-        let sig_ok = self.send_sigkill().is_ok();
+        let _sig_ok = self.send_sigkill().is_ok();
         #[cfg(target_family = "unix")]
-        if !sig_ok {
+        if !_sig_ok {
             self.kill_process_tree_scan(libc::SIGKILL);
         }
         let _ = self.child.wait();
@@ -3144,6 +3246,56 @@ fn shutdown_term_delay(timeout: Duration) -> Duration {
     by_fraction.min(by_remaining)
 }
 
+#[cfg(target_family = "windows")]
+fn handle_windows_ipc_connect_result(
+    connect_result: Result<(), std::io::Error>,
+    child: &mut Child,
+) -> Result<(), WorkerError> {
+    match connect_result {
+        Ok(()) => Ok(()),
+        // The child here is the sandbox wrapper process. Give it a short grace
+        // period to unwind ACL changes before forcing termination/reap.
+        Err(err) => {
+            const WRAPPER_EXIT_GRACE: Duration = Duration::from_secs(2);
+            let deadline = std::time::Instant::now() + WRAPPER_EXIT_GRACE;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            let _ = child.kill();
+                            let _ = child.wait();
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(_) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break;
+                    }
+                }
+            }
+            Err(WorkerError::Io(err))
+        }
+    }
+}
+
+#[cfg(target_family = "windows")]
+fn request_soft_termination(_child: &mut Child) -> Result<(), WorkerError> {
+    // The Windows child is the sandbox wrapper. Let it exit naturally so it can
+    // roll back temporary ACL state before process teardown.
+    Ok(())
+}
+
+#[cfg(target_family = "unix")]
+fn set_command_arg0(command: &mut Command, arg0: &str) {
+    command.arg0(arg0);
+}
+
+#[cfg(not(target_family = "unix"))]
+fn set_command_arg0(_command: &mut Command, _arg0: &str) {}
+
 fn format_exit_status_message(status: &std::process::ExitStatus) -> String {
     #[cfg(target_family = "unix")]
     if let Some(signal) = std::os::unix::process::ExitStatusExt::signal(status) {
@@ -3241,5 +3393,93 @@ mod tests {
             split_write_stdin_control_prefix("\u{4}\nprint(1)").expect("expected control prefix");
         assert!(matches!(action, WriteStdinControlAction::Restart));
         assert_eq!(remaining, "print(1)");
+    }
+
+    #[test]
+    fn completion_waits_for_request_end_event() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        driver_on_input_start("1+1", &server);
+
+        let sender = std::thread::spawn(move || {
+            let prompt = "> ".to_string();
+            let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+                prompt: prompt.clone(),
+            });
+            let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+                prompt: prompt.clone(),
+                line: "1+1\n".to_string(),
+            });
+            let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+                prompt: prompt.clone(),
+            });
+            std::thread::sleep(Duration::from_millis(150));
+            let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+        });
+
+        let result = driver_wait_for_completion(Duration::from_millis(75), server);
+        sender.join().expect("sender thread");
+        assert!(
+            matches!(result, Err(WorkerError::Timeout(_))),
+            "expected timeout before request-end"
+        );
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_ipc_connect_error_reaps_wrapper_process() {
+        let mut child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .spawn()
+            .expect("spawn test child process");
+
+        let result = handle_windows_ipc_connect_result(
+            Err(std::io::Error::other("ipc connect failed")),
+            &mut child,
+        );
+        assert!(matches!(result, Err(WorkerError::Io(_))));
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let status = child.try_wait().expect("query child status");
+            if status.is_some() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("connect-error handler should reap child wrapper");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_soft_termination_does_not_kill_child() {
+        let mut child = Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .spawn()
+            .expect("spawn test child process");
+
+        request_soft_termination(&mut child).expect("soft terminate call should succeed");
+
+        let status = child.try_wait().expect("query child status");
+        assert!(
+            status.is_none(),
+            "child should still be running after soft termination request"
+        );
+
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[cfg(target_family = "windows")]
+    #[test]
+    fn windows_ipc_connect_timeout_is_bounded() {
+        assert!(
+            WINDOWS_IPC_CONNECT_MAX_WAIT <= Duration::from_secs(120),
+            "windows IPC connect max wait should fail fast, got {:?}",
+            WINDOWS_IPC_CONNECT_MAX_WAIT
+        );
     }
 }

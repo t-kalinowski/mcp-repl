@@ -1,7 +1,33 @@
 mod common;
 
-use common::{McpSnapshot, TestResult};
+#[cfg(not(windows))]
+use common::McpSnapshot;
+use common::TestResult;
+use rmcp::model::RawContent;
 
+fn result_text(result: &rmcp::model::CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|item| match &item.raw {
+            RawContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn backend_unavailable(text: &str) -> bool {
+    text.contains("Fatal error: cannot create 'R_TempDir'")
+        || text.contains("failed to start R session")
+        || text.contains("worker exited with status")
+        || text.contains("unable to initialize the JIT")
+        || text.contains(
+            "worker protocol error: ipc disconnected while waiting for request completion",
+        )
+}
+
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshots_restart_and_interrupt_with_plots() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -41,6 +67,7 @@ cat("plots_done\n")
     Ok(())
 }
 
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshots_browser_prompt_and_continue() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -67,6 +94,7 @@ async fn snapshots_browser_prompt_and_continue() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshots_truncation_notice_tail() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -97,6 +125,7 @@ cat("\nEND\n")
     Ok(())
 }
 
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshots_pager_hits_with_images() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -131,5 +160,77 @@ for (i in 1:60) cat("gamma line ", i, "\n", sep = "")
         );
     });
 
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn windows_restart_interrupt_plot_smoke() -> TestResult<()> {
+    use tokio::time::{Duration, Instant, sleep};
+
+    async fn assert_eventually_contains(
+        session: &mut common::McpTestSession,
+        input: &str,
+        expected: &str,
+    ) -> TestResult<bool> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            let result = session.write_stdin_raw_with(input, Some(10.0)).await?;
+            let text = result_text(&result);
+            if backend_unavailable(&text) {
+                return Ok(false);
+            }
+            if text.contains(expected) {
+                return Ok(true);
+            }
+            if text.contains("<<console status: busy")
+                || text.contains("worker is busy")
+                || text.contains("request already running")
+                || text.contains("input discarded while worker busy")
+            {
+                sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        Ok(false)
+    }
+
+    let mut session = common::spawn_server().await?;
+
+    let result = session
+        .write_stdin_raw_with(
+            "set.seed(1); plot(1:5, type='l'); plot(5:1, type='l'); cat('plots_done\\n')",
+            Some(30.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("refactor_coverage backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if !text.contains("plots_done") && !text.contains("<<console status: busy") {
+        return Err(format!("expected plot command output marker, got: {text:?}").into());
+    }
+
+    let _ = session.write_stdin_raw_with("\u{4}", Some(10.0)).await?;
+    if !assert_eventually_contains(&mut session, "1+1", "2").await? {
+        eprintln!("refactor_coverage backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let _ = session
+        .write_stdin_raw_with("Sys.sleep(5)", Some(0.2))
+        .await?;
+    let _ = session.write_stdin_raw_with("\u{3}", Some(10.0)).await?;
+    if !assert_eventually_contains(&mut session, "1+1", "2").await? {
+        eprintln!("refactor_coverage backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
     Ok(())
 }

@@ -2,7 +2,9 @@ use std::collections::{HashMap, VecDeque};
 use std::ffi::{CStr, CString};
 use std::hash::{Hash, Hasher};
 use std::os::raw::{c_char, c_int, c_uchar};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(target_family = "unix")]
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
 use std::thread;
 
@@ -23,11 +25,13 @@ use libr::{
 };
 #[cfg(target_family = "windows")]
 use libr::{
-    R_DefParamsEx, R_SetParams, R_common_command_line, Rboolean_FALSE, Rstart, UImode_RGui,
-    cmdlineoptions, get_R_HOME, getRUser, readconsolecfg,
+    R_DefParamsEx, R_SetParams, R_common_command_line, Rboolean_FALSE, Rboolean_TRUE, Rstart,
+    UImode_RGui, UserBreak, cmdlineoptions, get_R_HOME, getRUser, readconsolecfg,
 };
 #[cfg(target_family = "windows")]
 use std::mem::MaybeUninit;
+#[cfg(target_family = "windows")]
+use windows_sys::Win32::Globalization::{GetACP, MultiByteToWideChar};
 
 const MCP_CONSOLE_R_SCRIPT: &str = include_str!("../r/mcp_console.R");
 
@@ -148,6 +152,43 @@ pub(crate) fn clear_pending_input() -> bool {
     let had_pending = !guard.input_queue.is_empty();
     guard.input_queue.clear();
     had_pending
+}
+
+pub(crate) fn complete_active_request_if_idle() -> bool {
+    let Some(state) = SESSION_STATE.get() else {
+        return false;
+    };
+    let mut guard = state.inner.lock().unwrap();
+    if !guard.input_queue.is_empty() {
+        return false;
+    }
+    let active = guard.active_request.take();
+    let had_active = active.is_some();
+    drop(guard);
+    if had_active {
+        complete_active_request(state, active, false);
+    }
+    had_active
+}
+
+pub(crate) fn request_interrupt() -> bool {
+    let Some(state) = SESSION_STATE.get() else {
+        return false;
+    };
+    let should_interrupt = {
+        let guard = state.inner.lock().unwrap();
+        guard.active_request.is_some() || !guard.input_queue.is_empty()
+    };
+    if !should_interrupt {
+        return false;
+    }
+
+    #[cfg(target_family = "windows")]
+    unsafe {
+        libr::set(UserBreak, Rboolean_TRUE);
+    }
+
+    true
 }
 
 fn run_session_on_current_thread(
@@ -312,8 +353,16 @@ fn configure_r_help_output() -> Result<(), String> {
 }
 
 fn eval_in_global_env(code: &str) -> Result<(), String> {
+    // Parse from explicit lines so CRLF content from include_str! on Windows
+    // cannot leak carriage returns into the parser input stream.
+    let parse_lines: Vec<String> = code
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .split('\n')
+        .map(str::to_string)
+        .collect();
     let mut parse = RFunction::from("parse");
-    parse.param("text", code);
+    parse.param("text", parse_lines);
     let exprs = parse
         .call()
         .map_err(|err| format!("failed to parse R startup code: {err}"))?;
@@ -455,11 +504,7 @@ fn setup_r(args: &[String]) -> Result<(), String> {
         let (owned_args, mut c_args) = build_c_args_owned(args);
         let _ = R_MAIN_ARGS.set(owned_args);
         let mut c_args_len = c_args.len() as c_int;
-        R_common_command_line(
-            &mut c_args_len,
-            c_args.as_mut_ptr() as *mut *mut c_char,
-            params,
-        );
+        R_common_command_line(&mut c_args_len, c_args.as_mut_ptr(), params);
 
         (*params).R_Interactive = 1;
         (*params).CharacterMode = UImode_RGui;
@@ -475,6 +520,10 @@ fn setup_r(args: &[String]) -> Result<(), String> {
         (*params).Busy = Some(r_busy);
         (*params).Suicide = Some(r_suicide);
         (*params).CallBack = Some(r_callback);
+        // Windows R embeds UTF-8 spans in console output using UTF8in/UTF8out markers.
+        // Explicitly enable this (required when using Rstart version 0) so output
+        // encoding is deterministic and can be decoded reliably.
+        (*params).EmitEmbeddedUTF8 = Rboolean_TRUE;
 
         (*params).rhome = r_home;
         (*params).home = user_home;
@@ -556,6 +605,203 @@ fn write_stderr_bytes(bytes: &[u8]) {
     crate::output_stream::write_stderr_bytes(bytes);
 }
 
+#[cfg(target_family = "windows")]
+const UTF8_IN_MARKER: &[u8; 3] = b"\x02\xFF\xFE";
+#[cfg(target_family = "windows")]
+const UTF8_OUT_MARKER: &[u8; 3] = b"\x03\xFF\xFE";
+#[cfg(target_family = "windows")]
+static WINDOWS_CONSOLE_DECODE_STATE: OnceLock<Mutex<WindowsConsoleDecodeStates>> = OnceLock::new();
+
+#[cfg(target_family = "windows")]
+fn find_marker(bytes: &[u8], marker: &[u8; 3]) -> Option<usize> {
+    bytes
+        .windows(marker.len())
+        .position(|window| window == marker)
+}
+
+#[cfg(target_family = "windows")]
+fn decode_windows_code_page_bytes(bytes: &[u8]) -> String {
+    if bytes.is_empty() {
+        return String::new();
+    }
+    if bytes.len() > i32::MAX as usize {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+
+    let code_page = unsafe { GetACP() };
+
+    let input_len = bytes.len() as i32;
+    let wide_len = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            0,
+            bytes.as_ptr(),
+            input_len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if wide_len <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+
+    let mut wide = vec![0u16; wide_len as usize];
+    let written = unsafe {
+        MultiByteToWideChar(
+            code_page,
+            0,
+            bytes.as_ptr(),
+            input_len,
+            wide.as_mut_ptr(),
+            wide_len,
+        )
+    };
+    if written <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+
+    String::from_utf16_lossy(&wide[..written as usize])
+}
+
+#[cfg(target_family = "windows")]
+fn decode_windows_embedded_segment(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(text) => text.to_string(),
+        Err(_) => decode_windows_code_page_bytes(bytes),
+    }
+}
+
+#[cfg(target_family = "windows")]
+#[derive(Default)]
+struct WindowsConsoleDecodeState {
+    marker_tail: Vec<u8>,
+    utf8_segment: Vec<u8>,
+    in_utf8_segment: bool,
+}
+
+#[cfg(target_family = "windows")]
+#[derive(Default)]
+struct WindowsConsoleDecodeStates {
+    stdout: WindowsConsoleDecodeState,
+    stderr: WindowsConsoleDecodeState,
+}
+
+#[cfg(target_family = "windows")]
+fn trailing_marker_prefix_len(bytes: &[u8], markers: &[&[u8; 3]]) -> usize {
+    let mut keep = 0usize;
+    for marker in markers {
+        for prefix_len in (1..marker.len()).rev() {
+            if bytes.ends_with(&marker[..prefix_len]) {
+                keep = keep.max(prefix_len);
+                break;
+            }
+        }
+    }
+    keep
+}
+
+#[cfg(target_family = "windows")]
+fn decode_console_bytes_with_state(state: &mut WindowsConsoleDecodeState, bytes: &[u8]) -> Vec<u8> {
+    if bytes.is_empty() {
+        return Vec::new();
+    }
+
+    let mut input = Vec::with_capacity(state.marker_tail.len() + bytes.len());
+    input.extend_from_slice(&state.marker_tail);
+    state.marker_tail.clear();
+    input.extend_from_slice(bytes);
+
+    let mut out = String::new();
+    let mut cursor = 0usize;
+
+    while cursor < input.len() {
+        let remaining = &input[cursor..];
+        if !state.in_utf8_segment {
+            if remaining.starts_with(UTF8_IN_MARKER) {
+                state.in_utf8_segment = true;
+                cursor += UTF8_IN_MARKER.len();
+                continue;
+            }
+            if remaining.starts_with(UTF8_OUT_MARKER) {
+                cursor += UTF8_OUT_MARKER.len();
+                continue;
+            }
+
+            let next_in = find_marker(remaining, UTF8_IN_MARKER);
+            let next_out = find_marker(remaining, UTF8_OUT_MARKER);
+            let next = match (next_in, next_out) {
+                (Some(a), Some(b)) => Some(a.min(b)),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+            if let Some(next) = next {
+                if next > 0 {
+                    out.push_str(&decode_windows_code_page_bytes(&remaining[..next]));
+                    cursor += next;
+                }
+                continue;
+            }
+
+            let keep = trailing_marker_prefix_len(remaining, &[UTF8_IN_MARKER, UTF8_OUT_MARKER]);
+            let split = remaining.len().saturating_sub(keep);
+            if split > 0 {
+                out.push_str(&decode_windows_code_page_bytes(&remaining[..split]));
+            }
+            if keep > 0 {
+                state.marker_tail.extend_from_slice(&remaining[split..]);
+            }
+            break;
+        }
+
+        if let Some(end_rel) = find_marker(remaining, UTF8_OUT_MARKER) {
+            let end = cursor + end_rel;
+            state.utf8_segment.extend_from_slice(&input[cursor..end]);
+            out.push_str(&decode_windows_embedded_segment(&state.utf8_segment));
+            state.utf8_segment.clear();
+            state.in_utf8_segment = false;
+            cursor = end + UTF8_OUT_MARKER.len();
+            continue;
+        }
+
+        let keep = trailing_marker_prefix_len(remaining, &[UTF8_OUT_MARKER]);
+        let split = remaining.len().saturating_sub(keep);
+        if split > 0 {
+            state.utf8_segment.extend_from_slice(&remaining[..split]);
+        }
+        if keep > 0 {
+            state.marker_tail.extend_from_slice(&remaining[split..]);
+        }
+        break;
+    }
+
+    out.into_bytes()
+}
+
+#[cfg(target_family = "windows")]
+fn decode_console_bytes_for_channel(otype: c_int, bytes: &[u8]) -> Vec<u8> {
+    let state = WINDOWS_CONSOLE_DECODE_STATE.get_or_init(|| Mutex::new(Default::default()));
+    let mut guard = state.lock().unwrap();
+    if otype == 0 {
+        decode_console_bytes_with_state(&mut guard.stdout, bytes)
+    } else {
+        decode_console_bytes_with_state(&mut guard.stderr, bytes)
+    }
+}
+
+#[cfg(all(test, target_family = "windows"))]
+fn reset_console_decode_state_for_tests() {
+    if let Some(state) = WINDOWS_CONSOLE_DECODE_STATE.get() {
+        let mut guard = state.lock().unwrap();
+        *guard = WindowsConsoleDecodeStates::default();
+    }
+}
+
+#[cfg(not(target_family = "windows"))]
+fn decode_console_bytes_for_channel(_otype: c_int, bytes: &[u8]) -> Vec<u8> {
+    bytes.to_vec()
+}
+
 fn complete_active_request(
     state: &Arc<SessionState>,
     active: Option<ActiveRequest>,
@@ -576,10 +822,11 @@ pub extern "C-unwind" fn r_write_console(buf: *const c_char, buflen: c_int, otyp
         return;
     }
     let bytes = unsafe { std::slice::from_raw_parts(buf as *const u8, buflen as usize) };
+    let bytes = decode_console_bytes_for_channel(otype, bytes);
     if otype == 0 {
-        write_stdout_bytes(bytes);
+        write_stdout_bytes(&bytes);
     } else {
-        write_stderr_bytes(bytes);
+        write_stderr_bytes(&bytes);
     }
 }
 
@@ -594,7 +841,19 @@ pub extern "C-unwind" fn r_show_message(buf: *const c_char) {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C-unwind" fn r_busy(_which: c_int) {}
+pub extern "C-unwind" fn r_busy(which: c_int) {
+    #[cfg(target_family = "windows")]
+    {
+        if which == 0 {
+            let _ = complete_active_request_if_idle();
+        }
+    }
+
+    #[cfg(not(target_family = "windows"))]
+    {
+        let _ = which;
+    }
+}
 
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn r_suicide(buf: *const c_char) {
@@ -770,7 +1029,10 @@ pub(crate) fn push_plot_image(
 #[cfg(target_family = "windows")]
 #[unsafe(no_mangle)]
 pub extern "C-unwind" fn r_yes_no_cancel(_question: *const c_char) -> c_int {
-    0
+    // In embedded Windows sessions this callback can be reached during cleanup
+    // when R asks whether to save the workspace image. Returning -1 requests
+    // "no save", which keeps shutdown non-interactive.
+    -1
 }
 
 #[cfg(target_family = "windows")]
@@ -797,4 +1059,110 @@ fn get_user_home() -> String {
     unsafe { CStr::from_ptr(r_path) }
         .to_string_lossy()
         .to_string()
+}
+
+#[cfg(all(test, target_family = "windows"))]
+mod tests {
+    use std::sync::{Mutex, OnceLock};
+
+    use super::{
+        UTF8_IN_MARKER, UTF8_OUT_MARKER, decode_console_bytes_for_channel,
+        reset_console_decode_state_for_tests,
+    };
+
+    fn test_mutex() -> &'static Mutex<()> {
+        static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_MUTEX.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn decode_console_bytes_strips_embedded_utf8_markers() {
+        let _guard = test_mutex().lock().expect("test mutex");
+        reset_console_decode_state_for_tests();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"[1] \"");
+        bytes.extend_from_slice(UTF8_IN_MARKER);
+        bytes.extend_from_slice(b"after interrupt");
+        bytes.extend_from_slice(UTF8_OUT_MARKER);
+        bytes.extend_from_slice(b"\"\n");
+
+        let decoded = decode_console_bytes_for_channel(0, &bytes);
+        let text = String::from_utf8(decoded).expect("decoder must produce UTF-8");
+
+        assert_eq!(text, "[1] \"after interrupt\"\n");
+    }
+
+    #[test]
+    fn decode_console_bytes_preserves_embedded_utf8_text() {
+        let _guard = test_mutex().lock().expect("test mutex");
+        reset_console_decode_state_for_tests();
+
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"R Help on ");
+        bytes.extend_from_slice(UTF8_IN_MARKER);
+        let quoted = format!("{}mean{}", '\u{2018}', '\u{2019}');
+        bytes.extend_from_slice(quoted.as_bytes());
+        bytes.extend_from_slice(UTF8_OUT_MARKER);
+        bytes.extend_from_slice(b"\n");
+
+        let decoded = decode_console_bytes_for_channel(0, &bytes);
+        let text = String::from_utf8(decoded).expect("decoder must produce UTF-8");
+
+        assert_eq!(text, format!("R Help on {quoted}\n"));
+    }
+
+    #[test]
+    fn decode_console_bytes_handles_markers_split_across_callbacks() {
+        let _guard = test_mutex().lock().expect("test mutex");
+        reset_console_decode_state_for_tests();
+
+        let chunk1 = b"[1] \"\x02\xff";
+        let chunk2 = b"\xfeafter interrupt\x03\xff";
+        let chunk3 = b"\xfe\"\n";
+
+        let out1 = decode_console_bytes_for_channel(0, chunk1);
+        let out2 = decode_console_bytes_for_channel(0, chunk2);
+        let out3 = decode_console_bytes_for_channel(0, chunk3);
+
+        let merged = [out1, out2, out3].concat();
+        let text = String::from_utf8(merged).expect("decoder must produce UTF-8");
+        assert_eq!(text, "[1] \"after interrupt\"\n");
+    }
+
+    #[test]
+    fn decode_console_bytes_does_not_mix_stdout_stderr_marker_state() {
+        let _guard = test_mutex().lock().expect("test mutex");
+        reset_console_decode_state_for_tests();
+
+        let out1 = decode_console_bytes_for_channel(0, b"\x02\xff\xfecaf");
+        let out2 = decode_console_bytes_for_channel(1, b"ERR\n");
+        let out3 = decode_console_bytes_for_channel(0, b"\x03\xff\xfe");
+
+        assert!(
+            out1.is_empty(),
+            "stdout partial UTF-8 segment should be buffered"
+        );
+        let stderr = String::from_utf8(out2).expect("stderr output should remain UTF-8");
+        assert_eq!(stderr, "ERR\n");
+        let stdout_tail = String::from_utf8(out3).expect("stdout output should remain UTF-8");
+        assert_eq!(stdout_tail, "caf");
+    }
+}
+
+#[cfg(all(test, not(target_family = "windows")))]
+mod non_windows_tests {
+    use super::decode_console_bytes_for_channel;
+
+    #[test]
+    fn decode_console_bytes_passthrough_on_non_windows_stdout() {
+        let input = b"plain output\n";
+        assert_eq!(decode_console_bytes_for_channel(0, input), input);
+    }
+
+    #[test]
+    fn decode_console_bytes_passthrough_on_non_windows_stderr() {
+        let input = b"error output\n";
+        assert_eq!(decode_console_bytes_for_channel(1, input), input);
+    }
 }

@@ -15,7 +15,6 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         .join("")
 }
 
-#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn r_respects_rprofile_and_renviron_on_startup() -> TestResult<()> {
     let home_dir = tempfile::tempdir()?;
@@ -28,11 +27,24 @@ async fn r_respects_rprofile_and_renviron_on_startup() -> TestResult<()> {
         "options(mcp_console_rprofile_test = \"RPROFILE_OK_6a8d0df6\")\n",
     )?;
 
-    let mut session = common::spawn_server_with_env_vars(vec![(
-        "HOME".to_string(),
-        home_dir.path().to_string_lossy().to_string(),
-    )])
-    .await?;
+    let home = home_dir.path().to_string_lossy().to_string();
+    let mut env_vars = vec![
+        ("HOME".to_string(), home.clone()),
+        ("R_USER".to_string(), home.clone()),
+    ];
+    #[cfg(windows)]
+    {
+        env_vars.push(("USERPROFILE".to_string(), home.clone()));
+        if home.len() >= 3
+            && home.as_bytes()[1] == b':'
+            && (home.as_bytes()[2] == b'\\' || home.as_bytes()[2] == b'/')
+        {
+            env_vars.push(("HOMEDRIVE".to_string(), home[..2].to_string()));
+            env_vars.push(("HOMEPATH".to_string(), home[2..].to_string()));
+        }
+    }
+
+    let mut session = common::spawn_server_with_env_vars(env_vars).await?;
 
     let result = session
         .write_stdin_raw_with(

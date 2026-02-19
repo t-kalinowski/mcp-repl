@@ -1,16 +1,15 @@
 ---
 source: tests/plot_images.rs
-assertion_line: 159
 expression: transcript
 ---
 == transcript ==
 1) write_stdin
 >>> plot(1:10)
-<<< [image/png blake3:0694aafd9f8fc0744e7029b187c1ab182d061a4f180319772a19794be32ebf98]
+<<< [image/png blake3:2522b72c5d81851a70f577f10a50a32db6a3470a3bd862aa32757985d547212c]
 
 2) write_stdin
 >>> lines(4:8, 4:8)
-<<< [image/png blake3:360038e3039ff204ea7387e588961dc5e0c2cac15c840f78a7c1c8f3e8c9a0c0]
+<<< [image/png blake3:58a06870d08a865ec8a2edefafb0a726ad92ec28c091d8c77938b52e78343b17]
 
 3) write_stdin
 >>> 1+1

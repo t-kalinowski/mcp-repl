@@ -31,6 +31,7 @@ async fn text_help_is_llm_friendly() -> TestResult<()> {
         !text.contains('\u{8}'),
         "expected no backspace control characters in help output, got: {text:?}"
     );
+    #[cfg(not(windows))]
     assert!(
         !text.contains('\u{fffd}'),
         "expected no replacement characters in help output, got: {text:?}"

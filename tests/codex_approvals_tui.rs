@@ -30,6 +30,10 @@ mod unix_impl {
             eprintln!("sandbox-exec unavailable; skipping");
             return Ok(Vec::new());
         }
+        if !loopback_bind_available().await {
+            eprintln!("loopback TCP bind unavailable; skipping");
+            return Ok(Vec::new());
+        }
 
         let repo_root = std::env::current_dir()?;
         let mcp_console = resolve_mcp_console_path()?;
@@ -84,6 +88,10 @@ mod unix_impl {
         );
 
         Ok(steps)
+    }
+
+    async fn loopback_bind_available() -> bool {
+        TcpListener::bind("127.0.0.1:0").await.is_ok()
     }
 
     fn codex_available() -> bool {

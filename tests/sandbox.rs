@@ -1,6 +1,8 @@
 mod common;
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "windows")]
+use std::path::PathBuf;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::{
@@ -9,9 +11,9 @@ use std::{
 };
 
 use common::TestResult;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use rmcp::model::CallToolResult;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 use rmcp::model::RawContent;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use tokio::io::AsyncWriteExt;
@@ -35,7 +37,6 @@ struct TempDirStatus {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const SESSION_MARKER_FILE: &str = "mcp-console-session-marker.txt";
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 const SANDBOX_PAGER_PAGE_CHARS: u64 = 2048;
 
 #[cfg(target_os = "macos")]
@@ -63,7 +64,7 @@ fn linux_bwrap_available() -> bool {
         .any(|candidate| candidate.is_file())
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn collect_text(result: &CallToolResult) -> String {
     let text = result
         .content
@@ -93,7 +94,7 @@ fn sandbox_state_read_only() -> String {
     .to_string()
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn sandbox_state_workspace_write(network_access: bool) -> String {
     let mut policy = serde_json::Map::new();
     policy.insert(
@@ -287,7 +288,7 @@ cat("MARKER_EXISTS=", file.exists({marker}), "\n", sep = "")
     })
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 async fn spawn_server_with_sandbox_state(state: String) -> TestResult<common::McpTestSession> {
     common::spawn_server_with_args_env_and_pager_page_chars(
         vec!["--sandbox-state".to_string(), state],
@@ -310,7 +311,7 @@ async fn spawn_server_with_sandbox_state_and_env(
     .await
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn r_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| format!("\"{value}\""))
 }
@@ -350,6 +351,23 @@ async fn start_loopback_server() -> TestResult<std::net::SocketAddr> {
         }
     });
     Ok(addr)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+async fn start_loopback_server_if_available() -> TestResult<Option<std::net::SocketAddr>> {
+    match start_loopback_server().await {
+        Ok(addr) => Ok(Some(addr)),
+        Err(err) => {
+            let message = err.to_string();
+            if message.contains("Operation not permitted") || message.contains("Permission denied")
+            {
+                eprintln!("loopback unavailable in this environment; skipping");
+                Ok(None)
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -445,10 +463,7 @@ async fn sandbox_full_access_allows_writes_outside_workspace() -> TestResult<()>
         eprintln!("sandbox-exec unavailable; skipping");
         return Ok(());
     }
-    let Some(home) = std::env::var_os("HOME") else {
-        return Ok(());
-    };
-    let target = unique_path(Path::new(&home), "full-access");
+    let target = unique_path(&std::env::temp_dir(), "full-access");
     let mut session = spawn_server_with_sandbox_state(sandbox_state_full_access()).await?;
     let result = session
         .write_stdin_raw_with(write_test_code(&target), Some(10.0))
@@ -471,7 +486,9 @@ async fn sandbox_read_only_blocks_network_access() -> TestResult<()> {
         eprintln!("sandbox-exec unavailable; skipping");
         return Ok(());
     }
-    let addr = start_loopback_server().await?;
+    let Some(addr) = start_loopback_server_if_available().await? else {
+        return Ok(());
+    };
     let mut session = spawn_server_with_sandbox_state(sandbox_state_read_only()).await?;
     let result = session
         .write_stdin_raw_with(network_test_code(addr), Some(10.0))
@@ -535,6 +552,8 @@ if (!requireNamespace("reticulate", quietly = TRUE)) {
 
     if text.contains("[mcp-console] reticulate not installed")
         || text.contains("[mcp-console] keras3 not installed")
+        || text
+            .contains("[mcp-console] keras-reticulate-error:Python specified in RETICULATE_PYTHON")
     {
         session.cancel().await?;
         return Ok(());
@@ -560,7 +579,9 @@ async fn sandbox_workspace_write_blocks_network_access() -> TestResult<()> {
         eprintln!("sandbox-exec unavailable; skipping");
         return Ok(());
     }
-    let addr = start_loopback_server().await?;
+    let Some(addr) = start_loopback_server_if_available().await? else {
+        return Ok(());
+    };
     let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
     let result = session
         .write_stdin_raw_with(network_test_code(addr), Some(10.0))
@@ -665,7 +686,9 @@ async fn sandbox_workspace_write_allows_network_access() -> TestResult<()> {
         eprintln!("sandbox-exec unavailable; skipping");
         return Ok(());
     }
-    let addr = start_loopback_server().await?;
+    let Some(addr) = start_loopback_server_if_available().await? else {
+        return Ok(());
+    };
     let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(true)).await?;
     let result = session
         .write_stdin_raw_with(network_test_code(addr), Some(10.0))
@@ -686,7 +709,9 @@ async fn sandbox_full_access_allows_network_access() -> TestResult<()> {
         eprintln!("sandbox-exec unavailable; skipping");
         return Ok(());
     }
-    let addr = start_loopback_server().await?;
+    let Some(addr) = start_loopback_server_if_available().await? else {
+        return Ok(());
+    };
     let mut session = spawn_server_with_sandbox_state(sandbox_state_full_access()).await?;
     let result = session
         .write_stdin_raw_with(network_test_code(addr), Some(10.0))
@@ -931,7 +956,9 @@ async fn sandbox_workspace_write_blocks_network_access_bwrap() -> TestResult<()>
         eprintln!("bwrap unavailable; skipping");
         return Ok(());
     }
-    let addr = start_loopback_server().await?;
+    let Some(addr) = start_loopback_server_if_available().await? else {
+        return Ok(());
+    };
     let mut session = spawn_server_with_sandbox_state_and_env(
         sandbox_state_workspace_write(false),
         vec![("MCP_CONSOLE_USE_LINUX_BWRAP".to_string(), "1".to_string())],
@@ -994,8 +1021,68 @@ async fn sandbox_bwrap_no_proc_mode_starts_worker() -> TestResult<()> {
 }
 
 #[cfg(target_os = "windows")]
-#[test]
-fn sandbox_denials_windows_stub() -> TestResult<()> {
-    eprintln!("sandbox denial tests are not implemented on Windows; skipping");
+fn windows_home_dir() -> Option<PathBuf> {
+    if let Some(user_profile) = std::env::var_os("USERPROFILE") {
+        return Some(PathBuf::from(user_profile));
+    }
+    let home_drive = std::env::var_os("HOMEDRIVE")?;
+    let home_path = std::env::var_os("HOMEPATH")?;
+    let mut home = PathBuf::from(home_drive);
+    home.push(home_path);
+    Some(home)
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_denials_windows() -> TestResult<()> {
+    let Some(home) = windows_home_dir() else {
+        eprintln!("USERPROFILE/HOMEDRIVE+HOMEPATH unavailable; skipping");
+        return Ok(());
+    };
+    if !home.is_dir() {
+        eprintln!("home directory is unavailable; skipping");
+        return Ok(());
+    }
+
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let forbidden = home.join(format!("mcp-console-denied-{nanos}.txt"));
+    let forbidden_r = r_string(&forbidden.to_string_lossy());
+
+    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
+    let code = format!(
+        r#"
+target <- {forbidden_r}
+tryCatch({{
+  writeLines("nope", target)
+  cat("WRITE_OK\n")
+}}, error = function(e) {{
+  message("WRITE_ERROR:", conditionMessage(e))
+}})
+"#
+    );
+    let result = session.write_stdin_raw_with(&code, Some(10.0)).await?;
+    let text = collect_text(&result);
+    let _ = std::fs::remove_file(&forbidden);
+    if text.contains("CreateRestrictedToken failed: 87")
+        || text.contains("worker exited before IPC named pipe connection")
+        || text.contains("timed out waiting for IPC named pipe client connection")
+    {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert!(
+        text.contains("WRITE_ERROR:"),
+        "expected USERPROFILE write to be blocked under workspace-write, got: {text}"
+    );
+    assert!(
+        !text.contains("WRITE_OK"),
+        "write unexpectedly succeeded under workspace-write: {text}"
+    );
+    session.cancel().await?;
     Ok(())
 }

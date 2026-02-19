@@ -1,5 +1,5 @@
 use std::cell::Cell;
-use std::io;
+use std::io::{self, Write};
 use std::sync::{Mutex, MutexGuard};
 
 static OUTPUT_LOCK: Mutex<()> = Mutex::new(());
@@ -48,7 +48,9 @@ pub(crate) fn write_stdout_bytes(bytes: &[u8]) {
         return;
     }
     with_output_lock(|| {
-        let _ = write_fd(libc::STDOUT_FILENO, bytes);
+        let stdout = std::io::stdout();
+        let mut stdout = stdout.lock();
+        let _ = write_all_bytes(&mut stdout, bytes);
     });
 }
 
@@ -57,23 +59,32 @@ pub(crate) fn write_stderr_bytes(bytes: &[u8]) {
         return;
     }
     with_output_lock(|| {
-        let _ = write_fd(libc::STDERR_FILENO, bytes);
+        let stderr = std::io::stderr();
+        let mut stderr = stderr.lock();
+        let _ = write_all_bytes(&mut stderr, bytes);
     });
 }
 
-fn write_fd(fd: i32, bytes: &[u8]) -> io::Result<()> {
+fn write_all_bytes<W: Write>(writer: &mut W, bytes: &[u8]) -> io::Result<()> {
     let mut offset = 0usize;
     while offset < bytes.len() {
         let chunk = &bytes[offset..];
-        let result = unsafe { libc::write(fd, chunk.as_ptr().cast(), chunk.len()) };
-        if result < 0 {
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
+        match writer.write(chunk) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "failed to write output bytes",
+                ));
+            }
+            Ok(written) => {
+                offset = offset.saturating_add(written);
+            }
+            Err(err) if err.kind() == io::ErrorKind::Interrupted => {
                 continue;
             }
-            return Err(err);
+            Err(err) => return Err(err),
         }
-        offset = offset.saturating_add(result as usize);
     }
+    writer.flush()?;
     Ok(())
 }

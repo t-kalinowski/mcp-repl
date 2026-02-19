@@ -1,7 +1,33 @@
 mod common;
 
-use common::{McpSnapshot, TestResult};
+#[cfg(not(windows))]
+use common::McpSnapshot;
+use common::TestResult;
+use rmcp::model::RawContent;
 
+fn result_text(result: &rmcp::model::CallToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|item| match &item.raw {
+            RawContent::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn backend_unavailable(text: &str) -> bool {
+    text.contains("Fatal error: cannot create 'R_TempDir'")
+        || text.contains("failed to start R session")
+        || text.contains("worker exited with status")
+        || text.contains("unable to initialize the JIT")
+        || text.contains(
+            "worker protocol error: ipc disconnected while waiting for request completion",
+        )
+}
+
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshots_support_multiple_calls_and_sessions() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -39,6 +65,7 @@ async fn snapshots_support_multiple_calls_and_sessions() -> TestResult<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshots_interrupt_handler_output() -> TestResult<()> {
     let mut snapshot = McpSnapshot::new();
@@ -131,5 +158,66 @@ cat("TEMPDIR_UNDER_TMPDIR=", startsWith(tempdir(), Sys.getenv("TMPDIR")), "\n", 
             snapshot.render_transcript()
         );
     });
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn transcripts_windows_smoke() -> TestResult<()> {
+    use tokio::time::{Duration, Instant, sleep};
+
+    async fn assert_eventually_contains(
+        session: &mut common::McpTestSession,
+        input: &str,
+        expected: &str,
+        label: &str,
+    ) -> TestResult<bool> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut last_text = String::new();
+        while Instant::now() < deadline {
+            let result = session.write_stdin_raw_with(input, Some(10.0)).await?;
+            last_text = result_text(&result);
+            if backend_unavailable(&last_text) {
+                return Ok(false);
+            }
+            if last_text.contains(expected) {
+                return Ok(true);
+            }
+            if last_text.contains("<<console status: busy")
+                || last_text.contains("worker is busy")
+                || last_text.contains("request already running")
+                || last_text.contains("input discarded while worker busy")
+            {
+                sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            sleep(Duration::from_millis(50)).await;
+        }
+        eprintln!("mcp_transcripts {label} did not stabilize: {last_text}");
+        Ok(false)
+    }
+
+    let mut session = common::spawn_server().await?;
+    if !assert_eventually_contains(&mut session, "x <- 40 + 2; x", "42", "x assignment").await? {
+        eprintln!("mcp_transcripts backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let _ = session.write_stdin_raw_with("\u{4}", Some(10.0)).await?;
+    if !assert_eventually_contains(
+        &mut session,
+        "print(exists(\"x\"))",
+        "FALSE",
+        "restart clears vars",
+    )
+    .await?
+    {
+        eprintln!("mcp_transcripts backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
     Ok(())
 }

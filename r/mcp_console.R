@@ -214,6 +214,10 @@ local({
     if (grepl("^//", path)) {
       path <- sub("^//", "", path)
     }
+    path <- utils::URLdecode(path)
+    if (.Platform$OS.type == "windows" && grepl("^/[A-Za-z]:", path)) {
+      path <- sub("^/", "", path)
+    }
 
     if (file.exists(path)) {
       shown <- if (nzchar(fragment)) paste0(path, "#", fragment) else path
