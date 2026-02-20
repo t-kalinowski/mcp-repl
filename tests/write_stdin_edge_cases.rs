@@ -34,8 +34,12 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
 fn backend_unavailable(text: &str) -> bool {
     text.contains("Fatal error: cannot create 'R_TempDir'")
         || text.contains("failed to start R session")
+        || text.contains("worker exited with signal")
         || text.contains("worker exited with status")
+        || text.contains("worker io error: Broken pipe")
         || text.contains("unable to initialize the JIT")
+        || text.contains("libR.so: cannot open shared object file")
+        || text.contains("options(\"defaultPackages\") was not found")
         || text.contains(
             "worker protocol error: ipc disconnected while waiting for request completion",
         )
