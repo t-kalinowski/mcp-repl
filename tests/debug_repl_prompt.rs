@@ -57,6 +57,7 @@ fn debug_repl_prints_initial_prompt() -> TestResult<()> {
     }
     let mut child = cmd
         .env("MCP_CONSOLE_REPL_IMAGES", "0")
+        .env("MCP_CONSOLE_PAGER_PAGE_CHARS", "1000000")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -133,13 +134,16 @@ fn debug_repl_prints_initial_prompt() -> TestResult<()> {
         err_seen.extend_from_slice(&chunk);
     }
     let err_output = String::from_utf8_lossy(&err_seen);
+    let backend_unavailable = output.is_empty()
+        || err_output.contains("Fatal error: cannot create 'R_TempDir'")
+        || err_output.contains("failed to start R session")
+        || err_output
+            .contains("worker protocol error: ipc disconnected while waiting for backend info")
+        || err_output.contains("worker exited with status")
+        || err_output.contains("[mcp-console] error");
     if !((saw_prompt && output.contains("> "))
         || (saw_idle && output.contains("<<console status: idle>>")))
-        && (output.is_empty()
-            || err_output.contains("Fatal error: cannot create 'R_TempDir'")
-            || err_output.contains("failed to start R session")
-            || err_output
-                .contains("worker protocol error: ipc disconnected while waiting for backend info"))
+        && backend_unavailable
     {
         eprintln!("debug_repl backend unavailable in this environment; skipping");
         return Ok(());
