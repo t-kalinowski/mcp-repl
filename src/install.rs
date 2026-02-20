@@ -8,6 +8,10 @@ use std::process::{Command, Stdio};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use toml_edit::{Array, DocumentMut, Item, Table, value};
 
+const CODEX_TOOL_TIMEOUT_SECS: i64 = 1_800;
+const CODEX_TOOL_TIMEOUT_COMMENT: &str =
+    "\n# mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.\n";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum InstallTarget {
     Codex,
@@ -359,6 +363,14 @@ fn upsert_codex_mcp_server(
     }
 
     doc["mcp_servers"][server_name]["command"] = value(command);
+    doc["mcp_servers"][server_name]["tool_timeout_sec"] = value(CODEX_TOOL_TIMEOUT_SECS);
+    if let Some(tool_timeout_value) =
+        doc["mcp_servers"][server_name]["tool_timeout_sec"].as_value_mut()
+    {
+        tool_timeout_value
+            .decor_mut()
+            .set_prefix(CODEX_TOOL_TIMEOUT_COMMENT);
+    }
 
     let mut toml_args = Array::default();
     for arg in args {
@@ -462,6 +474,10 @@ mod tests {
             doc["mcp_servers"]["console"]["command"].as_str(),
             Some("/usr/local/bin/mcp-console")
         );
+        assert_eq!(
+            doc["mcp_servers"]["console"]["tool_timeout_sec"].as_integer(),
+            Some(1800)
+        );
         let args = doc["mcp_servers"]["console"]["args"]
             .as_array()
             .expect("args array");
@@ -471,6 +487,10 @@ mod tests {
         assert!(
             text.contains("additional writable roots outside cwd"),
             "expected install annotation comment in config"
+        );
+        assert!(
+            text.contains("mcp-repl handles the primary timeout"),
+            "expected tool timeout rationale comment in config"
         );
     }
 
