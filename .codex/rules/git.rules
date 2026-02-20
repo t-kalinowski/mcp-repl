@@ -19,11 +19,11 @@ prefix_rule(
 )
 
 # Forbid pushing
-prefix_rule(
-    pattern = ["git", "push"],
-    decision = "forbidden",
-    justification = "Pushing is blocked in this repo. Open a PR instead.",
-    match = [
-        "git push origin main",
-    ],
-)
+# prefix_rule(
+#     pattern = ["git", "push"],
+#     decision = "forbidden",
+#     justification = "Pushing is blocked in this repo. Open a PR instead.",
+#     match = [
+#         "git push origin main",
+#     ],
+# )

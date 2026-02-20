@@ -92,6 +92,9 @@ the R cache path writable:
 command = "/Users/alice/.cargo/bin/mcp-repl"
 # mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.
 tool_timeout_sec = 1800
+# additional roots the REPL can write to (outside cwd):
+# discovered at install time using R:
+# tools::R_user_dir("", which = "cache")
 # Re-run `mcp-repl install-codex` to refresh this list.
 args = [
   "--sandbox-mode", "workspace-write",

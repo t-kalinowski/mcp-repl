@@ -270,7 +270,7 @@ fn parse_install_args(
     mut targets: Vec<install::InstallTarget>,
     allow_positional_targets: bool,
 ) -> Result<install::InstallOptions, Box<dyn std::error::Error>> {
-    let mut server_name = "repl".to_string();
+    let mut server_name = "r_repl".to_string();
     let mut command = None;
     let mut args = Vec::new();
 
@@ -488,6 +488,16 @@ mod tests {
     fn parse_sandbox_network_access_accepts_expected_values() {
         assert_eq!(parse_sandbox_network_access("enabled"), Ok(true));
         assert_eq!(parse_sandbox_network_access("restricted"), Ok(false));
+    }
+
+    #[test]
+    fn parse_install_args_defaults_server_name_to_r_repl() {
+        let mut parser = ArgParser {
+            args: Vec::new(),
+            index: 0,
+        };
+        let parsed = parse_install_args(&mut parser, Vec::new(), true).expect("parse install args");
+        assert_eq!(parsed.server_name, "r_repl");
     }
 
     #[test]
