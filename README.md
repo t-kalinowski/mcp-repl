@@ -81,35 +81,33 @@ mcp-repl install-claude
 mcp-repl install
 ```
 
-`install-codex` also runs a one-time `R` probe and annotates
-`~/.codex/config.toml` with additional writable roots (outside `cwd`) commonly needed for R
-tooling (`cache`, `data`, `config`). When no explicit sandbox configuration flags are already set,
-those roots are injected into readable repeatable CLI flags.
+`install-codex` also runs a one-time `R` probe and can annotate
+`~/.codex/config.toml` with additional writable roots (outside `cwd`) for R tooling.
 
-Example generated Codex config (paths vary by OS/user):
+Example `R` REPL Codex config (paths vary by OS/user). This minimal example keeps only
+the R cache path writable:
 
 ```toml
-[mcp_servers.repl]
+[mcp_servers.r_repl]
 command = "/Users/alice/.cargo/bin/mcp-repl"
-# mcp-repl additional writable roots outside cwd (install-time R probe):
-# - /Users/alice/Library/Caches/org.R-project.R/R
-# - /Users/alice/Library/Application Support/org.R-project.R/R
-# - /Users/alice/Library/Preferences/org.R-project.R/R
 # Re-run `mcp-repl install-codex` to refresh this list.
 args = [
   "--sandbox-mode", "workspace-write",
   "--sandbox-network-access", "restricted",
   "--writable-root", "/Users/alice/Library/Caches/org.R-project.R/R",
-  "--writable-root", "/Users/alice/Library/Application Support/org.R-project.R/R",
-  "--writable-root", "/Users/alice/Library/Preferences/org.R-project.R/R",
 ]
 ```
 
-For manual Codex config, the entry looks like:
+Example `Python` REPL Codex config:
 
 ```toml
-[mcp_servers.repl]
-command = "mcp-repl"
+[mcp_servers.python_repl]
+command = "/Users/alice/.cargo/bin/mcp-repl"
+args = [
+  "--backend", "python",
+  "--sandbox-mode", "workspace-write",
+  "--sandbox-network-access", "restricted",
+]
 ```
 
 ### 3) Pick backend (optional)
@@ -170,11 +168,12 @@ Tool guides:
 - `docs/tool-descriptions/repl_tool_python.md`
 - `docs/tool-descriptions/repl_reset_tool.md`
 
-## Session endings
+## Session management
 
-- **Interrupt**: `repl` with input prefixed by `\u0003` (best-effort SIGINT), session continues when successful.
-- **Reset**: use `repl_reset`.
-- **EOF / `quit()`**: forwarded to R; output is returned, and a fresh worker starts next request.
+- **Interrupt**: prefix `repl` input with `\u0003` (best-effort SIGINT). If successful, the same session continues.
+- **Reset**: call `repl_reset`, or prefix `repl` input with `\u0004` (Ctrl-D). With `\u0004`, remaining input (optional newline) is executed in the fresh session.
+- **Reset escalation model**: reset first attempts graceful session shutdown, then escalates to forceful termination; on Unix, if process-group signaling is unavailable, it falls back to scanning and signaling descendant processes.
+- **In-band exits**: standard runtime exits also work (`EOF`, `quit()`, etc.); output is returned and the next request runs in a fresh worker.
 
 ## Docs
 
