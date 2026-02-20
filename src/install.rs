@@ -269,7 +269,7 @@ fn probe_r_writable_roots() -> Vec<PathBuf> {
         .arg(
             r#"cat(
 sep = "",
-"MCP_CONSOLE_INSTALL_R_CACHE_ROOT=", dirname(tools::R_user_dir("mcp_console_probe", which = "cache")), "\n"
+"MCP_CONSOLE_INSTALL_R_CACHE_ROOT=", tools::R_user_dir("", which = "cache"), "\n"
 )"#,
         )
         .output();
@@ -369,7 +369,9 @@ fn upsert_codex_mcp_server(
 fn codex_r_writable_roots_comment(additional_writable_roots: &[PathBuf]) -> String {
     let mut lines = vec![
         "".to_string(),
-        "# mcp-repl additional writable roots outside cwd (install-time R probe):".to_string(),
+        "# additional roots the REPL can write to (outside cwd):".to_string(),
+        "# discovered at install time using R:".to_string(),
+        "# tools::R_user_dir(\"\", which = \"cache\")".to_string(),
     ];
     if additional_writable_roots.is_empty() {
         lines.push("# - none discovered".to_string());
@@ -540,7 +542,7 @@ mod tests {
             "expected generated timeout rationale comment in config"
         );
         assert!(
-            text.contains("additional writable roots outside cwd"),
+            text.contains("additional roots the REPL can write to"),
             "expected generated writable-roots annotation comment in config"
         );
         assert!(
