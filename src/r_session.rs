@@ -154,6 +154,7 @@ pub(crate) fn clear_pending_input() -> bool {
     had_pending
 }
 
+#[cfg(target_family = "windows")]
 pub(crate) fn complete_active_request_if_idle() -> bool {
     let Some(state) = SESSION_STATE.get() else {
         return false;

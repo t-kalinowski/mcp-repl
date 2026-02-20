@@ -6,7 +6,7 @@ expression: snapshot.render()
 -- step 1 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "\ncat(\"TMPDIR_SET=\", nzchar(Sys.getenv(\"TMPDIR\")), \"\\n\", sep = \"\")\ncat(\"TMPDIR_MATCH=\", Sys.getenv(\"TMPDIR\") == Sys.getenv(\"MCP_CONSOLE_R_SESSION_TMPDIR\"), \"\\n\", sep = \"\")\ncat(\"TEMPDIR_UNDER_TMPDIR=\", startsWith(tempdir(), Sys.getenv(\"TMPDIR\")), \"\\n\", sep = \"\")\nmarker <- file.path(tempdir(), \"mcp-console-snapshot.txt\")\ntryCatch({\n  writeLines(\"foo\", marker)\n  cat(\"TEMPDIR_MARKER_OK\\n\")\n}, error = function(e) {\n  message(\"TEMPDIR_MARKER_ERROR:\", conditionMessage(e))\n})\ntf <- tempfile()\ntryCatch({\n  writeLines(\"bar\", tf)\n  cat(\"TEMPFILE_OK\\n\")\n}, error = function(e) {\n  message(\"TEMPFILE_ERROR:\", conditionMessage(e))\n})\nunlink(tf)\ncat(\"TEMPDIR_LIST=\", paste(list.files(tempdir()), collapse = \",\"), \"\\n\", sep = \"\")\nroot_marker <- file.path(Sys.getenv(\"TMPDIR\"), \"mcp-console-snapshot-root.txt\")\ntryCatch({\n  writeLines(\"root\", root_marker)\n  cat(\"ROOT_MARKER_OK\\n\")\n}, error = function(e) {\n  message(\"ROOT_MARKER_ERROR:\", conditionMessage(e))\n})\ncat(\"ROOT_MARKER_EXISTS=\", file.exists(root_marker), \"\\n\", sep = \"\")\n",
     "timeout_ms": 10000
@@ -30,7 +30,7 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "\u0004\n"
   }
@@ -49,7 +49,7 @@ response:
 -- step 3 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "\nroot_marker <- file.path(Sys.getenv(\"TMPDIR\"), \"mcp-console-snapshot-root.txt\")\ncat(\"ROOT_MARKER_EXISTS=\", file.exists(root_marker), \"\\n\", sep = \"\")\ncat(\"TEMPDIR_LIST=\", paste(list.files(tempdir()), collapse = \",\"), \"\\n\", sep = \"\")\ncat(\"TEMPDIR_UNDER_TMPDIR=\", startsWith(tempdir(), Sys.getenv(\"TMPDIR\")), \"\\n\", sep = \"\")\n",
     "timeout_ms": 10000
@@ -73,7 +73,7 @@ response:
 -- step 4 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "\u0004\n"
   }
@@ -92,7 +92,7 @@ response:
 -- step 5 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "\nroot_marker <- file.path(Sys.getenv(\"TMPDIR\"), \"mcp-console-snapshot-root.txt\")\ncat(\"ROOT_MARKER_EXISTS=\", file.exists(root_marker), \"\\n\", sep = \"\")\ncat(\"TEMPDIR_LIST=\", paste(list.files(tempdir()), collapse = \",\"), \"\\n\", sep = \"\")\ncat(\"TEMPDIR_UNDER_TMPDIR=\", startsWith(tempdir(), Sys.getenv(\"TMPDIR\")), \"\\n\", sep = \"\")\n",
     "timeout_ms": 10000

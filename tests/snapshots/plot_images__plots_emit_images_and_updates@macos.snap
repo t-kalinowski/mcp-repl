@@ -5,7 +5,7 @@ expression: serialized
 {
   "steps": [
     {
-      "tool": "repl",
+      "tool": "r_repl",
       "input": "plot(1:10)",
       "response": {
         "content": [
@@ -29,7 +29,7 @@ expression: serialized
       }
     },
     {
-      "tool": "repl",
+      "tool": "r_repl",
       "input": "lines(4:8, 4:8)",
       "response": {
         "content": [
@@ -53,7 +53,7 @@ expression: serialized
       }
     },
     {
-      "tool": "repl",
+      "tool": "r_repl",
       "input": "1+1",
       "response": {
         "content": [

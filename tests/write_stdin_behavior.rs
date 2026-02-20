@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_lock)]
+
 mod common;
 
 use common::TestResult;
@@ -45,11 +47,11 @@ fn backend_unavailable(text: &str) -> bool {
 async fn spawn_behavior_session() -> TestResult<common::McpTestSession> {
     #[cfg(target_os = "windows")]
     {
-        return common::spawn_server_with_args(vec![
+        common::spawn_server_with_args(vec![
             "--sandbox-state".to_string(),
             "danger-full-access".to_string(),
         ])
-        .await;
+        .await
     }
     #[cfg(not(target_os = "windows"))]
     {

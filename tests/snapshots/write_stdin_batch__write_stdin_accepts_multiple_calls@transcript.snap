@@ -3,9 +3,9 @@ source: tests/write_stdin_batch.rs
 expression: snapshot.render_transcript()
 ---
 == session: list_inputs ==
-1) repl timeout_ms=10000
+1) r_repl timeout_ms=10000
 >>> x <- 1
 
-2) repl timeout_ms=10000
+2) r_repl timeout_ms=10000
 >>> x + 1
 <<< [1] 2

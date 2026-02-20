@@ -3,33 +3,33 @@ source: tests/pager.rs
 expression: snapshot.render_transcript()
 ---
 == session: default ==
-1) repl timeout_ms=30000
+1) r_repl timeout_ms=30000
 >>> line <- paste(rep("x", 200), collapse = ""); for (i in 1:200) { suffix <- if (i == 25) " r" else if (i == 75) "r " else ""; cat(sprintf("line%04d %s%s\n", i, line, suffix)) }
 <<< line0001 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< --More-- (140p, 0.4%, @0..210/42004)
 
-2) repl timeout_ms=30000
+2) r_repl timeout_ms=30000
 >>> :where  r
 <<< [mcp-console:pager] next match is ~23 page(s) ahead: use / r or `skip 23`
 <<< --More-- (140p, 0.4%, @210/42004)
 
-3) repl timeout_ms=30000
+3) r_repl timeout_ms=30000
 >>> :/ r
 <<< [mcp-console:pager] elided output (already shown): @210..5040
 <<< line0025 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx r
 <<< --More-- (123p, 12.5%, @5040..5252/42004)
 
-4) repl timeout_ms=30000
+4) r_repl timeout_ms=30000
 >>> :where r 
 <<< [mcp-console:pager] next match is ~49 page(s) ahead: use /r or `skip 49`
 <<< --More-- (123p, 12.5%, @5252/42004)
 
-5) repl timeout_ms=30000
+5) r_repl timeout_ms=30000
 >>> :/r 
 <<< [mcp-console:pager] elided output (already shown): @5252..15542
 <<< line0075 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxr 
 <<< --More-- (88p, 37.5%, @15542..15754/42004)
 
-6) repl timeout_ms=30000
+6) r_repl timeout_ms=30000
 >>> :q
 <<< (END, 37.5%, @15542..15754/42004)

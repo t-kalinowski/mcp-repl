@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_lock)]
+
 use common::TestResult;
 use rmcp::model::RawContent;
 use std::sync::{Mutex, OnceLock};

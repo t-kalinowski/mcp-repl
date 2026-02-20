@@ -6,7 +6,7 @@ expression: snapshot.render()
 -- step 1 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "\ncat(paste(rep(\"x\", 2200000), collapse = \"\"))\ncat(\"\\nEND\\n\")\n",
     "timeout_ms": 20000
@@ -30,7 +30,7 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "tail 8k\n",
     "timeout_ms": 10000

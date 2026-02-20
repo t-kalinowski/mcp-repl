@@ -6,7 +6,7 @@ expression: snapshot.render()
 -- step 1 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "tryCatch({ Sys.sleep(10000000) }, interrupt = function(e) cat(\"interrupt received\\n\"))\n",
     "timeout_ms": 200
@@ -23,14 +23,14 @@ response:
     },
     {
       "type": "text",
-      "text": "<<console status: busy, write_stdin timeout reached; elapsed_ms=200>>"
+      "text": "<<console status: busy, write_stdin timeout reached; elapsed_ms=N>>"
     }
   ]
 }
 -- step 2 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "\u0003\n",
     "timeout_ms": 5000
@@ -54,7 +54,7 @@ response:
 -- step 3 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "1+1\n",
     "timeout_ms": 10000

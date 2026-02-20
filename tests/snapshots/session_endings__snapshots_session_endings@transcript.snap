@@ -3,76 +3,76 @@ source: tests/session_endings.rs
 expression: snapshot.render_transcript()
 ---
 == session: restart_timeout_zero ==
-1) repl timeout_ms=10000
+1) r_repl timeout_ms=10000
 >>> x <- 1
 
-2) repl timeout_ms=0
+2) r_repl timeout_ms=0
 >>> 
 <<< [mcp-console] new session started
 
-3) repl timeout_ms=10000
+3) r_repl timeout_ms=10000
 >>> print(exists("x"))
 <<< [1] FALSE
 
 == session: restart_timeout_thirty ==
-1) repl timeout_ms=10000
+1) r_repl timeout_ms=10000
 >>> x <- 1
 
-2) repl timeout_ms=30000
+2) r_repl timeout_ms=30000
 >>> 
 <<< [mcp-console] new session started
 
-3) repl timeout_ms=10000
+3) r_repl timeout_ms=10000
 >>> print(exists("x"))
 <<< [1] FALSE
 
 == session: eof_input ==
-1) repl timeout_ms=10000
+1) r_repl timeout_ms=10000
 >>> 
 <<< [mcp-console] new session started
 
-2) repl timeout_ms=10000
+2) r_repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2
 
 == session: eof_then_remaining_input_same_call ==
-1) repl timeout_ms=10000
+1) r_repl timeout_ms=10000
 >>> 
 >>> 1+1
 <<< [1] 2
 
 == session: quit_no ==
-1) repl timeout_ms=10000
+1) r_repl timeout_ms=10000
 >>> x <- 1
 
-2) repl timeout_ms=10000
+2) r_repl timeout_ms=10000
 >>> quit("no")
 <<< [mcp-console] session ended
 
-3) repl timeout_ms=10000
+3) r_repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2
 
 == session: quit_default ==
-1) repl timeout_ms=10000
+1) r_repl timeout_ms=10000
 >>> x <- 1
 
-2) repl timeout_ms=10000
+2) r_repl timeout_ms=10000
 >>> quit()
 <<< [mcp-console] session ended
 
-3) repl timeout_ms=10000
+3) r_repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2
 
 == session: quit_yes ==
-1) repl timeout_ms=10000
+1) r_repl timeout_ms=10000
 >>> setwd(tempdir()); x <- 1
 
-2) repl timeout_ms=10000
+2) r_repl timeout_ms=10000
 >>> quit("yes")
 <<< [mcp-console] session ended
 
-3) repl timeout_ms=10000
+3) r_repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2

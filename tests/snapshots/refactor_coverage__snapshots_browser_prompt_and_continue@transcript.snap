@@ -3,13 +3,13 @@ source: tests/refactor_coverage.rs
 expression: snapshot.render_transcript()
 ---
 == session: browser_prompt ==
-1) repl timeout_ms=10000
+1) r_repl timeout_ms=10000
 >>> browser()
 <<< Called from: top level 
 
-2) repl timeout_ms=10000
+2) r_repl timeout_ms=10000
 >>> c
 
-3) repl timeout_ms=10000
+3) r_repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2

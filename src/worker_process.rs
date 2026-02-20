@@ -2433,7 +2433,7 @@ impl WorkerProcess {
 
         let mut ipc_server = IpcServer::bind().map_err(WorkerError::Io)?;
         let SpawnedWorker {
-            mut child,
+            child,
             stdin_tx,
             session_tmpdir,
             #[cfg(target_os = "macos")]
@@ -2449,6 +2449,8 @@ impl WorkerProcess {
                 Self::spawn_python_worker(sandbox_state, output_timeline.clone(), &mut ipc_server)?
             }
         };
+        #[allow(unused_mut)]
+        let mut child = child;
 
         let ipc = IpcHandle::new();
         #[cfg(any(target_family = "unix", target_family = "windows"))]
@@ -3404,29 +3406,28 @@ mod tests {
     fn completion_waits_for_request_end_event() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         driver_on_input_start("1+1", &server);
-
-        let sender = std::thread::spawn(move || {
-            let prompt = "> ".to_string();
-            let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
-                prompt: prompt.clone(),
-            });
-            let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
-                prompt: prompt.clone(),
-                line: "1+1\n".to_string(),
-            });
-            let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
-                prompt: prompt.clone(),
-            });
-            std::thread::sleep(Duration::from_millis(150));
-            let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+        let prompt = "> ".to_string();
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: prompt.clone(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: prompt.clone(),
+            line: "1+1\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: prompt.clone(),
         });
 
-        let result = driver_wait_for_completion(Duration::from_millis(75), server);
-        sender.join().expect("sender thread");
+        let result = driver_wait_for_completion(Duration::from_millis(75), server.clone());
         assert!(
             matches!(result, Err(WorkerError::Timeout(_))),
             "expected timeout before request-end"
         );
+
+        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after request-end");
+        assert_eq!(completion.prompt.as_deref(), Some("> "));
     }
 
     #[test]

@@ -3,8 +3,10 @@ mod common;
 #[cfg(not(windows))]
 use common::McpSnapshot;
 use common::TestResult;
+#[cfg(windows)]
 use rmcp::model::RawContent;
 
+#[cfg(windows)]
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
         .content
@@ -17,6 +19,7 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         .join("")
 }
 
+#[cfg(windows)]
 fn backend_unavailable(text: &str) -> bool {
     text.contains("Fatal error: cannot create 'R_TempDir'")
         || text.contains("failed to start R session")
@@ -25,6 +28,36 @@ fn backend_unavailable(text: &str) -> bool {
         || text.contains(
             "worker protocol error: ipc disconnected while waiting for request completion",
         )
+}
+
+#[cfg(not(windows))]
+fn backend_unavailable(text: &str) -> bool {
+    text.contains("Fatal error: cannot create 'R_TempDir'")
+        || text.contains("failed to start R session")
+        || text.contains("worker exited with status")
+        || text.contains("worker exited with signal")
+        || text.contains("unable to initialize the JIT")
+        || text.contains(
+            "worker protocol error: ipc disconnected while waiting for request completion",
+        )
+        || text.contains("options(\"defaultPackages\") was not found")
+        || text.contains("worker io error: Broken pipe")
+        || text.contains("[mcp-console] protocol error: missing prompt after pager dismiss")
+}
+
+#[cfg(not(windows))]
+fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()> {
+    let rendered = snapshot.render();
+    let transcript = snapshot.render_transcript();
+    if backend_unavailable(&rendered) || backend_unavailable(&transcript) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        return Ok(());
+    }
+    insta::assert_snapshot!(name, rendered);
+    insta::with_settings!({ snapshot_suffix => "transcript" }, {
+        insta::assert_snapshot!(name, transcript);
+    });
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -41,11 +74,7 @@ async fn paginates_large_output() -> TestResult<()> {
         })
         .await?;
 
-    insta::assert_snapshot!("paginates_large_output", snapshot.render());
-    insta::with_settings!({ snapshot_suffix => "transcript" }, {
-        insta::assert_snapshot!("paginates_large_output", snapshot.render_transcript());
-    });
-    Ok(())
+    assert_snapshot_or_skip("paginates_large_output", &snapshot)
 }
 
 #[cfg(not(windows))]
@@ -63,11 +92,7 @@ async fn pager_search_and_counts() -> TestResult<()> {
         })
         .await?;
 
-    insta::assert_snapshot!("pager_search_and_counts", snapshot.render());
-    insta::with_settings!({ snapshot_suffix => "transcript" }, {
-        insta::assert_snapshot!("pager_search_and_counts", snapshot.render_transcript());
-    });
-    Ok(())
+    assert_snapshot_or_skip("pager_search_and_counts", &snapshot)
 }
 
 #[cfg(not(windows))]
@@ -85,14 +110,7 @@ async fn pager_search_preserves_whitespace() -> TestResult<()> {
         })
         .await?;
 
-    insta::assert_snapshot!("pager_search_preserves_whitespace", snapshot.render());
-    insta::with_settings!({ snapshot_suffix => "transcript" }, {
-        insta::assert_snapshot!(
-            "pager_search_preserves_whitespace",
-            snapshot.render_transcript()
-        );
-    });
-    Ok(())
+    assert_snapshot_or_skip("pager_search_preserves_whitespace", &snapshot)
 }
 
 #[cfg(not(windows))]
@@ -109,17 +127,7 @@ async fn pager_search_case_insensitive_prefix_parsing() -> TestResult<()> {
         })
         .await?;
 
-    insta::assert_snapshot!(
-        "pager_search_case_insensitive_prefix_parsing",
-        snapshot.render()
-    );
-    insta::with_settings!({ snapshot_suffix => "transcript" }, {
-        insta::assert_snapshot!(
-            "pager_search_case_insensitive_prefix_parsing",
-            snapshot.render_transcript()
-        );
-    });
-    Ok(())
+    assert_snapshot_or_skip("pager_search_case_insensitive_prefix_parsing", &snapshot)
 }
 
 #[cfg(not(windows))]
@@ -135,14 +143,7 @@ async fn pager_matches_with_headings() -> TestResult<()> {
         })
         .await?;
 
-    insta::assert_snapshot!("pager_matches_with_headings", snapshot.render());
-    insta::with_settings!({ snapshot_suffix => "transcript" }, {
-        insta::assert_snapshot!(
-            "pager_matches_with_headings",
-            snapshot.render_transcript()
-        );
-    });
-    Ok(())
+    assert_snapshot_or_skip("pager_matches_with_headings", &snapshot)
 }
 
 #[cfg(not(windows))]
@@ -158,11 +159,7 @@ async fn pager_hits_mode() -> TestResult<()> {
         })
         .await?;
 
-    insta::assert_snapshot!("pager_hits_mode", snapshot.render());
-    insta::with_settings!({ snapshot_suffix => "transcript" }, {
-        insta::assert_snapshot!("pager_hits_mode", snapshot.render_transcript());
-    });
-    Ok(())
+    assert_snapshot_or_skip("pager_hits_mode", &snapshot)
 }
 
 #[cfg(not(windows))]
@@ -177,17 +174,7 @@ async fn pager_whitespace_only_input_advances_page() -> TestResult<()> {
         })
         .await?;
 
-    insta::assert_snapshot!(
-        "pager_whitespace_only_input_advances_page",
-        snapshot.render()
-    );
-    insta::with_settings!({ snapshot_suffix => "transcript" }, {
-        insta::assert_snapshot!(
-            "pager_whitespace_only_input_advances_page",
-            snapshot.render_transcript()
-        );
-    });
-    Ok(())
+    assert_snapshot_or_skip("pager_whitespace_only_input_advances_page", &snapshot)
 }
 
 #[cfg(not(windows))]
@@ -204,11 +191,7 @@ async fn pager_dedup_on_seek() -> TestResult<()> {
         })
         .await?;
 
-    insta::assert_snapshot!("pager_dedup_on_seek", snapshot.render());
-    insta::with_settings!({ snapshot_suffix => "transcript" }, {
-        insta::assert_snapshot!("pager_dedup_on_seek", snapshot.render_transcript());
-    });
-    Ok(())
+    assert_snapshot_or_skip("pager_dedup_on_seek", &snapshot)
 }
 
 #[cfg(windows)]

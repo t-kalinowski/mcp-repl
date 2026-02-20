@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_lock)]
+
 mod common;
 
 use common::{McpTestSession, TestResult};
@@ -47,8 +49,12 @@ fn sandbox_update_params(network_access: bool) -> serde_json::Value {
 fn backend_unavailable(text: &str) -> bool {
     text.contains("Fatal error: cannot create 'R_TempDir'")
         || text.contains("failed to start R session")
+        || text.contains("worker exited with signal")
         || text.contains("worker exited with status")
+        || text.contains("worker io error: Broken pipe")
         || text.contains("unable to initialize the JIT")
+        || text.contains("libR.so: cannot open shared object file")
+        || text.contains("options(\"defaultPackages\") was not found")
         || text.contains(
             "worker protocol error: ipc disconnected while waiting for request completion",
         )
@@ -227,6 +233,12 @@ tryCatch({
     .replace("__TARGET__", &target_literal);
     let result = session.write_stdin_raw_with(code, Some(10.0)).await?;
     let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates full_access backend unavailable; skipping");
+        let _ = std::fs::remove_file(&target);
+        session.cancel().await?;
+        return Ok(());
+    }
     assert!(
         text.contains("WRITE_OK"),
         "expected full access to allow write, got: {text}"

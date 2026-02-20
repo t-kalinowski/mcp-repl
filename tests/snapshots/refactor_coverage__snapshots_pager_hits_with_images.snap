@@ -6,7 +6,7 @@ expression: snapshot.render()
 -- step 1 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "\nset.seed(1)\ncat(\"# Title\\n\")\nfor (i in 1:60) cat(\"alpha line \", i, \"\\n\", sep = \"\")\nplot(1:5, type = \"l\")\nfor (i in 1:60) cat(\"beta line \", i, \"\\n\", sep = \"\")\nplot(5:1, type = \"l\")\nfor (i in 1:60) cat(\"gamma line \", i, \"\\n\", sep = \"\")\n",
     "timeout_ms": 10000
@@ -30,7 +30,7 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "hits alpha\n",
     "timeout_ms": 10000
@@ -54,7 +54,7 @@ response:
 -- step 3 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "seek 0\n",
     "timeout_ms": 10000
@@ -78,7 +78,7 @@ response:
 -- step 4 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "hits beta\n",
     "timeout_ms": 10000

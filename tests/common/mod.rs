@@ -160,6 +160,33 @@ enum SnapshotServiceError {
     Other { message: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestBackend {
+    R,
+    Python,
+}
+
+impl TestBackend {
+    fn repl_tool_name(self) -> &'static str {
+        match self {
+            Self::R => "r_repl",
+            Self::Python => "py_repl",
+        }
+    }
+}
+
+fn normalize_tool_name_for_request(tool: &str) -> &str {
+    match tool {
+        "r_repl" | "py_repl" => "repl",
+        "r_repl_reset" | "py_repl_reset" => "repl_reset",
+        _ => tool,
+    }
+}
+
+fn is_repl_tool_name(tool: &str) -> bool {
+    matches!(tool, "repl" | "r_repl" | "py_repl")
+}
+
 fn normalize_newlines(mut text: String) -> String {
     if text.contains("\r\n") {
         text = text.replace("\r\n", "\n");
@@ -188,6 +215,9 @@ fn normalize_text_snapshot(text: &str) -> String {
     let mut stripped = strip_trailing_prompt(&normalized);
     while stripped.ends_with('\n') {
         stripped.pop();
+    }
+    if let Some(rest) = stripped.strip_prefix("\nstderr:") {
+        stripped = format!("stderr:{rest}");
     }
     stripped
 }
@@ -270,6 +300,7 @@ pub struct McpTestSession {
     service: rmcp::service::RunningService<rmcp::service::RoleClient, TestClient>,
     steps: Vec<SnapshotStep>,
     server_pid: Option<u32>,
+    backend: TestBackend,
 }
 
 impl McpTestSession {
@@ -298,11 +329,17 @@ impl McpTestSession {
                 json!((timeout * 1000.0).round() as i64),
             );
         }
-        self.call_tool("repl", Value::Object(args)).await;
+        self.call_tool(self.repl_tool_name(), Value::Object(args))
+            .await;
+    }
+
+    pub fn repl_tool_name(&self) -> &'static str {
+        self.backend.repl_tool_name()
     }
 
     pub async fn call_tool(&mut self, tool: impl Into<String>, arguments: Value) {
         let tool = tool.into();
+        let request_tool = normalize_tool_name_for_request(&tool).to_string();
         let arguments_for_snapshot = match &arguments {
             Value::Null => None,
             other => Some(other.clone()),
@@ -332,7 +369,7 @@ impl McpTestSession {
             .service
             .call_tool(CallToolRequestParams {
                 meta: None,
-                name: tool.clone().into(),
+                name: request_tool.into(),
                 arguments: arguments_for_mcp,
                 task: None,
             })
@@ -358,6 +395,7 @@ impl McpTestSession {
         arguments: Value,
     ) -> Result<rmcp::model::CallToolResult, ServiceError> {
         let tool = tool.into();
+        let request_tool = normalize_tool_name_for_request(&tool).to_string();
         let arguments = match arguments {
             Value::Null => None,
             Value::Object(map) => Some(map.into_iter().collect()),
@@ -371,7 +409,7 @@ impl McpTestSession {
         self.service
             .call_tool(CallToolRequestParams {
                 meta: None,
-                name: tool.into(),
+                name: request_tool.into(),
                 arguments,
                 task: None,
             })
@@ -397,14 +435,7 @@ impl McpTestSession {
                 json!((timeout * 1000.0).round() as i64),
             );
         }
-
-        self.service
-            .call_tool(CallToolRequestParams {
-                meta: None,
-                name: "repl".into(),
-                arguments: Some(args.into_iter().collect()),
-                task: None,
-            })
+        self.call_tool_raw(self.repl_tool_name(), Value::Object(args))
             .await
     }
 
@@ -423,14 +454,7 @@ impl McpTestSession {
                 json!((timeout * 1000.0).round() as i64),
             );
         }
-
-        self.service
-            .call_tool(CallToolRequestParams {
-                meta: None,
-                name: "repl".into(),
-                arguments: Some(args.into_iter().collect()),
-                task: None,
-            })
+        self.call_tool_raw(self.repl_tool_name(), Value::Object(args))
             .await
     }
 
@@ -607,7 +631,7 @@ fn normalize_snapshot_text(text: &str) -> String {
     if text.starts_with("\n[mcp-console] session ended") {
         return text.trim_start_matches('\n').to_string();
     }
-    let text = normalize_pager_elision(text);
+    let text = normalize_busy_timeout_elapsed_ms(&normalize_pager_elision(text));
     if !text.contains("stderr:") {
         return text;
     }
@@ -653,6 +677,28 @@ fn normalize_snapshot_text(text: &str) -> String {
     out
 }
 
+fn normalize_busy_timeout_elapsed_ms(text: &str) -> String {
+    let marker = "elapsed_ms=";
+    let mut out = String::with_capacity(text.len());
+    let mut idx = 0;
+    while let Some(pos) = text[idx..].find(marker) {
+        let abs = idx + pos;
+        out.push_str(&text[idx..abs]);
+        out.push_str(marker);
+        let mut end = abs + marker.len();
+        let bytes = text.as_bytes();
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end > abs + marker.len() {
+            out.push('N');
+        }
+        idx = end;
+    }
+    out.push_str(&text[idx..]);
+    out
+}
+
 fn normalize_pager_elision(text: &str) -> String {
     let marker = "[mcp-console:pager] elided output: @";
     let mut out = String::with_capacity(text.len());
@@ -694,7 +740,7 @@ fn format_snapshot_call(call: &SnapshotCall) -> (String, Vec<String>) {
 
     if let Some(Value::Object(map)) = &call.arguments {
         match call.tool.as_str() {
-            "repl" => {
+            tool if is_repl_tool_name(tool) => {
                 if let Some(Value::String(input)) = map.get("input") {
                     input_lines = split_input_lines(input);
                 }
@@ -756,7 +802,7 @@ fn format_snapshot_response_lines(response: &SnapshotResponse, tool: &str) -> Ve
                 match content {
                     SnapshotContent::Text { text } => {
                         for line in split_text_lines(text) {
-                            if tool == "repl" && is_prompt_line(&line) {
+                            if is_repl_tool_name(tool) && is_prompt_line(&line) {
                                 continue;
                             }
                             lines.push(line);
@@ -919,6 +965,7 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
 ) -> TestResult<McpTestSession> {
     let exe = resolve_server_path()?;
     let env_vars = env_vars.clone();
+    let backend = parse_backend_from_args(&args);
     let mut args = args.clone();
     if !sandbox_exec_available()
         && !args
@@ -947,7 +994,27 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
         service,
         steps: Vec::new(),
         server_pid,
+        backend,
     })
+}
+
+fn parse_backend_from_args(args: &[String]) -> TestBackend {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--backend" {
+            if iter.next().is_some_and(|value| value == "python") {
+                return TestBackend::Python;
+            }
+            continue;
+        }
+        if arg
+            .strip_prefix("--backend=")
+            .is_some_and(|value| value == "python")
+        {
+            return TestBackend::Python;
+        }
+    }
+    TestBackend::R
 }
 
 fn resolve_server_path() -> TestResult<PathBuf> {

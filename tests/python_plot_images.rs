@@ -67,7 +67,7 @@ fn response_snapshot(result: &CallToolResult) -> serde_json::Value {
 
 fn step_snapshot(input: &str, result: &CallToolResult) -> PlotStepSnapshot {
     PlotStepSnapshot {
-        tool: "repl".to_string(),
+        tool: "py_repl".to_string(),
         input: input.to_string(),
         response: response_snapshot(result),
     }

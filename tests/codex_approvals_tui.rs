@@ -44,7 +44,7 @@ mod unix_impl {
         let sandbox_log = sandbox_log_dir.path().join("sandbox-state.log");
         let r_code = sandbox_run_code();
         let tool_args = serde_json::json!({
-            "chars": format!("{r_code}\n"),
+            "input": format!("{r_code}\n"),
         })
         .to_string();
         let mock_server = MockResponsesServer::start(tool_name(), tool_args.clone()).await?;
@@ -352,10 +352,10 @@ trust_level = "trusted"
         }
         let mut lines = collapsed;
 
-        if let Some(first_nonempty) = lines.iter().position(|line| !line.trim().is_empty()) {
-            if first_nonempty > 0 {
-                lines.drain(0..first_nonempty);
-            }
+        if let Some(first_nonempty) = lines.iter().position(|line| !line.trim().is_empty())
+            && first_nonempty > 0
+        {
+            lines.drain(0..first_nonempty);
         }
 
         while matches!(lines.last(), Some(line) if line.trim().is_empty()) {

@@ -3,7 +3,7 @@ source: tests/pager.rs
 expression: snapshot.render_transcript()
 ---
 == session: default ==
-1) repl timeout_ms=30000
+1) r_repl timeout_ms=30000
 >>> cat('# Title\n\n## Alpha\n'); for (i in 1:20) cat(sprintf('alpha line %02d foo\n', i)); cat('\n## Beta\n'); for (i in 1:20) cat(sprintf('beta line %02d foo\n', i))
 <<< # Title
 <<< 
@@ -25,7 +25,7 @@ expression: snapshot.render_transcript()
 <<< alpha line 15 foo
 <<< --More-- (2p, 39.6%, @0..288/727)
 
-2) repl timeout_ms=30000
+2) r_repl timeout_ms=30000
 >>> :matches foo
 <<< [mcp-console:pager] matches: 25 (limit 50); use `matches -n all` or `seek @OFFSET` to jump
 <<< #1 @288 Title > Alpha | alpha line 16 foo
@@ -55,7 +55,7 @@ expression: snapshot.render_transcript()
 <<< #25 @710 Title > Beta | beta line 20 foo
 <<< --More-- (2p, 39.6%, @0..288/727)
 
-3) repl timeout_ms=30000
+3) r_repl timeout_ms=30000
 >>> :matches -C 1 foo
 <<< [mcp-console:pager] matches: 25 (limit 50); use `matches -n all` or `seek @OFFSET` to jump
 <<< #1 @288 Title > Alpha
@@ -158,6 +158,6 @@ expression: snapshot.render_transcript()
 <<<   > beta line 20 foo
 <<< --More-- (2p, 39.6%, @0..288/727)
 
-4) repl timeout_ms=30000
+4) r_repl timeout_ms=30000
 >>> :q
 <<< (END, 39.6%, @0..288/727)

@@ -1,8 +1,11 @@
 mod common;
 
+#[cfg(windows)]
 use common::TestResult;
+#[cfg(windows)]
 use rmcp::model::RawContent;
 
+#[cfg(windows)]
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
         .content
@@ -15,6 +18,7 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         .join("")
 }
 
+#[cfg(windows)]
 fn backend_unavailable(text: &str) -> bool {
     text.contains("Fatal error: cannot create 'R_TempDir'")
         || text.contains("failed to start R session")
@@ -25,6 +29,7 @@ fn backend_unavailable(text: &str) -> bool {
         )
 }
 
+#[cfg(windows)]
 fn assert_no_console_encoding_artifacts(text: &str) {
     assert!(
         !text.contains('\u{2}'),

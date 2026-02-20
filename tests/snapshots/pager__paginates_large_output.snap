@@ -6,7 +6,7 @@ expression: snapshot.render()
 -- step 1 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))\n",
     "timeout_ms": 30000
@@ -30,7 +30,7 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "1+1\n",
     "timeout_ms": 10000
@@ -54,7 +54,7 @@ response:
 -- step 3 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": ":next\n",
     "timeout_ms": 30000
@@ -78,7 +78,7 @@ response:
 -- step 4 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": ":tail\n",
     "timeout_ms": 30000
@@ -110,7 +110,7 @@ response:
 -- step 5 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "1+1\n",
     "timeout_ms": 10000

@@ -3,7 +3,7 @@ source: tests/refactor_coverage.rs
 expression: snapshot.render_transcript()
 ---
 == session: pager_hits_images ==
-1) repl timeout_ms=10000
+1) r_repl timeout_ms=10000
 >>> 
 >>> set.seed(1)
 >>> cat("# Title\n")
@@ -27,17 +27,17 @@ expression: snapshot.render_transcript()
 <<< alpha line 11
 <<< --More-- (14p, 10.3%, @0..299/2882)
 
-2) repl timeout_ms=10000
+2) r_repl timeout_ms=10000
 >>> hits alpha
 <<< [mcp-console:pager] input blocked while pager is active: hits alpha (use :q to exit pager)
 <<< --More-- (14p, 10.3%, @0..299/2882)
 
-3) repl timeout_ms=10000
+3) r_repl timeout_ms=10000
 >>> seek 0
 <<< [mcp-console:pager] input blocked while pager is active: seek 0 (use :q to exit pager)
 <<< --More-- (14p, 10.3%, @0..299/2882)
 
-4) repl timeout_ms=10000
+4) r_repl timeout_ms=10000
 >>> hits beta
 <<< [mcp-console:pager] input blocked while pager is active: hits beta (use :q to exit pager)
 <<< --More-- (14p, 10.3%, @0..299/2882)

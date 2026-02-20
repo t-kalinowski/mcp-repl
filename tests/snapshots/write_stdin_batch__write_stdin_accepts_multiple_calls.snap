@@ -6,7 +6,7 @@ expression: snapshot.render()
 -- step 1 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "x <- 1\n",
     "timeout_ms": 10000
@@ -26,7 +26,7 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "x + 1\n",
     "timeout_ms": 10000

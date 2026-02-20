@@ -3,28 +3,28 @@ source: tests/pager.rs
 expression: snapshot.render_transcript()
 ---
 == session: default ==
-1) repl timeout_ms=30000
+1) r_repl timeout_ms=30000
 >>> line <- paste(rep("x", 200), collapse = ""); for (i in 1:200) cat(sprintf("line%04d %s\n", i, line))
 <<< line0001 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< --More-- (140p, 0.5%, @0..210/42000)
 
-2) repl timeout_ms=10000
+2) r_repl timeout_ms=10000
 >>> 1+1
 <<< [mcp-console:pager] input blocked while pager is active: 1+1 (use :q to exit pager)
 <<< --More-- (140p, 0.5%, @0..210/42000)
 
-3) repl timeout_ms=30000
+3) r_repl timeout_ms=30000
 >>> :next
 <<< line0002 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< --More-- (139p, 1.0%, @210..420/42000)
 
-4) repl timeout_ms=30000
+4) r_repl timeout_ms=30000
 >>> :tail
 <<< [mcp-console:pager] elided output (already shown): @420..41580
 <<< line0199 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< line0200 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< (END, 100.0%, @41580..42000/42000)
 
-5) repl timeout_ms=10000
+5) r_repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2

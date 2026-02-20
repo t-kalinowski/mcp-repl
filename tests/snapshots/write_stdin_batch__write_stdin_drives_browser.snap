@@ -6,7 +6,7 @@ expression: snapshot.render()
 -- step 1 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "f <- function() { browser(); x <- 1; x <- x + 1; x }\n",
     "timeout_ms": 10000
@@ -26,7 +26,7 @@ response:
 -- step 2 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "f()\n",
     "timeout_ms": 10000
@@ -50,7 +50,7 @@ response:
 -- step 3 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "n\n",
     "timeout_ms": 10000
@@ -74,7 +74,7 @@ response:
 -- step 4 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "n\n",
     "timeout_ms": 10000
@@ -98,7 +98,7 @@ response:
 -- step 5 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "c\n",
     "timeout_ms": 10000

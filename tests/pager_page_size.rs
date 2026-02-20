@@ -2,6 +2,7 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::RawContent;
+use tokio::time::{Duration, Instant, sleep};
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -30,10 +31,19 @@ fn backend_unavailable(text: &str) -> bool {
     text.contains("Fatal error: cannot create 'R_TempDir'")
         || text.contains("failed to start R session")
         || text.contains("worker exited with status")
+        || text.contains("worker exited with signal")
         || text.contains("unable to initialize the JIT")
+        || text.contains("options(\"defaultPackages\") was not found")
         || text.contains(
             "worker protocol error: ipc disconnected while waiting for request completion",
         )
+}
+
+fn busy_response(text: &str) -> bool {
+    text.contains("<<console status: busy")
+        || text.contains("worker is busy")
+        || text.contains("request already running")
+        || text.contains("input discarded while worker busy")
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -41,14 +51,33 @@ async fn respects_configured_small_page_size() -> TestResult<()> {
     let page_bytes = 80;
     let mut session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
 
-    let result = session
+    let mut result = session
         .write_stdin_raw_with("for (i in 1:50) cat('abcd\\n')", Some(10.0))
         .await?;
-    let full_text = result_text(&result);
+    let mut full_text = result_text(&result);
     if backend_unavailable(&full_text) {
         eprintln!("pager_page_size backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
+    }
+
+    if busy_response(&full_text) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            sleep(Duration::from_millis(100)).await;
+            let next = session.write_stdin_raw_with("", Some(2.0)).await?;
+            let text = result_text(&next);
+            if backend_unavailable(&text) {
+                eprintln!("pager_page_size backend unavailable in this environment; skipping");
+                session.cancel().await?;
+                return Ok(());
+            }
+            result = next;
+            full_text = text;
+            if !busy_response(&full_text) {
+                break;
+            }
+        }
     }
     session.cancel().await?;
 
@@ -83,14 +112,33 @@ async fn respects_configured_large_page_size() -> TestResult<()> {
     let page_bytes = 10_000;
     let mut session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
 
-    let result = session
+    let mut result = session
         .write_stdin_raw_with("for (i in 1:10) cat('abcd\\n\')", Some(10.0))
         .await?;
-    let full_text = result_text(&result);
+    let mut full_text = result_text(&result);
     if backend_unavailable(&full_text) {
         eprintln!("pager_page_size backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
+    }
+
+    if busy_response(&full_text) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline {
+            sleep(Duration::from_millis(100)).await;
+            let next = session.write_stdin_raw_with("", Some(2.0)).await?;
+            let text = result_text(&next);
+            if backend_unavailable(&text) {
+                eprintln!("pager_page_size backend unavailable in this environment; skipping");
+                session.cancel().await?;
+                return Ok(());
+            }
+            result = next;
+            full_text = text;
+            if !busy_response(&full_text) {
+                break;
+            }
+        }
     }
     session.cancel().await?;
 

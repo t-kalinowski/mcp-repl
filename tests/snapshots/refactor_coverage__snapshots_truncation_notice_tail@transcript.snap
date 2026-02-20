@@ -3,14 +3,14 @@ source: tests/refactor_coverage.rs
 expression: snapshot.render_transcript()
 ---
 == session: truncation_tail ==
-1) repl timeout_ms=20000
+1) r_repl timeout_ms=20000
 >>> 
 >>> cat(paste(rep("x", 2200000), collapse = ""))
 >>> cat("\nEND\n")
 <<< xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 <<< --More-- (6978p, 0.0%, @0..300/2093526)
 
-2) repl timeout_ms=10000
+2) r_repl timeout_ms=10000
 >>> tail 8k
 <<< [mcp-console:pager] input blocked while pager is active: tail 8k (use :q to exit pager)
 <<< --More-- (6978p, 0.0%, @0..300/2093526)

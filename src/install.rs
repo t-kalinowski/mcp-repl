@@ -301,12 +301,23 @@ fn parse_r_writable_roots_probe_output(stdout: &str) -> Vec<PathBuf> {
         if value.is_empty() {
             continue;
         }
-        let path = PathBuf::from(value);
-        if path.is_absolute() {
-            roots.push(path);
+        if is_absolute_probe_path(value) {
+            roots.push(PathBuf::from(value));
         }
     }
     roots
+}
+
+fn is_absolute_probe_path(raw_path: &str) -> bool {
+    let bytes = raw_path.as_bytes();
+    let is_drive_absolute = bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'\\' | b'/');
+    raw_path.starts_with('/')
+        || raw_path.starts_with(r"\\")
+        || is_drive_absolute
+        || Path::new(raw_path).is_absolute()
 }
 
 fn codex_r_writable_roots_comment(additional_writable_roots: &[PathBuf]) -> String {
@@ -525,6 +536,11 @@ mod tests {
                 PathBuf::from("/tmp/config-root"),
             ]
         );
+    }
+
+    #[test]
+    fn is_absolute_probe_path_accepts_posix_paths() {
+        assert!(is_absolute_probe_path("/tmp/cache-root"));
     }
 
     #[test]

@@ -3,15 +3,15 @@ source: tests/plot_images.rs
 expression: transcript
 ---
 == transcript ==
-1) repl
+1) r_repl
 >>> plot(1:10)
 <<< [image/png blake3:ae6672605feb09b2f26604d8439f4ca60aac78b7db4f1f6a210b44194d84af6c]
 
-2) repl
+2) r_repl
 >>> plot(1:10)
 <<< [image/png blake3:ae6672605feb09b2f26604d8439f4ca60aac78b7db4f1f6a210b44194d84af6c]
 
-3) repl
+3) r_repl
 >>> 1+1
 <<< [1] 2
 <<<

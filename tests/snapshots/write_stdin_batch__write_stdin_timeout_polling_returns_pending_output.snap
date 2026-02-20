@@ -6,7 +6,7 @@ expression: snapshot.render()
 -- step 1 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "cat(\"start\\n\"); flush.console(); Sys.sleep(1); cat(\"end\\n\")\n",
     "timeout_ms": 500
@@ -23,14 +23,14 @@ response:
     },
     {
       "type": "text",
-      "text": "<<console status: busy, write_stdin timeout reached; elapsed_ms=500>>"
+      "text": "<<console status: busy, write_stdin timeout reached; elapsed_ms=N>>"
     }
   ]
 }
 -- step 2 --
 call:
 {
-  "tool": "repl",
+  "tool": "r_repl",
   "arguments": {
     "input": "\n",
     "timeout_ms": 2000

@@ -3,7 +3,7 @@ source: tests/mcp_transcripts.rs
 expression: snapshot.render_transcript()
 ---
 == session: tempdir_session ==
-1) repl timeout_ms=10000
+1) r_repl timeout_ms=10000
 >>> 
 >>> cat("TMPDIR_SET=", nzchar(Sys.getenv("TMPDIR")), "\n", sep = "")
 >>> cat("TMPDIR_MATCH=", Sys.getenv("TMPDIR") == Sys.getenv("MCP_CONSOLE_R_SESSION_TMPDIR"), "\n", sep = "")
@@ -37,11 +37,11 @@ expression: snapshot.render_transcript()
 <<< TMPDIR_MATCH=TRUE
 <<< --More-- (3p, 24.8%, @0..279/1125)
 
-2) repl
+2) r_repl
 >>> 
 <<< [mcp-console] new session started
 
-3) repl timeout_ms=10000
+3) r_repl timeout_ms=10000
 >>> 
 >>> root_marker <- file.path(Sys.getenv("TMPDIR"), "mcp-console-snapshot-root.txt")
 >>> cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")
@@ -51,11 +51,11 @@ expression: snapshot.render_transcript()
 <<< ROOT_MARKER_EXISTS=FALSE
 <<< TEMPDIR_LIST=
 
-4) repl
+4) r_repl
 >>> 
 <<< [mcp-console] new session started
 
-5) repl timeout_ms=10000
+5) r_repl timeout_ms=10000
 >>> 
 >>> root_marker <- file.path(Sys.getenv("TMPDIR"), "mcp-console-snapshot-root.txt")
 >>> cat("ROOT_MARKER_EXISTS=", file.exists(root_marker), "\n", sep = "")

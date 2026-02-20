@@ -3,15 +3,15 @@ source: tests/write_stdin_batch.rs
 expression: snapshot.render_transcript()
 ---
 == session: timeout_list ==
-1) repl timeout_ms=2000
+1) r_repl timeout_ms=2000
 >>> Sys.sleep(5)
-<<< <<console status: busy, write_stdin timeout reached; elapsed_ms=1800>>
+<<< <<console status: busy, write_stdin timeout reached; elapsed_ms=N>>
 
-2) repl timeout_ms=1000
+2) r_repl timeout_ms=1000
 >>> 1+1
-<<< <<console status: busy, write_stdin timeout reached; elapsed_ms=2800>>
+<<< <<console status: busy, write_stdin timeout reached; elapsed_ms=N>>
 <<< [mcp-console] input discarded while worker busy
 
-3) repl timeout_ms=10000
+3) r_repl timeout_ms=10000
 >>> 1+1
 <<< [1] 2

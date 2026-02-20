@@ -3,11 +3,11 @@ source: tests/plot_images.rs
 expression: transcript
 ---
 == transcript ==
-1) repl
+1) r_repl
 >>> par(mfrow = c(2, 1)); plot(1:10); plot(10:1)
 <<< [image/png blake3:f767760a51c634506c4f219b749ff8aeb7f26e4fbe2ce6aa7b37f4564a76c23b]
 
-2) repl
+2) r_repl
 >>> 1+1
 <<< [1] 2
 <<<

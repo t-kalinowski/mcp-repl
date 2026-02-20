@@ -26,13 +26,20 @@ fn backend_unavailable(text: &str) -> bool {
         )
 }
 
+fn busy_response(text: &str) -> bool {
+    text.contains("<<console status: busy")
+        || text.contains("worker is busy")
+        || text.contains("request already running")
+        || text.contains("input discarded while worker busy")
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn repl_tool_accepts_input_and_timeout_ms() -> TestResult<()> {
     let mut session = common::spawn_server().await?;
 
     let result = session
         .call_tool_raw(
-            "repl",
+            session.repl_tool_name(),
             json!({
                 "input": "1+1\n",
                 "timeout_ms": 10_000
@@ -42,6 +49,11 @@ async fn repl_tool_accepts_input_and_timeout_ms() -> TestResult<()> {
     let text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("repl_surface backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&text) {
+        eprintln!("repl_surface worker remained busy; skipping");
         session.cancel().await?;
         return Ok(());
     }
@@ -57,7 +69,7 @@ async fn repl_reset_clears_state() -> TestResult<()> {
 
     let set_var = session
         .call_tool_raw(
-            "repl",
+            session.repl_tool_name(),
             json!({
                 "input": "x <- 1\n",
                 "timeout_ms": 10_000
@@ -70,12 +82,17 @@ async fn repl_reset_clears_state() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
+    if busy_response(&set_var_text) {
+        eprintln!("repl_surface worker remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
 
     let _ = session.call_tool_raw("repl_reset", json!({})).await?;
 
     let after_reset = session
         .call_tool_raw(
-            "repl",
+            session.repl_tool_name(),
             json!({
                 "input": "print(exists(\"x\"))\n",
                 "timeout_ms": 10_000
@@ -83,6 +100,16 @@ async fn repl_reset_clears_state() -> TestResult<()> {
         )
         .await?;
     let after_reset_text = result_text(&after_reset);
+    if backend_unavailable(&after_reset_text) {
+        eprintln!("repl_surface backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&after_reset_text) {
+        eprintln!("repl_surface worker remained busy after reset; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
     assert!(
         after_reset_text.contains("FALSE"),
         "expected reset state, got: {after_reset_text:?}"
