@@ -28,10 +28,20 @@ fn backend_unavailable(text: &str) -> bool {
     text.contains("Fatal error: cannot create 'R_TempDir'")
         || text.contains("failed to start R session")
         || text.contains("worker exited with status")
+        || text.contains("worker exited with signal")
         || text.contains("unable to initialize the JIT")
+        || text.contains("options(\"defaultPackages\") was not found")
         || text.contains(
             "worker protocol error: ipc disconnected while waiting for request completion",
         )
+}
+
+async fn spawn_manage_session() -> TestResult<common::McpTestSession> {
+    common::spawn_server_with_args(vec![
+        "--sandbox-state".to_string(),
+        "danger-full-access".to_string(),
+    ])
+    .await
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -39,12 +49,17 @@ async fn interrupt_without_active_request_returns_prompt() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "manage_session_behavior test mutex poisoned")?;
-    let mut session = common::spawn_server().await?;
+    let mut session = spawn_manage_session().await?;
 
     let _ = session.write_stdin_raw_with("1+1", Some(5.0)).await?;
     let result = session.write_stdin_raw_with("\u{3}", Some(5.0)).await?;
 
     let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("interrupt test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
     assert!(
         text.contains(">") || text.contains("<<console status: busy"),
         "expected prompt or timeout status in output, got: {text:?}"
@@ -91,7 +106,7 @@ async fn restart_while_busy_resets_session() -> TestResult<()> {
     let _guard = test_mutex()
         .lock()
         .map_err(|_| "manage_session_behavior test mutex poisoned")?;
-    let mut session = common::spawn_server().await?;
+    let mut session = spawn_manage_session().await?;
 
     let _ = session
         .write_stdin_raw_with("x <- 1; Sys.sleep(5)", Some(0.1))

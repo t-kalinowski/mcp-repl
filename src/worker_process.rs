@@ -3404,35 +3404,30 @@ mod tests {
 
     #[test]
     fn completion_waits_for_request_end_event() {
-        let sync = std::sync::Arc::new(std::sync::Barrier::new(2));
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         driver_on_input_start("1+1", &server);
-
-        let sender_sync = std::sync::Arc::clone(&sync);
-        let sender = std::thread::spawn(move || {
-            let prompt = "> ".to_string();
-            let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
-                prompt: prompt.clone(),
-            });
-            let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
-                prompt: prompt.clone(),
-                line: "1+1\n".to_string(),
-            });
-            let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
-                prompt: prompt.clone(),
-            });
-            sender_sync.wait();
-            std::thread::sleep(Duration::from_millis(150));
-            let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+        let prompt = "> ".to_string();
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: prompt.clone(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: prompt.clone(),
+            line: "1+1\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: prompt.clone(),
         });
 
-        sync.wait();
-        let result = driver_wait_for_completion(Duration::from_millis(75), server);
-        sender.join().expect("sender thread");
+        let result = driver_wait_for_completion(Duration::from_millis(75), server.clone());
         assert!(
             matches!(result, Err(WorkerError::Timeout(_))),
             "expected timeout before request-end"
         );
+
+        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after request-end");
+        assert_eq!(completion.prompt.as_deref(), Some("> "));
     }
 
     #[test]

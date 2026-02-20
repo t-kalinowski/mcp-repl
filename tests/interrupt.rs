@@ -32,6 +32,7 @@ async fn spawn_interrupt_session() -> TestResult<common::McpTestSession> {
     .await
 }
 
+#[cfg(unix)]
 fn backend_unavailable(text: &str) -> bool {
     text.contains("failed to start R session")
         || text.contains("worker exited with status")
