@@ -269,9 +269,7 @@ fn probe_r_writable_roots() -> Vec<PathBuf> {
         .arg(
             r#"cat(
 sep = "",
-"MCP_CONSOLE_INSTALL_R_CACHE_ROOT=", dirname(tools::R_user_dir("mcp_console_probe", which = "cache")), "\n",
-"MCP_CONSOLE_INSTALL_R_DATA_ROOT=", dirname(tools::R_user_dir("mcp_console_probe", which = "data")), "\n",
-"MCP_CONSOLE_INSTALL_R_CONFIG_ROOT=", dirname(tools::R_user_dir("mcp_console_probe", which = "config")), "\n"
+"MCP_CONSOLE_INSTALL_R_CACHE_ROOT=", dirname(tools::R_user_dir("mcp_console_probe", which = "cache")), "\n"
 )"#,
         )
         .output();
@@ -293,12 +291,7 @@ fn parse_r_writable_roots_probe_output(stdout: &str) -> Vec<PathBuf> {
         let Some((key, value)) = line.trim_start().split_once('=') else {
             continue;
         };
-        if !matches!(
-            key,
-            "MCP_CONSOLE_INSTALL_R_CACHE_ROOT"
-                | "MCP_CONSOLE_INSTALL_R_DATA_ROOT"
-                | "MCP_CONSOLE_INSTALL_R_CONFIG_ROOT"
-        ) {
+        if !matches!(key, "MCP_CONSOLE_INSTALL_R_CACHE_ROOT") {
             continue;
         }
         let value = value.trim();
@@ -324,22 +317,6 @@ fn is_absolute_probe_path(raw_path: &str) -> bool {
         || Path::new(raw_path).is_absolute()
 }
 
-fn codex_r_writable_roots_comment(additional_writable_roots: &[PathBuf]) -> String {
-    let mut lines = vec![
-        "".to_string(),
-        "# mcp-repl additional writable roots outside cwd (install-time R probe):".to_string(),
-    ];
-    if additional_writable_roots.is_empty() {
-        lines.push("# - none discovered".to_string());
-    } else {
-        for root in additional_writable_roots {
-            lines.push(format!("# - {}", root.display()));
-        }
-    }
-    lines.push("# Re-run `mcp-repl install-codex` to refresh this list.".to_string());
-    lines.join("\n") + "\n"
-}
-
 fn upsert_codex_mcp_server(
     config_path: &Path,
     server_name: &str,
@@ -361,28 +338,94 @@ fn upsert_codex_mcp_server(
     if !doc["mcp_servers"].is_table() {
         return Err("`mcp_servers` must be a TOML table".into());
     }
+    normalize_codex_server_item(&mut doc, server_name)?;
 
     doc["mcp_servers"][server_name]["command"] = value(command);
     doc["mcp_servers"][server_name]["tool_timeout_sec"] = value(CODEX_TOOL_TIMEOUT_SECS);
-    if let Some(tool_timeout_value) =
-        doc["mcp_servers"][server_name]["tool_timeout_sec"].as_value_mut()
-    {
-        tool_timeout_value
-            .decor_mut()
-            .set_prefix(CODEX_TOOL_TIMEOUT_COMMENT);
-    }
 
     let mut toml_args = Array::default();
     for arg in args {
         toml_args.push(arg.as_str());
     }
+    format_toml_array_multiline(&mut toml_args);
     doc["mcp_servers"][server_name]["args"] = Item::Value(toml_args.into());
-    let comment = codex_r_writable_roots_comment(additional_writable_roots);
-    if let Some(args_value) = doc["mcp_servers"][server_name]["args"].as_value_mut() {
-        args_value.decor_mut().set_prefix(comment.as_str());
+    if let Some(server_table) = doc["mcp_servers"][server_name].as_table_mut() {
+        if let Some(mut timeout_key) = server_table.key_mut("tool_timeout_sec") {
+            timeout_key
+                .leaf_decor_mut()
+                .set_prefix(CODEX_TOOL_TIMEOUT_COMMENT);
+        }
+        if let Some(mut args_key) = server_table.key_mut("args") {
+            args_key
+                .leaf_decor_mut()
+                .set_prefix(codex_r_writable_roots_comment(additional_writable_roots));
+        }
     }
 
     atomic_write(config_path, &doc.to_string())?;
+    Ok(())
+}
+
+fn codex_r_writable_roots_comment(additional_writable_roots: &[PathBuf]) -> String {
+    let mut lines = vec![
+        "".to_string(),
+        "# mcp-repl additional writable roots outside cwd (install-time R probe):".to_string(),
+    ];
+    if additional_writable_roots.is_empty() {
+        lines.push("# - none discovered".to_string());
+    } else {
+        for root in additional_writable_roots {
+            lines.push(format!("# - {}", root.display()));
+        }
+    }
+    lines.push("# Re-run `mcp-repl install-codex` to refresh this list.".to_string());
+    lines.join("\n") + "\n"
+}
+
+fn format_toml_array_multiline(array: &mut Array) {
+    for (idx, value) in array.iter_mut().enumerate() {
+        let decor = value.decor_mut();
+        if idx % 2 == 0 {
+            decor.set_prefix("\n    ");
+        } else {
+            decor.set_prefix(" ");
+        }
+        decor.set_suffix("");
+    }
+    array.set_trailing_comma(true);
+    array.set_trailing("\n");
+}
+
+fn normalize_codex_server_item(
+    doc: &mut DocumentMut,
+    server_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let server_item = &mut doc["mcp_servers"][server_name];
+    if server_item.is_none() {
+        *server_item = Item::Table(Table::new());
+        return Ok(());
+    }
+    if server_item.is_table() {
+        return Ok(());
+    }
+
+    let Some(inline) = server_item.as_inline_table() else {
+        return Err(
+            format!("`mcp_servers.{server_name}` must be a TOML table or inline table").into(),
+        );
+    };
+
+    let mut table = Table::new();
+    for (key, value) in inline.iter() {
+        table.insert(key, Item::Value(value.clone()));
+    }
+    *server_item = Item::Table(table);
+    if let Some(mcp_servers) = doc["mcp_servers"].as_table_mut()
+        && let Some(mut server_key) = mcp_servers.key_mut(server_name)
+    {
+        server_key.leaf_decor_mut().clear();
+        server_key.dotted_decor_mut().clear();
+    }
     Ok(())
 }
 
@@ -465,7 +508,7 @@ mod tests {
             "console",
             "/usr/local/bin/mcp-console",
             &["--backend".to_string(), "python".to_string()],
-            &[],
+            &[PathBuf::from("/tmp/cache-root")],
         )
         .expect("upsert codex");
         let text = fs::read_to_string(config).expect("read config");
@@ -485,12 +528,142 @@ mod tests {
         assert_eq!(args.get(0).and_then(|v| v.as_str()), Some("--backend"));
         assert_eq!(args.get(1).and_then(|v| v.as_str()), Some("python"));
         assert!(
-            text.contains("additional writable roots outside cwd"),
-            "expected install annotation comment in config"
+            text.contains("args = [\n"),
+            "expected args array to be multiline for readability"
+        );
+        assert!(
+            text.contains("\"--backend\", \"python\""),
+            "expected paired install args to share one line"
         );
         assert!(
             text.contains("mcp-repl handles the primary timeout"),
-            "expected tool timeout rationale comment in config"
+            "expected generated timeout rationale comment in config"
+        );
+        assert!(
+            text.contains("additional writable roots outside cwd"),
+            "expected generated writable-roots annotation comment in config"
+        );
+        assert!(
+            text.contains("# - /tmp/cache-root"),
+            "expected writable-roots comment to include discovered cache root"
+        );
+    }
+
+    #[test]
+    fn upsert_codex_mcp_server_handles_existing_inline_table_server_entry() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        fs::write(
+            &config,
+            r#"[mcp_servers]
+repl = { command = "/usr/local/bin/old-mcp-repl", args = ["--backend", "r"] }
+"#,
+        )
+        .expect("seed config");
+
+        upsert_codex_mcp_server(
+            &config,
+            "repl",
+            "/usr/local/bin/mcp-repl",
+            &[
+                "--sandbox-mode".to_string(),
+                "workspace-write".to_string(),
+                "--sandbox-network-access".to_string(),
+                "restricted".to_string(),
+            ],
+            &[],
+        )
+        .expect("upsert codex");
+
+        let text = fs::read_to_string(&config).expect("read config");
+        let doc = text.parse::<DocumentMut>().expect("parse generated config");
+        assert!(
+            !text.contains("repl = {"),
+            "server entry should not remain an inline table after normalization"
+        );
+        assert_eq!(
+            doc["mcp_servers"]["repl"]["command"].as_str(),
+            Some("/usr/local/bin/mcp-repl")
+        );
+        assert_eq!(
+            doc["mcp_servers"]["repl"]["tool_timeout_sec"].as_integer(),
+            Some(CODEX_TOOL_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn upsert_codex_mcp_server_preserves_other_config_in_messy_existing_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        fs::write(
+            &config,
+            r#"# Existing config with uneven spacing and comments
+
+[mcp_servers]
+  # keep this note
+repl={command="/usr/local/bin/old-mcp-repl",args=["--backend","r"]}
+r_repl = { command = "/usr/local/bin/legacy-repl" }
+
+[workspace]
+name="demo"
+"#,
+        )
+        .expect("seed config");
+
+        upsert_codex_mcp_server(
+            &config,
+            "repl",
+            "/usr/local/bin/mcp-repl",
+            &["--backend".to_string(), "r".to_string()],
+            &[],
+        )
+        .expect("upsert codex");
+
+        let text = fs::read_to_string(&config).expect("read config");
+        let doc = text.parse::<DocumentMut>().expect("parse generated config");
+        assert!(
+            text.contains("# Existing config with uneven spacing and comments"),
+            "top-level comments should remain in place"
+        );
+        assert_eq!(
+            doc["workspace"]["name"].as_str(),
+            Some("demo"),
+            "non-mcp sections should be preserved"
+        );
+        assert_eq!(
+            doc["mcp_servers"]["r_repl"]["command"].as_str(),
+            Some("/usr/local/bin/legacy-repl"),
+            "other MCP servers should be preserved"
+        );
+    }
+
+    #[test]
+    fn upsert_codex_mcp_server_handles_existing_empty_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        fs::write(&config, "").expect("seed empty config");
+
+        upsert_codex_mcp_server(
+            &config,
+            "repl",
+            "/usr/local/bin/mcp-repl",
+            &["--backend".to_string(), "r".to_string()],
+            &[],
+        )
+        .expect("upsert codex");
+
+        let text = fs::read_to_string(&config).expect("read config");
+        let doc = text.parse::<DocumentMut>().expect("parse generated config");
+        assert_eq!(
+            doc["mcp_servers"]["repl"]["command"].as_str(),
+            Some("/usr/local/bin/mcp-repl")
+        );
+        assert_eq!(
+            doc["mcp_servers"]["repl"]["args"]
+                .as_array()
+                .expect("args")
+                .len(),
+            2
         );
     }
 
@@ -548,14 +721,7 @@ mod tests {
         let parsed = parse_r_writable_roots_probe_output(
             "noise\nMCP_CONSOLE_INSTALL_R_CACHE_ROOT=relative/path\nMCP_CONSOLE_INSTALL_R_CACHE_ROOT=/tmp/cache-root\nMCP_CONSOLE_INSTALL_R_DATA_ROOT=/tmp/data-root\nMCP_CONSOLE_INSTALL_R_CONFIG_ROOT=/tmp/config-root\n",
         );
-        assert_eq!(
-            parsed,
-            vec![
-                PathBuf::from("/tmp/cache-root"),
-                PathBuf::from("/tmp/data-root"),
-                PathBuf::from("/tmp/config-root"),
-            ]
-        );
+        assert_eq!(parsed, vec![PathBuf::from("/tmp/cache-root")]);
     }
 
     #[test]
