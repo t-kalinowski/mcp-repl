@@ -44,7 +44,7 @@ mod unix_impl {
         let sandbox_log = sandbox_log_dir.path().join("sandbox-state.log");
         let r_code = sandbox_run_code();
         let tool_args = serde_json::json!({
-            "chars": format!("{r_code}\n"),
+            "input": format!("{r_code}\n"),
         })
         .to_string();
         let mock_server = MockResponsesServer::start(tool_name(), tool_args.clone()).await?;

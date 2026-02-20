@@ -84,7 +84,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "\nstderr: Error: object 'x' not found"
+      "text": "stderr: Error: object 'x' not found"
     },
     {
       "type": "text",

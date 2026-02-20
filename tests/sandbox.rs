@@ -78,7 +78,11 @@ fn collect_text(result: &CallToolResult) -> String {
     text.lines()
         .filter(|line| {
             let trimmed = line.trim_start();
-            !(trimmed.starts_with("> ") || trimmed.starts_with("+ ") || trimmed == ">")
+            !(trimmed.starts_with("> ")
+                || trimmed.starts_with("+ ")
+                || trimmed == ">"
+                || trimmed.starts_with("[mcp-console] input:")
+                || trimmed.starts_with("[mcp-console] echoed input"))
         })
         .collect::<Vec<_>>()
         .join("\n")

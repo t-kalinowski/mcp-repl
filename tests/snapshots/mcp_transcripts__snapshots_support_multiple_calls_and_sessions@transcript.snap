@@ -17,5 +17,4 @@ expression: snapshot.render_transcript()
 == session: session_2 ==
 1) repl timeout_ms=10000
 >>> x
-<<< 
 <<< stderr: Error: object 'x' not found

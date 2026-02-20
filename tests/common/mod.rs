@@ -189,6 +189,9 @@ fn normalize_text_snapshot(text: &str) -> String {
     while stripped.ends_with('\n') {
         stripped.pop();
     }
+    if let Some(rest) = stripped.strip_prefix("\nstderr:") {
+        stripped = format!("stderr:{rest}");
+    }
     stripped
 }
 
