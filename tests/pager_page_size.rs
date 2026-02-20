@@ -52,7 +52,7 @@ async fn respects_configured_small_page_size() -> TestResult<()> {
     let mut session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
 
     let mut result = session
-        .write_stdin_raw_with("for (i in 1:50) cat('abcd\\n')", Some(10.0))
+        .write_stdin_raw_with("for (i in 1:50) cat('abcd\\n')", Some(30.0))
         .await?;
     let mut full_text = result_text(&result);
     if backend_unavailable(&full_text) {
@@ -62,7 +62,7 @@ async fn respects_configured_small_page_size() -> TestResult<()> {
     }
 
     if busy_response(&full_text) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
             sleep(Duration::from_millis(100)).await;
             let next = session.write_stdin_raw_with("", Some(2.0)).await?;
@@ -78,12 +78,11 @@ async fn respects_configured_small_page_size() -> TestResult<()> {
                 break;
             }
         }
-        if busy_response(&full_text) {
-            eprintln!("pager_page_size worker remained busy; skipping");
-            session.cancel().await?;
-            return Ok(());
-        }
     }
+    assert!(
+        !busy_response(&full_text),
+        "pager_page_size worker remained busy after waiting for completion: {full_text:?}"
+    );
     session.cancel().await?;
 
     let chunks = text_chunks(&result);
@@ -118,7 +117,7 @@ async fn respects_configured_large_page_size() -> TestResult<()> {
     let mut session = common::spawn_server_with_pager_page_chars(page_bytes).await?;
 
     let mut result = session
-        .write_stdin_raw_with("for (i in 1:10) cat('abcd\\n\')", Some(10.0))
+        .write_stdin_raw_with("for (i in 1:10) cat('abcd\\n\')", Some(30.0))
         .await?;
     let mut full_text = result_text(&result);
     if backend_unavailable(&full_text) {
@@ -128,7 +127,7 @@ async fn respects_configured_large_page_size() -> TestResult<()> {
     }
 
     if busy_response(&full_text) {
-        let deadline = Instant::now() + Duration::from_secs(20);
+        let deadline = Instant::now() + Duration::from_secs(60);
         while Instant::now() < deadline {
             sleep(Duration::from_millis(100)).await;
             let next = session.write_stdin_raw_with("", Some(2.0)).await?;
@@ -144,12 +143,11 @@ async fn respects_configured_large_page_size() -> TestResult<()> {
                 break;
             }
         }
-        if busy_response(&full_text) {
-            eprintln!("pager_page_size worker remained busy; skipping");
-            session.cancel().await?;
-            return Ok(());
-        }
     }
+    assert!(
+        !busy_response(&full_text),
+        "pager_page_size worker remained busy after waiting for completion: {full_text:?}"
+    );
     session.cancel().await?;
 
     let chunks = text_chunks(&result);
