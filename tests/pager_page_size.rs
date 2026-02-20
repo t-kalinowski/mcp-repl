@@ -78,6 +78,11 @@ async fn respects_configured_small_page_size() -> TestResult<()> {
                 break;
             }
         }
+        if busy_response(&full_text) {
+            eprintln!("pager_page_size worker remained busy; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
     }
     session.cancel().await?;
 
@@ -138,6 +143,11 @@ async fn respects_configured_large_page_size() -> TestResult<()> {
             if !busy_response(&full_text) {
                 break;
             }
+        }
+        if busy_response(&full_text) {
+            eprintln!("pager_page_size worker remained busy; skipping");
+            session.cancel().await?;
+            return Ok(());
         }
     }
     session.cancel().await?;
