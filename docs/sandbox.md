@@ -30,9 +30,11 @@ For `workspace-write`, writable roots include:
 
 - configured `writable_roots` (absolute paths only),
 - current working directory,
-- R `cache`/`data`/`config` roots configured in client policy (for Codex configs installed via `mcp-repl install-codex`, this is auto-populated at install time via a one-time `R` probe),
+- R cache roots configured in client policy (for Codex configs installed via `mcp-repl install-codex`, this cache root is auto-populated at install time via a one-time `R` probe),
 - temp roots (`/tmp`, `TMPDIR` when absolute), and
 - the per-session temp directory.
+
+If you also need R data/config roots, add them explicitly with repeatable `--writable-root` entries.
 
 Within writable roots, these subpaths are forced read-only when present:
 
@@ -62,6 +64,10 @@ Optional `bwrap` stage:
 - `MCP_CONSOLE_LINUX_BWRAP_NO_PROC=1` skips `/proc` mounting.
 - if `bwrap` is requested but unavailable, worker startup fails fast.
 
-## Windows status
+## Windows behavior (experimental)
 
-Current worker/sideband flow is Unix-focused; Windows is not currently supported.
+- R backend is supported with the same policy surface (`read-only`, `workspace-write`, `danger-full-access`).
+- Python backend is currently unavailable on Windows (it requires a Unix PTY).
+- `read-only` and `workspace-write` are enforced by the Windows sandbox runner.
+- `danger-full-access` and `external-sandbox` run without built-in sandbox enforcement.
+- Some Windows environments may not support the restricted-token setup required by sandboxed modes.

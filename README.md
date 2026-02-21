@@ -152,7 +152,7 @@ Notes:
 ## Platform support
 
 - **macOS / Linux**: supported.
-- **Windows**: experimental. Support is in progress.
+- **Windows**: experimental for the R backend. The Python backend currently requires a Unix PTY and is not available on Windows.
 
 ## Sandbox
 
