@@ -351,6 +351,12 @@ pub struct SandboxState {
 }
 
 pub fn log_sandbox_policy_update(policy: &SandboxPolicy) {
+    crate::event_log::log(
+        "sandbox_policy_update_received",
+        serde_json::json!({
+            "policy": policy,
+        }),
+    );
     let Some(path) = std::env::var_os(SANDBOX_STATE_LOG_ENV) else {
         return;
     };
@@ -365,6 +371,13 @@ pub fn log_sandbox_policy_update(policy: &SandboxPolicy) {
 }
 
 pub fn log_sandbox_state_event(method: &str, params: Option<&serde_json::Value>) {
+    crate::event_log::log(
+        "sandbox_state_event_received",
+        serde_json::json!({
+            "method": method,
+            "params": params,
+        }),
+    );
     let Some(path) = std::env::var_os(SANDBOX_STATE_LOG_ENV) else {
         return;
     };

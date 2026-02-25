@@ -1,0 +1,251 @@
+use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use serde_json::{Value as JsonValue, json};
+
+pub const DEBUG_EVENTS_DIR_ENV: &str = "MCP_REPL_DEBUG_EVENTS_DIR";
+
+static LOGGER: OnceLock<Option<Arc<EventLogger>>> = OnceLock::new();
+
+#[derive(Debug, Clone)]
+pub struct StartupContext {
+    pub mode: String,
+    pub backend: String,
+    pub debug_repl: bool,
+    pub sandbox_state: Option<String>,
+}
+
+#[derive(Debug)]
+struct EventLogger {
+    file: Mutex<File>,
+    file_path: PathBuf,
+    startup_epoch: Instant,
+    session_instance_id: String,
+    pid: u32,
+    seq: AtomicU64,
+}
+
+impl EventLogger {
+    fn new(dir: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+        fs::create_dir_all(dir)?;
+        let unix_ms = unix_ms_now();
+        let pid = std::process::id();
+        let session_instance_id = format!("{unix_ms}-{pid}");
+        let (file, file_path) = create_unique_log_file(dir, unix_ms, pid)?;
+        Ok(Self {
+            file: Mutex::new(file),
+            file_path,
+            startup_epoch: Instant::now(),
+            session_instance_id,
+            pid,
+            seq: AtomicU64::new(0),
+        })
+    }
+
+    fn write_event(&self, event: &str, payload: JsonValue) -> Result<(), std::io::Error> {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
+        let line = json!({
+            "ts_unix_ms": unix_ms_now(),
+            "uptime_ms": self.startup_epoch.elapsed().as_millis(),
+            "seq": seq,
+            "session_instance_id": self.session_instance_id,
+            "pid": self.pid,
+            "event": event,
+            "payload": payload,
+        });
+        let mut file = self.file.lock().expect("event logger mutex poisoned");
+        writeln!(file, "{line}")?;
+        file.flush()?;
+        Ok(())
+    }
+}
+
+pub fn initialize(
+    debug_events_dir: Option<PathBuf>,
+    context: StartupContext,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if LOGGER.get().is_some() {
+        return Ok(());
+    }
+
+    let maybe_dir = resolve_debug_dir(debug_events_dir);
+    let maybe_logger = if let Some(dir) = maybe_dir {
+        let logger = Arc::new(EventLogger::new(&dir)?);
+        logger.write_event("startup", startup_payload(&context, &logger.file_path))?;
+        Some(logger)
+    } else {
+        None
+    };
+    let _ = LOGGER.set(maybe_logger);
+    Ok(())
+}
+
+pub fn log(event: &str, payload: JsonValue) {
+    let Some(logger) = current_logger() else {
+        return;
+    };
+    let _ = logger.write_event(event, payload);
+}
+
+fn current_logger() -> Option<Arc<EventLogger>> {
+    LOGGER.get().and_then(|entry| entry.clone())
+}
+
+fn resolve_debug_dir(debug_events_dir: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(path) = debug_events_dir
+        && !path.as_os_str().is_empty()
+    {
+        return Some(path);
+    }
+    std::env::var_os(DEBUG_EVENTS_DIR_ENV)
+        .filter(|raw| !raw.is_empty())
+        .map(PathBuf::from)
+}
+
+fn startup_payload(context: &StartupContext, file_path: &Path) -> JsonValue {
+    let cwd = std::env::current_dir()
+        .ok()
+        .map(|path| path.to_string_lossy().to_string());
+    let argv: Vec<String> = std::env::args().collect();
+    let codex_session_id = codex_session_id();
+    let codex_env = visible_codex_env();
+    json!({
+        "mode": context.mode,
+        "backend": context.backend,
+        "debug_repl": context.debug_repl,
+        "sandbox_state": context.sandbox_state,
+        "cwd": cwd,
+        "argv": argv,
+        "log_file": file_path.to_string_lossy().to_string(),
+        "codex_session_id": codex_session_id,
+        "codex_env": codex_env,
+    })
+}
+
+fn codex_session_id() -> Option<String> {
+    for key in [
+        "CODEX_SESSION_ID",
+        "CODEX_THREAD_ID",
+        "CODEX_CONVERSATION_ID",
+    ] {
+        if let Ok(value) = std::env::var(key)
+            && !value.trim().is_empty()
+        {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn visible_codex_env() -> BTreeMap<String, String> {
+    visible_codex_env_from_iter(std::env::vars())
+}
+
+fn visible_codex_env_from_iter<I>(iter: I) -> BTreeMap<String, String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
+    let mut out = BTreeMap::new();
+    for (key, value) in iter {
+        if !key.starts_with("CODEX_") {
+            continue;
+        }
+        if is_sensitive_env_key(&key) {
+            continue;
+        }
+        out.insert(key, value);
+    }
+    out
+}
+
+fn is_sensitive_env_key(key: &str) -> bool {
+    let upper = key.to_ascii_uppercase();
+    ["KEY", "TOKEN", "SECRET", "PASSWORD"]
+        .iter()
+        .any(|needle| upper.contains(needle))
+}
+
+fn create_unique_log_file(
+    dir: &Path,
+    unix_ms: u128,
+    pid: u32,
+) -> Result<(File, PathBuf), Box<dyn std::error::Error>> {
+    for suffix in 0u32..1_000u32 {
+        let name = if suffix == 0 {
+            format!("mcp-repl-{unix_ms}-{pid}.jsonl")
+        } else {
+            format!("mcp-repl-{unix_ms}-{pid}-{suffix}.jsonl")
+        };
+        let path = dir.join(name);
+        match OpenOptions::new().create_new(true).append(true).open(&path) {
+            Ok(file) => return Ok((file, path)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(Box::new(err)),
+        }
+    }
+    Err("failed to allocate unique event log filename after 1000 attempts".into())
+}
+
+fn unix_ms_now() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn visible_codex_env_filters_sensitive_keys() {
+        let env = vec![
+            ("CODEX_SESSION_ID".to_string(), "sess-123".to_string()),
+            ("CODEX_SANDBOX".to_string(), "seatbelt".to_string()),
+            ("CODEX_API_KEY".to_string(), "redacted".to_string()),
+            ("OTHER_VAR".to_string(), "ignored".to_string()),
+        ];
+        let filtered = visible_codex_env_from_iter(env);
+        assert_eq!(
+            filtered.get("CODEX_SESSION_ID"),
+            Some(&"sess-123".to_string())
+        );
+        assert_eq!(filtered.get("CODEX_SANDBOX"), Some(&"seatbelt".to_string()));
+        assert!(!filtered.contains_key("CODEX_API_KEY"));
+        assert!(!filtered.contains_key("OTHER_VAR"));
+    }
+
+    #[test]
+    fn logger_writes_jsonl_event() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let logger = EventLogger::new(temp.path()).expect("create logger");
+        logger
+            .write_event("test-event", json!({"ok": true}))
+            .expect("write event");
+        let text = std::fs::read_to_string(&logger.file_path).expect("read event log");
+        assert!(text.contains("\"event\":\"test-event\""));
+        assert!(text.contains("\"ok\":true"));
+        assert!(text.contains("\"session_instance_id\""));
+    }
+
+    #[test]
+    fn create_unique_log_file_uses_incrementing_suffix_on_collision() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let unix_ms = 123_u128;
+        let pid = 456_u32;
+        let first_path = temp.path().join(format!("mcp-repl-{unix_ms}-{pid}.jsonl"));
+        std::fs::write(&first_path, "{}\n").expect("seed first path");
+
+        let (_file, second_path) =
+            create_unique_log_file(temp.path(), unix_ms, pid).expect("allocate second path");
+        assert_eq!(
+            second_path.file_name().and_then(|name| name.to_str()),
+            Some("mcp-repl-123-456-1.jsonl")
+        );
+    }
+}

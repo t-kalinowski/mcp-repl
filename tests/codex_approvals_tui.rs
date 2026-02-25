@@ -17,9 +17,10 @@ mod unix_impl {
     use tokio::net::{TcpListener, TcpStream};
     use vt100::Parser;
 
-    const TEST_MARKER: &str = "SANDBOX_TEST_1";
+    const WORKSPACE_WRITE_MARKER: &str = "SANDBOX_TEST_1";
+    const FULL_ACCESS_MARKER: &str = "SANDBOX_TEST_2";
     const WARMUP_MARKER: &str = "WARMUP_TEST";
-    const CALL_ID: &str = "call-1";
+    const FULL_ACCESS_TEST_ENV: &str = "MCP_REPL_ENABLE_FULL_ACCESS_TUI_TEST";
 
     pub(super) async fn run_codex_tui_initial_sandbox_state() -> TestResult<Vec<Step>> {
         if !codex_available() {
@@ -42,12 +43,9 @@ mod unix_impl {
         std::fs::create_dir_all(&codex_home)?;
         let sandbox_log_dir = tempfile::tempdir_in(&repo_root)?;
         let sandbox_log = sandbox_log_dir.path().join("sandbox-state.log");
-        let r_code = sandbox_run_code();
-        let tool_args = serde_json::json!({
-            "input": format!("{r_code}\n"),
-        })
-        .to_string();
-        let mock_server = MockResponsesServer::start(tool_name(), tool_args.clone()).await?;
+        let tool_args = tool_args_for_code(&sandbox_run_code());
+        let mock_server =
+            MockResponsesServer::start(tool_name(), tool_args.clone(), Some(tool_args)).await?;
         let config = codex_config(&mcp_console, &repo_root);
         std::fs::write(codex_home.join("config.toml"), config)?;
         let mut driver = CodexPtyDriver::spawn(
@@ -63,7 +61,9 @@ mod unix_impl {
         steps.push(Step::new("warmup", driver.snapshot_screen()));
         wait_for_log_contains(&sandbox_log, "workspace-write", Duration::from_secs(10))?;
 
-        driver.send_line(&format!("{TEST_MARKER}: run the sandbox write test"))?;
+        driver.send_line(&format!(
+            "{WORKSPACE_WRITE_MARKER}: run the sandbox write test"
+        ))?;
         if let Err(err) = driver.wait_for_contains("WRITE_OK", Duration::from_secs(20)) {
             let request_count = mock_server.request_count().await;
             let last_request = mock_server.last_request().await;
@@ -88,6 +88,98 @@ mod unix_impl {
         );
 
         Ok(steps)
+    }
+
+    pub(super) async fn run_codex_tui_full_access_sandbox_update() -> TestResult<()> {
+        if !full_access_test_enabled() {
+            eprintln!(
+                "{FULL_ACCESS_TEST_ENV} is not set; skipping full-access Codex TUI integration test"
+            );
+            return Ok(());
+        }
+        if !codex_available() {
+            eprintln!("codex not found on PATH; skipping");
+            return Ok(());
+        }
+        if !common::sandbox_exec_available() {
+            eprintln!("sandbox-exec unavailable; skipping");
+            return Ok(());
+        }
+        if !loopback_bind_available().await {
+            eprintln!("loopback TCP bind unavailable; skipping");
+            return Ok(());
+        }
+
+        let repo_root = std::env::current_dir()?;
+        let mcp_console = resolve_mcp_console_path()?;
+        let temp_dir = tempfile::tempdir()?;
+        let codex_home = temp_dir.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home)?;
+        let sandbox_log_dir = tempfile::tempdir_in(&repo_root)?;
+        let sandbox_log = sandbox_log_dir.path().join("sandbox-state.log");
+
+        let workspace_args = tool_args_for_code(&sandbox_run_code());
+        let full_access_probe_args = tool_args_for_code(&outside_workspace_probe_code()?);
+        let mock_server =
+            MockResponsesServer::start(tool_name(), workspace_args, Some(full_access_probe_args))
+                .await?;
+
+        let config = codex_config(&mcp_console, &repo_root);
+        std::fs::write(codex_home.join("config.toml"), config)?;
+
+        let mut driver = CodexPtyDriver::spawn(
+            &codex_home,
+            &repo_root,
+            &mock_server.base_url(),
+            &sandbox_log,
+        )?;
+        driver.drain(Duration::from_millis(800));
+        driver.ensure_running("after startup")?;
+        driver.wait_for_warmup(Duration::from_secs(10))?;
+        wait_for_log_contains(&sandbox_log, "workspace-write", Duration::from_secs(10))?;
+
+        driver.send_line(&format!(
+            "{FULL_ACCESS_MARKER}: probe write before full access"
+        ))?;
+        driver.wait_for_contains("WRITE_ERROR:", Duration::from_secs(20))?;
+        driver.wait_for_contains("Tool call 1 completed", Duration::from_secs(20))?;
+
+        driver.send_line("/approvals")?;
+        driver.wait_for_contains("Update Model Permissions", Duration::from_secs(15))?;
+        driver.send("3")?;
+        driver.wait_for_contains(
+            "Permissions updated to Full Access",
+            Duration::from_secs(15),
+        )?;
+
+        wait_for_log_contains(&sandbox_log, "danger-full-access", Duration::from_secs(20))?;
+        wait_for_log_contains(
+            &sandbox_log,
+            "codex/sandbox-state/update",
+            Duration::from_secs(20),
+        )?;
+
+        driver.send_line(&format!(
+            "{FULL_ACCESS_MARKER}: probe write after full access"
+        ))?;
+        driver.wait_for_contains("WRITE_OK", Duration::from_secs(20))?;
+        driver.wait_for_contains("Tool call 2 completed", Duration::from_secs(20))?;
+        driver.kill()?;
+
+        let outputs = mock_server.function_call_outputs().await;
+        assert!(
+            outputs.iter().any(|out| out.contains("WRITE_ERROR:")),
+            "expected pre-full-access tool call to fail outside workspace: {outputs:?}"
+        );
+        assert!(
+            outputs.iter().any(|out| out.contains("WRITE_OK")),
+            "expected post-full-access tool call to succeed outside workspace: {outputs:?}"
+        );
+        Ok(())
+    }
+
+    fn full_access_test_enabled() -> bool {
+        std::env::var_os(FULL_ACCESS_TEST_ENV).is_some()
     }
 
     async fn loopback_bind_available() -> bool {
@@ -165,6 +257,31 @@ trust_level = "trusted"
     fn sandbox_run_code() -> String {
         "target <- tempfile(\"mcp-console-codex\")\ntryCatch({\n  writeLines(\"ok\", target)\n  cat(\"WRITE_OK\\n\")\n  unlink(target)\n}, error = function(e) {\n  message(\"WRITE_ERROR:\", conditionMessage(e))\n})"
             .to_string()
+    }
+
+    fn outside_workspace_probe_code() -> TestResult<String> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let target = std::env::temp_dir().join(format!("mcp-console-codex-probe-{nanos}.txt"));
+        let target_literal = serde_json::to_string(&target.to_string_lossy().to_string())
+            .map_err(|err| format!("failed to encode target path: {err}"))?;
+        Ok(r#"target <- __TARGET__
+tryCatch({
+  writeLines("ok", target)
+  cat("WRITE_OK\n")
+  unlink(target)
+}, error = function(e) {
+  message("WRITE_ERROR:", conditionMessage(e))
+})"#
+        .replace("__TARGET__", &target_literal))
+    }
+
+    fn tool_args_for_code(r_code: &str) -> String {
+        serde_json::json!({
+            "input": format!("{r_code}\n"),
+        })
+        .to_string()
     }
 
     pub(super) struct Step {
@@ -316,7 +433,8 @@ trust_level = "trusted"
             }
             if is_prompt_line(trimmed)
                 && !trimmed.contains(WARMUP_MARKER)
-                && !trimmed.contains(TEST_MARKER)
+                && !trimmed.contains(WORKSPACE_WRITE_MARKER)
+                && !trimmed.contains(FULL_ACCESS_MARKER)
             {
                 continue;
             }
@@ -728,29 +846,32 @@ trust_level = "trusted"
 
     struct MockState {
         tool_name: String,
-        tool_args: String,
+        workspace_write_tool_args: String,
+        full_access_tool_args: Option<String>,
         requests: Vec<Value>,
         request_paths: Vec<String>,
-        phase: MockPhase,
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum MockPhase {
-        Init,
-        WaitingCall,
-        CallDone,
+        next_call_ordinal: usize,
+        pending_call_id: Option<String>,
+        pending_call_ordinal: Option<usize>,
     }
 
     impl MockResponsesServer {
-        async fn start(tool_name: String, tool_args: String) -> TestResult<Self> {
+        async fn start(
+            tool_name: String,
+            workspace_write_tool_args: String,
+            full_access_tool_args: Option<String>,
+        ) -> TestResult<Self> {
             let listener = TcpListener::bind("127.0.0.1:0").await?;
             let addr = listener.local_addr()?;
             let state = Arc::new(tokio::sync::Mutex::new(MockState {
                 tool_name,
-                tool_args,
+                workspace_write_tool_args,
+                full_access_tool_args,
                 requests: Vec::new(),
                 request_paths: Vec::new(),
-                phase: MockPhase::Init,
+                next_call_ordinal: 1,
+                pending_call_id: None,
+                pending_call_ordinal: None,
             }));
             let state_clone = Arc::clone(&state);
             tokio::spawn(async move {
@@ -901,32 +1022,39 @@ trust_level = "trusted"
         if has_user_marker(body, WARMUP_MARKER) {
             return response_body_with_items(vec![message_item("Warmup complete")], "resp-warmup");
         }
-        match state.phase {
-            MockPhase::Init => {
-                if has_user_marker(body, TEST_MARKER) {
-                    state.phase = MockPhase::WaitingCall;
-                    return response_body_with_items(
-                        vec![function_call_item(
-                            &state.tool_name,
-                            CALL_ID,
-                            &state.tool_args,
-                        )],
-                        "resp-call-1",
-                    );
-                }
-            }
-            MockPhase::WaitingCall => {
-                if has_function_call_output(body, CALL_ID) {
-                    state.phase = MockPhase::CallDone;
-                    return response_body_with_items(
-                        vec![message_item("Tool call 1 completed")],
-                        "resp-tool-1",
-                    );
-                }
-            }
-            MockPhase::CallDone => {}
+
+        if let Some(call_id) = state.pending_call_id.as_deref()
+            && has_function_call_output(body, call_id)
+        {
+            let ordinal = state.pending_call_ordinal.take().unwrap_or_default();
+            state.pending_call_id = None;
+            return response_body_with_items(
+                vec![message_item(&format!("Tool call {ordinal} completed"))],
+                &format!("resp-tool-{ordinal}"),
+            );
+        }
+
+        if has_user_marker(body, WORKSPACE_WRITE_MARKER) {
+            return queue_tool_call(state, state.workspace_write_tool_args.clone());
+        }
+        if has_user_marker(body, FULL_ACCESS_MARKER)
+            && let Some(tool_args) = state.full_access_tool_args.clone()
+        {
+            return queue_tool_call(state, tool_args);
         }
         response_body_with_items(vec![message_item("ready")], "resp-ready")
+    }
+
+    fn queue_tool_call(state: &mut MockState, tool_args: String) -> String {
+        let ordinal = state.next_call_ordinal;
+        state.next_call_ordinal += 1;
+        let call_id = format!("call-{ordinal}");
+        state.pending_call_id = Some(call_id.clone());
+        state.pending_call_ordinal = Some(ordinal);
+        response_body_with_items(
+            vec![function_call_item(&state.tool_name, &call_id, &tool_args)],
+            &format!("resp-call-{ordinal}"),
+        )
     }
 
     fn response_body_with_items(items: Vec<Value>, response_id: &str) -> String {
@@ -1040,6 +1168,11 @@ mod linux {
         );
         Ok(())
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_tui_full_access_sandbox_update() -> TestResult<()> {
+        super::unix_impl::run_codex_tui_full_access_sandbox_update().await
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -1057,6 +1190,11 @@ mod macos {
             super::unix_impl::render_steps(&steps)
         );
         Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn codex_tui_full_access_sandbox_update() -> TestResult<()> {
+        super::unix_impl::run_codex_tui_full_access_sandbox_update().await
     }
 }
 

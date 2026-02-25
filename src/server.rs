@@ -70,6 +70,14 @@ impl SharedServer {
         input: String,
         timeout: Duration,
     ) -> Result<CallToolResult, McpError> {
+        crate::event_log::log(
+            "tool_call_begin",
+            json!({
+                "tool": "repl",
+                "input": input.clone(),
+                "timeout_ms": timeout.as_millis(),
+            }),
+        );
         let worker_timeout = apply_tool_call_margin(timeout);
         let server_timeout = apply_safety_margin(timeout);
         let result = self
@@ -77,15 +85,52 @@ impl SharedServer {
                 worker.write_stdin(input, worker_timeout, server_timeout, None, false)
             })
             .await?;
-        worker_result_to_call_tool_result(result)
+        let tool_result = worker_result_to_call_tool_result(result);
+        match &tool_result {
+            Ok(result) => {
+                let serialized = serde_json::to_value(result)
+                    .unwrap_or_else(|err| json!({"serialize_error": err.to_string()}));
+                crate::event_log::log(
+                    "tool_call_end",
+                    json!({
+                        "tool": "repl",
+                        "result": serialized,
+                    }),
+                );
+            }
+            Err(err) => {
+                crate::event_log::log(
+                    "tool_call_error",
+                    json!({
+                        "tool": "repl",
+                        "error": err.to_string(),
+                    }),
+                );
+            }
+        }
+        tool_result
     }
 
     async fn on_custom_request(&self, request: CustomRequest) -> Result<CustomResult, McpError> {
         if std::env::var_os("MCP_CONSOLE_DEBUG_MCP").is_some() {
             eprintln!("custom request: {}", request.method);
         }
+        crate::event_log::log(
+            "custom_request_received",
+            json!({
+                "method": request.method.clone(),
+                "params": request.params.clone(),
+            }),
+        );
         crate::sandbox::log_sandbox_state_event(&request.method, request.params.as_ref());
         if request.method != SANDBOX_STATE_METHOD {
+            crate::event_log::log(
+                "custom_request_rejected",
+                json!({
+                    "method": request.method.clone(),
+                    "reason": "method_not_found",
+                }),
+            );
             return Err(McpError::new(
                 ErrorCode::METHOD_NOT_FOUND,
                 request.method,
@@ -97,18 +142,45 @@ impl SharedServer {
             .params_as::<SandboxStateUpdate>()
             .map_err(|err| McpError::invalid_params(err.to_string(), None))?
             .ok_or_else(|| McpError::invalid_params("missing sandbox state params", None))?;
+        let update_for_log = serde_json::to_value(&update)
+            .unwrap_or_else(|err| json!({"serialize_error": err.to_string()}));
 
-        let result = self
+        let outcome = self
             .run_worker(move |worker| worker.update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT))
             .await?;
-        if let Err(err) = result {
-            return Err(McpError::internal_error(err.to_string(), None));
+        match outcome {
+            Ok(changed) => {
+                crate::event_log::log(
+                    "sandbox_state_request_applied",
+                    json!({
+                        "changed": changed,
+                        "update": update_for_log,
+                    }),
+                );
+            }
+            Err(err) => {
+                crate::event_log::log(
+                    "sandbox_state_request_failed",
+                    json!({
+                        "error": err.to_string(),
+                        "update": update_for_log,
+                    }),
+                );
+                return Err(McpError::internal_error(err.to_string(), None));
+            }
         }
 
         Ok(CustomResult::new(json!({})))
     }
 
     async fn on_custom_notification(&self, notification: CustomNotification) {
+        crate::event_log::log(
+            "custom_notification_received",
+            json!({
+                "method": notification.method.clone(),
+                "params": notification.params.clone(),
+            }),
+        );
         crate::sandbox::log_sandbox_state_event(&notification.method, notification.params.as_ref());
         if notification.method != SANDBOX_STATE_METHOD {
             return;
@@ -118,24 +190,60 @@ impl SharedServer {
             Ok(Some(update)) => update,
             Ok(None) => {
                 eprintln!("sandbox update missing params");
+                crate::event_log::log(
+                    "sandbox_state_notification_failed",
+                    json!({
+                        "error": "missing sandbox state params",
+                    }),
+                );
                 return;
             }
             Err(err) => {
                 eprintln!("sandbox update parse error: {err}");
+                crate::event_log::log(
+                    "sandbox_state_notification_failed",
+                    json!({
+                        "error": err.to_string(),
+                    }),
+                );
                 return;
             }
         };
+        let update_for_log = serde_json::to_value(&update)
+            .unwrap_or_else(|err| json!({"serialize_error": err.to_string()}));
 
         match self
             .run_worker(move |worker| worker.update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT))
             .await
         {
-            Ok(Ok(_)) => {}
+            Ok(Ok(changed)) => {
+                crate::event_log::log(
+                    "sandbox_state_notification_applied",
+                    json!({
+                        "changed": changed,
+                        "update": update_for_log.clone(),
+                    }),
+                );
+            }
             Ok(Err(err)) => {
                 eprintln!("sandbox update failed: {err}");
+                crate::event_log::log(
+                    "sandbox_state_notification_failed",
+                    json!({
+                        "error": err.to_string(),
+                        "update": update_for_log.clone(),
+                    }),
+                );
             }
             Err(err) => {
                 eprintln!("sandbox update failed: {err}");
+                crate::event_log::log(
+                    "sandbox_state_notification_failed",
+                    json!({
+                        "error": err.to_string(),
+                        "update": update_for_log.clone(),
+                    }),
+                );
             }
         }
     }
@@ -187,13 +295,42 @@ macro_rules! define_backend_tool_server {
                 &self,
                 _params: Parameters<ReplResetArgs>,
             ) -> Result<CallToolResult, McpError> {
+                crate::event_log::log(
+                    "tool_call_begin",
+                    json!({
+                        "tool": "repl_reset",
+                    }),
+                );
                 let timeout = parse_timeout(None, "repl_reset", false)?;
                 let worker_timeout = apply_tool_call_margin(timeout);
                 let result = self
                     .shared
                     .run_worker(move |worker| worker.restart(worker_timeout))
                     .await?;
-                worker_result_to_call_tool_result(result)
+                let tool_result = worker_result_to_call_tool_result(result);
+                match &tool_result {
+                    Ok(result) => {
+                        let serialized = serde_json::to_value(result)
+                            .unwrap_or_else(|err| json!({"serialize_error": err.to_string()}));
+                        crate::event_log::log(
+                            "tool_call_end",
+                            json!({
+                                "tool": "repl_reset",
+                                "result": serialized,
+                            }),
+                        );
+                    }
+                    Err(err) => {
+                        crate::event_log::log(
+                            "tool_call_error",
+                            json!({
+                                "tool": "repl_reset",
+                                "error": err.to_string(),
+                            }),
+                        );
+                    }
+                }
+                tool_result
             }
         }
 
@@ -287,12 +424,22 @@ where
 {
     let warm_worker = shutdown_worker.clone();
     thread::spawn(move || {
+        crate::event_log::log("worker_warm_start_begin", json!({}));
         let mut worker = warm_worker.lock().unwrap();
         if let Err(err) = worker.warm_start() {
             eprintln!("worker warm start error: {err}");
+            crate::event_log::log(
+                "worker_warm_start_error",
+                json!({
+                    "error": err.to_string(),
+                }),
+            );
+            return;
         }
+        crate::event_log::log("worker_warm_start_end", json!({"status": "ok"}));
     });
 
+    crate::event_log::log("server_listen_begin", json!({}));
     let result: Result<(), Box<dyn std::error::Error>> = async {
         let running = rmcp::serve_server(service, rmcp::transport::stdio()).await?;
         running
@@ -307,11 +454,27 @@ where
         let mut worker = shutdown_worker.lock().unwrap();
         worker.shutdown();
     }
+    match &result {
+        Ok(()) => crate::event_log::log("server_listen_end", json!({"status": "ok"})),
+        Err(err) => crate::event_log::log(
+            "server_listen_end",
+            json!({
+                "status": "error",
+                "error": err.to_string(),
+            }),
+        ),
+    }
     result
 }
 
 pub async fn run(backend: Backend) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("starting mcp-repl server");
+    crate::event_log::log(
+        "server_run_begin",
+        json!({
+            "backend": format!("{backend:?}"),
+        }),
+    );
     match backend {
         Backend::R => {
             let service = RToolServer::new(backend)?;

@@ -1,6 +1,7 @@
 mod backend;
 mod debug_repl;
 mod diagnostics;
+mod event_log;
 mod html_to_markdown;
 mod input_protocol;
 mod install;
@@ -36,6 +37,7 @@ struct CliOptions {
     sandbox_state: Option<String>,
     debug_repl: bool,
     backend: Backend,
+    debug_events_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +100,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::env::set_var(INITIAL_SANDBOX_STATE_ENV, state);
                 }
             }
+            event_log::initialize(
+                options.debug_events_dir,
+                event_log::StartupContext {
+                    mode: if options.debug_repl {
+                        "debug_repl".to_string()
+                    } else {
+                        "server".to_string()
+                    },
+                    backend: match options.backend {
+                        Backend::R => "r".to_string(),
+                        Backend::Python => "python".to_string(),
+                    },
+                    debug_repl: options.debug_repl,
+                    sandbox_state: std::env::var(INITIAL_SANDBOX_STATE_ENV).ok(),
+                },
+            )?;
             if options.debug_repl {
                 crate::diagnostics::startup_log("main: debug repl mode");
                 return debug_repl::run(options.backend);
@@ -130,6 +148,7 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
 
     let mut sandbox_args = SandboxCliArgs::default();
     let mut debug_repl = false;
+    let mut debug_events_dir = None;
     let mut backend = backend_from_env()?;
     while let Some(arg) = parser.next() {
         match arg.as_str() {
@@ -192,6 +211,20 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
             "--debug-repl" => {
                 debug_repl = true;
             }
+            "--debug-events-dir" => {
+                let value = parser.next_value("--debug-events-dir")?;
+                if value.trim().is_empty() {
+                    return Err("missing value for --debug-events-dir".into());
+                }
+                debug_events_dir = Some(PathBuf::from(value));
+            }
+            _ if arg.starts_with("--debug-events-dir=") => {
+                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
+                if value.trim().is_empty() {
+                    return Err("missing value for --debug-events-dir".into());
+                }
+                debug_events_dir = Some(PathBuf::from(value));
+            }
             _ => match parse_backend_arg(&arg, &mut parser)? {
                 Some(parsed_backend) => backend = Some(parsed_backend),
                 None => return Err(format!("unknown argument: {arg}").into()),
@@ -205,6 +238,7 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
         sandbox_state,
         debug_repl,
         backend: backend.unwrap_or(Backend::R),
+        debug_events_dir,
     }))
 }
 
@@ -520,6 +554,7 @@ fn print_usage() {
 mcp-repl [--debug-repl] [--interpreter <r|python>] [--sandbox-mode <mode>] [--sandbox-network-access <restricted|enabled>] [--writable-root <abs-path>]...\n\
 mcp-repl install [codex] [claude] [--client <codex|claude>]... [--interpreter <r|python>[,r|python]...]... [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
 --debug-repl: run an interactive debug REPL over stdio\n\
+--debug-events-dir: optional directory for per-startup JSONL debug event logs (env: MCP_REPL_DEBUG_EVENTS_DIR)\n\
 --interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER, compatibility env MCP_REPL_BACKEND)\n\
 --backend: compatibility alias for --interpreter\n\
 --sandbox-state: inherit | JSON | read-only | workspace-write | danger-full-access\n\

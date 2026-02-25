@@ -143,6 +143,14 @@ By default install creates one entry per supported interpreter:
 Use `--interpreter r`, `--interpreter python`, or comma-separated/repeatable forms
 to limit which interpreters are installed.
 
+Optional: enable rich JSONL debug logs for each `mcp-repl` startup:
+
+- CLI arg: `--debug-events-dir /path/to/log-dir`
+- Environment: `MCP_REPL_DEBUG_EVENTS_DIR=/path/to/log-dir`
+
+When enabled, each startup writes a new `mcp-repl-*.jsonl` file containing startup
+metadata (cwd, argv, Codex session hints) plus tool calls and sandbox state updates.
+
 ### 3) Pick interpreter (optional)
 
 - Default interpreter: R
