@@ -424,6 +424,34 @@ fn split_write_stdin_control_prefix(input: &str) -> Option<(WriteStdinControlAct
     Some((action, tail))
 }
 
+fn worker_context_event_payload(
+    backend: Backend,
+    sandbox_state: &SandboxState,
+    preserve_pager: Option<bool>,
+) -> serde_json::Value {
+    let sandbox_policy = serde_json::to_value(&sandbox_state.sandbox_policy)
+        .unwrap_or_else(|err| serde_json::json!({ "serialize_error": err.to_string() }));
+    let mut payload = serde_json::json!({
+        "backend": format!("{backend:?}"),
+        "sandbox_policy": sandbox_policy,
+        "sandbox_cwd": sandbox_state.sandbox_cwd.to_string_lossy().to_string(),
+        "session_temp_dir": sandbox_state.session_temp_dir.to_string_lossy().to_string(),
+        "codex_linux_sandbox_exe": sandbox_state
+            .codex_linux_sandbox_exe
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string()),
+    });
+    if let Some(preserve_pager) = preserve_pager
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert(
+            "preserve_pager".to_string(),
+            serde_json::Value::Bool(preserve_pager),
+        );
+    }
+    payload
+}
+
 pub struct WorkerManager {
     exe_path: PathBuf,
     backend: Backend,
@@ -453,16 +481,9 @@ impl WorkerManager {
         if let Some(update) = crate::sandbox::initial_sandbox_state_update() {
             sandbox_state.apply_update(update);
         }
-        crate::event_log::log(
-            "worker_manager_created",
-            serde_json::json!({
-                "backend": format!("{backend:?}"),
-                "sandbox_policy": sandbox_state.sandbox_policy.clone(),
-                "sandbox_cwd": sandbox_state.sandbox_cwd.clone(),
-                "session_temp_dir": sandbox_state.session_temp_dir.clone(),
-                "codex_linux_sandbox_exe": sandbox_state.codex_linux_sandbox_exe.clone(),
-            }),
-        );
+        crate::event_log::log_lazy("worker_manager_created", || {
+            worker_context_event_payload(backend, &sandbox_state, None)
+        });
         let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
         reset_output_ring();
         reset_last_reply_marker_offset();
@@ -1488,17 +1509,9 @@ impl WorkerManager {
 
     fn spawn_process(&mut self) -> Result<WorkerProcess, WorkerError> {
         self.reset_output_state(false);
-        crate::event_log::log(
-            "worker_spawn_begin",
-            serde_json::json!({
-                "backend": format!("{:?}", self.backend),
-                "sandbox_policy": self.sandbox_state.sandbox_policy.clone(),
-                "sandbox_cwd": self.sandbox_state.sandbox_cwd.clone(),
-                "session_temp_dir": self.sandbox_state.session_temp_dir.clone(),
-                "codex_linux_sandbox_exe": self.sandbox_state.codex_linux_sandbox_exe.clone(),
-                "preserve_pager": false,
-            }),
-        );
+        crate::event_log::log_lazy("worker_spawn_begin", || {
+            worker_context_event_payload(self.backend, &self.sandbox_state, Some(false))
+        });
         let process = WorkerProcess::spawn(
             self.backend,
             &self.exe_path,
@@ -1538,17 +1551,9 @@ impl WorkerManager {
         preserve_pager: bool,
     ) -> Result<WorkerProcess, WorkerError> {
         self.reset_output_state(preserve_pager);
-        crate::event_log::log(
-            "worker_spawn_begin",
-            serde_json::json!({
-                "backend": format!("{:?}", self.backend),
-                "sandbox_policy": self.sandbox_state.sandbox_policy.clone(),
-                "sandbox_cwd": self.sandbox_state.sandbox_cwd.clone(),
-                "session_temp_dir": self.sandbox_state.session_temp_dir.clone(),
-                "codex_linux_sandbox_exe": self.sandbox_state.codex_linux_sandbox_exe.clone(),
-                "preserve_pager": preserve_pager,
-            }),
-        );
+        crate::event_log::log_lazy("worker_spawn_begin", || {
+            worker_context_event_payload(self.backend, &self.sandbox_state, Some(preserve_pager))
+        });
         let process = WorkerProcess::spawn(
             self.backend,
             &self.exe_path,
@@ -3440,6 +3445,12 @@ fn worker_error_code(err: &WorkerError) -> Option<WorkerErrorCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn cwd_test_mutex() -> &'static Mutex<()> {
+        static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_MUTEX.get_or_init(|| Mutex::new(()))
+    }
 
     fn echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
         IpcEchoEvent {
@@ -3563,6 +3574,33 @@ mod tests {
             }
             _ => panic!("expected stdin_write control message"),
         }
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn worker_manager_new_does_not_panic_for_non_utf8_tmpdir_env() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let _guard = cwd_test_mutex().lock().expect("cwd mutex");
+        let original_tmpdir = std::env::var_os("TMPDIR");
+        let non_utf8_tmpdir = OsString::from_vec(b"/tmp/non-utf8-\xFF-tmp".to_vec());
+
+        unsafe {
+            std::env::set_var("TMPDIR", &non_utf8_tmpdir);
+        }
+        let result = std::panic::catch_unwind(|| WorkerManager::new(Backend::Python));
+
+        match original_tmpdir {
+            Some(value) => unsafe {
+                std::env::set_var("TMPDIR", value);
+            },
+            None => unsafe {
+                std::env::remove_var("TMPDIR");
+            },
+        }
+
+        assert!(result.is_ok(), "WorkerManager::new should not panic");
     }
 
     #[cfg(target_family = "windows")]
