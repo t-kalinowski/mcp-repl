@@ -679,6 +679,12 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_state_arg_accepts_inherit() {
+        let parsed = sandbox_state_arg("inherit".to_string()).expect("sandbox state");
+        assert_eq!(parsed, "inherit");
+    }
+
+    #[test]
     fn sandbox_state_from_cli_args_workspace_write_defaults_restricted() {
         let state = sandbox_state_from_cli_args(SandboxCliArgs {
             mode: Some(SandboxModeArg::WorkspaceWrite),
