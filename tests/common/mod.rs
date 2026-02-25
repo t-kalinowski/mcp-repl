@@ -921,7 +921,7 @@ pub async fn spawn_server_with_args(args: Vec<String>) -> TestResult<McpTestSess
 
 pub async fn spawn_python_server() -> TestResult<McpTestSession> {
     spawn_server_with_args(vec![
-        "--backend".to_string(),
+        "--interpreter".to_string(),
         "python".to_string(),
         "--sandbox-state".to_string(),
         "danger-full-access".to_string(),
@@ -1001,11 +1001,17 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
 fn parse_backend_from_args(args: &[String]) -> TestBackend {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
-        if arg == "--backend" {
+        if arg == "--interpreter" || arg == "--backend" {
             if iter.next().is_some_and(|value| value == "python") {
                 return TestBackend::Python;
             }
             continue;
+        }
+        if arg
+            .strip_prefix("--interpreter=")
+            .is_some_and(|value| value == "python")
+        {
+            return TestBackend::Python;
         }
         if arg
             .strip_prefix("--backend=")

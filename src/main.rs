@@ -207,23 +207,13 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
                     .writable_roots
                     .push(parse_writable_root(value)?);
             }
-            "--backend" => {
-                let value = parser.next_value("--backend")?;
-                backend = Some(Backend::parse(&value).map_err(|err| err.to_string())?);
-            }
-            _ if arg.starts_with("--backend=") => {
-                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
-                if value.is_empty() {
-                    return Err("missing value for --backend".into());
-                }
-                backend = Some(Backend::parse(value).map_err(|err| err.to_string())?);
-            }
             "--debug-repl" => {
                 debug_repl = true;
             }
-            _ => {
-                return Err(format!("unknown argument: {arg}").into());
-            }
+            _ => match parse_backend_arg(&arg, &mut parser)? {
+                Some(parsed_backend) => backend = Some(parsed_backend),
+                None => return Err(format!("unknown argument: {arg}").into()),
+            },
         }
     }
 
@@ -234,6 +224,33 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
         debug_repl,
         backend: backend.unwrap_or(Backend::R),
     }))
+}
+
+fn parse_backend_arg(
+    arg: &str,
+    parser: &mut ArgParser,
+) -> Result<Option<Backend>, Box<dyn std::error::Error>> {
+    if arg == "--interpreter" {
+        let value = parser.next_value("--interpreter")?;
+        return Ok(Some(Backend::parse(&value).map_err(|err| err.to_string())?));
+    }
+    if arg == "--backend" {
+        let value = parser.next_value("--backend")?;
+        return Ok(Some(Backend::parse(&value).map_err(|err| err.to_string())?));
+    }
+    if let Some(value) = arg.strip_prefix("--interpreter=") {
+        if value.is_empty() {
+            return Err("missing value for --interpreter".into());
+        }
+        return Ok(Some(Backend::parse(value).map_err(|err| err.to_string())?));
+    }
+    if let Some(value) = arg.strip_prefix("--backend=") {
+        if value.is_empty() {
+            return Err("missing value for --backend".into());
+        }
+        return Ok(Some(Backend::parse(value).map_err(|err| err.to_string())?));
+    }
+    Ok(None)
 }
 
 struct ArgParser {
@@ -454,12 +471,13 @@ fn sandbox_state_from_cli_args(
 fn print_usage() {
     println!(
         "Usage:\n\
-mcp-repl [--debug-repl] [--backend <r|python>] [--sandbox-mode <mode>] [--sandbox-network-access <restricted|enabled>] [--writable-root <abs-path>]...\n\
+mcp-repl [--debug-repl] [--interpreter <r|python>] [--sandbox-mode <mode>] [--sandbox-network-access <restricted|enabled>] [--writable-root <abs-path>]...\n\
 mcp-repl install [codex] [claude] [--server-name <name>] [--command <path>] [--arg <value>]...\n\
 mcp-repl install-codex [--server-name <name>] [--command <path>] [--arg <value>]...\n\
 mcp-repl install-claude [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
 --debug-repl: run an interactive debug REPL over stdio\n\
---backend: choose REPL backend (default: r; env MCP_REPL_BACKEND)\n\
+--interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER, compatibility env MCP_REPL_BACKEND)\n\
+--backend: compatibility alias for --interpreter\n\
 --sandbox-mode: read-only | workspace-write | danger-full-access (default: workspace-write when sandbox flags are provided)\n\
 --sandbox-network-access: restricted | enabled (workspace-write only; default: restricted)\n\
 --writable-root: additional absolute writable path (repeatable; workspace-write only)\n\
@@ -483,6 +501,40 @@ Missing homes are not created."
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_backend_arg_accepts_interpreter_flag_forms() {
+        let mut parser = ArgParser {
+            args: vec!["python".to_string()],
+            index: 0,
+        };
+        let parsed = parse_backend_arg("--interpreter", &mut parser).expect("parse flag");
+        assert_eq!(parsed, Some(Backend::Python));
+
+        let mut parser = ArgParser {
+            args: Vec::new(),
+            index: 0,
+        };
+        let parsed = parse_backend_arg("--interpreter=python", &mut parser).expect("parse flag");
+        assert_eq!(parsed, Some(Backend::Python));
+    }
+
+    #[test]
+    fn parse_backend_arg_accepts_backend_compatibility_forms() {
+        let mut parser = ArgParser {
+            args: vec!["python".to_string()],
+            index: 0,
+        };
+        let parsed = parse_backend_arg("--backend", &mut parser).expect("parse flag");
+        assert_eq!(parsed, Some(Backend::Python));
+
+        let mut parser = ArgParser {
+            args: Vec::new(),
+            index: 0,
+        };
+        let parsed = parse_backend_arg("--backend=python", &mut parser).expect("parse flag");
+        assert_eq!(parsed, Some(Backend::Python));
+    }
 
     #[test]
     fn parse_sandbox_network_access_accepts_expected_values() {

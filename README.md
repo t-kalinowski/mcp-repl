@@ -2,7 +2,7 @@
 
 `mcp-repl` is an MCP server that exposes a long-lived interactive REPL runtime over stdio.
 
-It is backend-agnostic in design. The default backend is R, with an opt-in Python backend (`--backend python`).
+It is backend-agnostic in design. The default interpreter is R, with an opt-in Python interpreter (`--interpreter python`).
 Session state persists across calls, so agents can iterate in place, inspect intermediate values, debug, and read docs in-band.
 
 ## Why use it
@@ -109,7 +109,7 @@ Example `Python` REPL Codex config:
 [mcp_servers.python_repl]
 command = "/Users/alice/.cargo/bin/mcp-repl"
 args = [
-  "--backend", "python",
+  "--interpreter", "python",
   "--sandbox-mode", "workspace-write",
   "--sandbox-network-access", "restricted",
 ]
@@ -117,17 +117,19 @@ args = [
 
 ### 3) Pick backend (optional)
 
-- Default backend: R
-- CLI: `mcp-repl --backend r|python`
-- Environment: `MCP_REPL_BACKEND=r|python`
+- Default interpreter: R
+- CLI: `mcp-repl --interpreter r|python`
+- Environment: `MCP_REPL_INTERPRETER=r|python` (compatibility alias: `MCP_REPL_BACKEND`)
 
 ## Runtime discovery
 
 ### Backend selection order
 
-`mcp-repl` chooses backend in this order:
-- `--backend <r|python>` (if provided)
-- `MCP_REPL_BACKEND`
+`mcp-repl` chooses interpreter in this order:
+- `--interpreter <r|python>` (if provided)
+- compatibility CLI alias: `--backend <r|python>`
+- `MCP_REPL_INTERPRETER`
+- compatibility env alias: `MCP_REPL_BACKEND`
 - default: `r`
 
 ### R backend: which R installation is used
