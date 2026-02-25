@@ -32,7 +32,7 @@ fn resolve_exe() -> TestResult<PathBuf> {
 }
 
 #[test]
-fn install_codex_defaults_to_r_and_python_servers() -> TestResult<()> {
+fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let codex_home = temp.path().join("codex-home");
     std::fs::create_dir_all(&codex_home)?;
@@ -100,7 +100,7 @@ fn install_codex_defaults_to_r_and_python_servers() -> TestResult<()> {
 }
 
 #[test]
-fn install_claude_defaults_to_r_and_python_servers() -> TestResult<()> {
+fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let claude_home = temp.path().join(".claude");
     std::fs::create_dir_all(&claude_home)?;
@@ -209,6 +209,40 @@ fn install_rejects_empty_client_selector() -> TestResult<()> {
     assert!(
         !status.success(),
         "expected install with empty --client selector to fail"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn install_subcommands_are_rejected() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let codex_home = temp.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home)?;
+    let exe = resolve_exe()?;
+
+    let codex_status = Command::new(&exe)
+        .arg("install-codex")
+        .arg("--command")
+        .arg("/usr/local/bin/mcp-repl")
+        .env("CODEX_HOME", &codex_home)
+        .status()?;
+    assert!(
+        !codex_status.success(),
+        "install-codex should fail after subcommand removal"
+    );
+
+    let claude_home = temp.path().join(".claude");
+    std::fs::create_dir_all(&claude_home)?;
+    let claude_status = Command::new(exe)
+        .arg("install-claude")
+        .arg("--command")
+        .arg("/usr/local/bin/mcp-repl")
+        .env("HOME", temp.path())
+        .status()?;
+    assert!(
+        !claude_status.success(),
+        "install-claude should fail after subcommand removal"
     );
 
     Ok(())

@@ -70,14 +70,13 @@ impl SharedServer {
         input: String,
         timeout: Duration,
     ) -> Result<CallToolResult, McpError> {
-        crate::event_log::log(
-            "tool_call_begin",
+        crate::event_log::log_lazy("tool_call_begin", || {
             json!({
                 "tool": "repl",
                 "input": input.clone(),
                 "timeout_ms": timeout.as_millis(),
-            }),
-        );
+            })
+        });
         let worker_timeout = apply_tool_call_margin(timeout);
         let server_timeout = apply_safety_margin(timeout);
         let result = self
@@ -88,24 +87,22 @@ impl SharedServer {
         let tool_result = worker_result_to_call_tool_result(result);
         match &tool_result {
             Ok(result) => {
-                let serialized = serde_json::to_value(result)
-                    .unwrap_or_else(|err| json!({"serialize_error": err.to_string()}));
-                crate::event_log::log(
-                    "tool_call_end",
+                crate::event_log::log_lazy("tool_call_end", || {
+                    let serialized = serde_json::to_value(result)
+                        .unwrap_or_else(|err| json!({"serialize_error": err.to_string()}));
                     json!({
                         "tool": "repl",
                         "result": serialized,
-                    }),
-                );
+                    })
+                });
             }
             Err(err) => {
-                crate::event_log::log(
-                    "tool_call_error",
+                crate::event_log::log_lazy("tool_call_error", || {
                     json!({
                         "tool": "repl",
                         "error": err.to_string(),
-                    }),
-                );
+                    })
+                });
             }
         }
         tool_result
@@ -295,12 +292,11 @@ macro_rules! define_backend_tool_server {
                 &self,
                 _params: Parameters<ReplResetArgs>,
             ) -> Result<CallToolResult, McpError> {
-                crate::event_log::log(
-                    "tool_call_begin",
+                crate::event_log::log_lazy("tool_call_begin", || {
                     json!({
                         "tool": "repl_reset",
-                    }),
-                );
+                    })
+                });
                 let timeout = parse_timeout(None, "repl_reset", false)?;
                 let worker_timeout = apply_tool_call_margin(timeout);
                 let result = self
@@ -310,24 +306,22 @@ macro_rules! define_backend_tool_server {
                 let tool_result = worker_result_to_call_tool_result(result);
                 match &tool_result {
                     Ok(result) => {
-                        let serialized = serde_json::to_value(result)
-                            .unwrap_or_else(|err| json!({"serialize_error": err.to_string()}));
-                        crate::event_log::log(
-                            "tool_call_end",
+                        crate::event_log::log_lazy("tool_call_end", || {
+                            let serialized = serde_json::to_value(result)
+                                .unwrap_or_else(|err| json!({"serialize_error": err.to_string()}));
                             json!({
                                 "tool": "repl_reset",
                                 "result": serialized,
-                            }),
-                        );
+                            })
+                        });
                     }
                     Err(err) => {
-                        crate::event_log::log(
-                            "tool_call_error",
+                        crate::event_log::log_lazy("tool_call_error", || {
                             json!({
                                 "tool": "repl_reset",
                                 "error": err.to_string(),
-                            }),
-                        );
+                            })
+                        });
                     }
                 }
                 tool_result

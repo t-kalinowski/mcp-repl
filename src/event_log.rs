@@ -92,6 +92,16 @@ pub fn log(event: &str, payload: JsonValue) {
     let _ = logger.write_event(event, payload);
 }
 
+pub fn log_lazy<F>(event: &str, payload: F)
+where
+    F: FnOnce() -> JsonValue,
+{
+    let Some(logger) = current_logger() else {
+        return;
+    };
+    let _ = logger.write_event(event, payload());
+}
+
 fn current_logger() -> Option<Arc<EventLogger>> {
     LOGGER.get().and_then(|entry| entry.clone())
 }
@@ -247,5 +257,17 @@ mod tests {
             second_path.file_name().and_then(|name| name.to_str()),
             Some("mcp-repl-123-456-1.jsonl")
         );
+    }
+
+    #[test]
+    fn log_lazy_does_not_build_payload_without_logger() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let invoked = AtomicBool::new(false);
+        super::log_lazy("test-event", || {
+            invoked.store(true, Ordering::SeqCst);
+            json!({"ok": true})
+        });
+        assert!(!invoked.load(Ordering::SeqCst));
     }
 }
