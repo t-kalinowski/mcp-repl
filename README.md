@@ -81,7 +81,8 @@ mcp-repl install-claude
 mcp-repl install
 ```
 
-`install-codex` writes only the MCP command and args. Sandbox policy is inherited from Codex.
+`install-codex` writes `--sandbox-state inherit` by default. That sentinel means `mcp-repl` should
+inherit sandbox policy updates from Codex for the session.
 
 Example `R` REPL Codex config (paths vary by OS/user):
 
@@ -90,7 +91,11 @@ Example `R` REPL Codex config (paths vary by OS/user):
 command = "/Users/alice/.cargo/bin/mcp-repl"
 # mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.
 tool_timeout_sec = 1800
-args = []
+# --sandbox-state inherit: use sandbox policy updates sent by Codex for this session.
+# If no update is sent, mcp-repl falls back to its internal default policy.
+args = [
+  "--sandbox-state", "inherit",
+]
 ```
 
 Example `Python` REPL Codex config:
@@ -100,11 +105,24 @@ Example `Python` REPL Codex config:
 command = "/Users/alice/.cargo/bin/mcp-repl"
 args = [
   "--interpreter", "python",
+  "--sandbox-state", "inherit",
 ]
 ```
 
-For Claude, pass explicit sandbox flags in `args` because Claude does not propagate sandbox state
-to MCP servers.
+For Claude, `install-claude` writes explicit sandbox mode by default because Claude does not
+propagate sandbox state updates to MCP servers:
+
+```json
+{
+  "mcpServers": {
+    "repl": {
+      "command": "/Users/alice/.cargo/bin/mcp-repl",
+      "args": ["--sandbox-state", "workspace-write"],
+      "_comment_sandbox_state": "sandbox-state values: read-only | workspace-write | danger-full-access"
+    }
+  }
+}
+```
 
 ### 3) Pick backend (optional)
 

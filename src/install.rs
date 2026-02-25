@@ -10,6 +10,10 @@ use toml_edit::{Array, DocumentMut, Item, Table, value};
 const CODEX_TOOL_TIMEOUT_SECS: i64 = 1_800;
 const CODEX_TOOL_TIMEOUT_COMMENT: &str =
     "\n# mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.\n";
+const CODEX_SANDBOX_INHERIT_COMMENT: &str = "\n# --sandbox-state inherit: use sandbox policy updates sent by Codex for this session.\n# If no update is sent, mcp-repl falls back to its internal default policy.\n";
+const CLAUDE_SANDBOX_STATE_COMMENT_FIELD: &str = "_comment_sandbox_state";
+const CLAUDE_SANDBOX_STATE_COMMENT: &str =
+    "sandbox-state values: read-only | workspace-write | danger-full-access";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum InstallTarget {
@@ -47,17 +51,19 @@ pub struct InstallOptions {
 pub fn run(options: InstallOptions) -> Result<(), Box<dyn std::error::Error>> {
     let command = options.command.unwrap_or_else(default_command);
     let targets = resolve_target_roots(&options.targets)?;
+    let codex_args = codex_install_args(&options.args);
+    let claude_args = claude_install_args(&options.args);
 
     for (target, root) in targets {
         match target {
             InstallTarget::Codex => {
                 let path = root.join("config.toml");
-                upsert_codex_mcp_server(&path, &options.server_name, &command, &options.args)?;
+                upsert_codex_mcp_server(&path, &options.server_name, &command, &codex_args)?;
                 println!("Updated codex MCP config: {}", path.display());
             }
             InstallTarget::Claude => {
                 let path = resolve_claude_config_path(&root);
-                upsert_claude_mcp_server(&path, &options.server_name, &command, &options.args)?;
+                upsert_claude_mcp_server(&path, &options.server_name, &command, &claude_args)?;
                 println!("Updated claude MCP config: {}", path.display());
             }
         }
@@ -180,6 +186,55 @@ fn resolve_claude_config_path(root: &Path) -> PathBuf {
     settings
 }
 
+fn has_sandbox_config_arg(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--sandbox-state" | "--sandbox-mode" | "--sandbox-network-access" | "--writable-root"
+        ) || arg.starts_with("--sandbox-state=")
+            || arg.starts_with("--sandbox-mode=")
+            || arg.starts_with("--sandbox-network-access=")
+            || arg.starts_with("--writable-root=")
+    })
+}
+
+fn codex_install_args(base_args: &[String]) -> Vec<String> {
+    let mut args = base_args.to_vec();
+    if !has_sandbox_config_arg(base_args) {
+        args.push("--sandbox-state".to_string());
+        args.push("inherit".to_string());
+    }
+    args
+}
+
+fn claude_install_args(base_args: &[String]) -> Vec<String> {
+    let mut args = base_args.to_vec();
+    if !has_sandbox_config_arg(base_args) {
+        args.push("--sandbox-state".to_string());
+        args.push("workspace-write".to_string());
+    }
+    args
+}
+
+fn contains_sandbox_state_value(args: &[String], target: &str) -> bool {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--sandbox-state" {
+            if iter.next().is_some_and(|value| value == target) {
+                return true;
+            }
+            continue;
+        }
+        if arg
+            .strip_prefix("--sandbox-state=")
+            .is_some_and(|value| value == target)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 fn upsert_codex_mcp_server(
     config_path: &Path,
     server_name: &str,
@@ -217,6 +272,14 @@ fn upsert_codex_mcp_server(
         timeout_key
             .leaf_decor_mut()
             .set_prefix(CODEX_TOOL_TIMEOUT_COMMENT);
+    }
+    if contains_sandbox_state_value(args, "inherit")
+        && let Some(server_table) = doc["mcp_servers"][server_name].as_table_mut()
+        && let Some(mut args_key) = server_table.key_mut("args")
+    {
+        args_key
+            .leaf_decor_mut()
+            .set_prefix(CODEX_SANDBOX_INHERIT_COMMENT);
     }
 
     atomic_write(config_path, &doc.to_string())?;
@@ -307,6 +370,10 @@ fn upsert_claude_mcp_server(
             (
                 "args".to_string(),
                 JsonValue::Array(args.iter().cloned().map(JsonValue::String).collect()),
+            ),
+            (
+                CLAUDE_SANDBOX_STATE_COMMENT_FIELD.to_string(),
+                JsonValue::String(CLAUDE_SANDBOX_STATE_COMMENT.to_string()),
             ),
         ])),
     );
@@ -493,6 +560,97 @@ name="demo"
                 .expect("args")
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn upsert_codex_mcp_server_adds_inherit_comment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        upsert_codex_mcp_server(
+            &config,
+            "repl",
+            "/usr/local/bin/mcp-repl",
+            &["--sandbox-state".to_string(), "inherit".to_string()],
+        )
+        .expect("upsert codex");
+
+        let text = fs::read_to_string(config).expect("read config");
+        assert!(
+            text.contains("--sandbox-state inherit: use sandbox policy updates sent by Codex"),
+            "expected inherit comment in codex config"
+        );
+    }
+
+    #[test]
+    fn codex_install_args_defaults_to_inherit() {
+        let args = codex_install_args(&["--interpreter".to_string(), "python".to_string()]);
+        assert_eq!(
+            args,
+            vec![
+                "--interpreter".to_string(),
+                "python".to_string(),
+                "--sandbox-state".to_string(),
+                "inherit".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_install_args_defaults_to_workspace_write() {
+        let args = claude_install_args(&["--interpreter".to_string(), "python".to_string()]);
+        assert_eq!(
+            args,
+            vec![
+                "--interpreter".to_string(),
+                "python".to_string(),
+                "--sandbox-state".to_string(),
+                "workspace-write".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn install_args_preserve_explicit_sandbox_config() {
+        let base = vec![
+            "--sandbox-state".to_string(),
+            "read-only".to_string(),
+            "--interpreter".to_string(),
+            "python".to_string(),
+        ];
+        assert_eq!(codex_install_args(&base), base);
+        assert_eq!(claude_install_args(&base), base);
+    }
+
+    #[test]
+    fn upsert_claude_mcp_server_adds_sandbox_comment_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("settings.json");
+        upsert_claude_mcp_server(
+            &config,
+            "repl",
+            "/usr/local/bin/mcp-repl",
+            &["--sandbox-state".to_string(), "workspace-write".to_string()],
+        )
+        .expect("upsert claude");
+
+        let text = fs::read_to_string(config).expect("read config");
+        let root: JsonValue = serde_json::from_str(&text).expect("parse json");
+        let server = &root["mcpServers"]["repl"];
+        assert_eq!(
+            server["args"][0].as_str(),
+            Some("--sandbox-state"),
+            "expected explicit sandbox-state arg in claude config"
+        );
+        assert_eq!(
+            server["args"][1].as_str(),
+            Some("workspace-write"),
+            "expected workspace-write default in claude config"
+        );
+        assert_eq!(
+            server[CLAUDE_SANDBOX_STATE_COMMENT_FIELD].as_str(),
+            Some(CLAUDE_SANDBOX_STATE_COMMENT),
+            "expected sandbox-state comment field in claude config"
         );
     }
 

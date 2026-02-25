@@ -25,6 +25,8 @@ use std::path::PathBuf;
 use crate::backend::{Backend, backend_from_env};
 use crate::sandbox::{INITIAL_SANDBOX_STATE_ENV, SandboxPolicy, SandboxStateUpdate};
 
+const SANDBOX_STATE_INHERIT: &str = "inherit";
+
 enum CliCommand {
     RunServer(CliOptions),
     Install(install::InstallOptions),
@@ -352,6 +354,9 @@ fn parse_install_args(
 
 fn sandbox_state_arg(raw: String) -> Result<String, Box<dyn std::error::Error>> {
     let trimmed = raw.trim();
+    if trimmed == SANDBOX_STATE_INHERIT {
+        return Ok(SANDBOX_STATE_INHERIT.to_string());
+    }
     if trimmed.starts_with('{') {
         let parsed: SandboxStateUpdate = serde_json::from_str(trimmed)?;
         let payload = serde_json::to_string(&parsed)?;
@@ -369,7 +374,7 @@ fn sandbox_state_arg(raw: String) -> Result<String, Box<dyn std::error::Error>> 
         "danger-full-access" => SandboxPolicy::DangerFullAccess,
         _ => {
             return Err(format!(
-                "invalid --sandbox-state value: {trimmed} (expected JSON or read-only|workspace-write|danger-full-access)"
+                "invalid --sandbox-state value: {trimmed} (expected inherit, JSON, or read-only|workspace-write|danger-full-access)"
             )
             .into());
         }
@@ -416,6 +421,9 @@ fn sandbox_state_from_cli_args(
         );
     }
     if let Some(state) = args.sandbox_state {
+        if state == SANDBOX_STATE_INHERIT {
+            return Ok(None);
+        }
         return Ok(Some(state));
     }
     if args.mode.is_none() && args.network_access.is_none() && args.writable_roots.is_empty() {
@@ -478,6 +486,7 @@ mcp-repl install-claude [--server-name <name>] [--command <path>] [--arg <value>
 --debug-repl: run an interactive debug REPL over stdio\n\
 --interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER, compatibility env MCP_REPL_BACKEND)\n\
 --backend: compatibility alias for --interpreter\n\
+--sandbox-state: inherit | JSON | read-only | workspace-write | danger-full-access\n\
 --sandbox-mode: read-only | workspace-write | danger-full-access (default: workspace-write when sandbox flags are provided)\n\
 --sandbox-network-access: restricted | enabled (workspace-write only; default: restricted)\n\
 --writable-root: additional absolute writable path (repeatable; workspace-write only)\n\
@@ -553,6 +562,12 @@ mod tests {
     }
 
     #[test]
+    fn sandbox_state_arg_accepts_inherit() {
+        let parsed = sandbox_state_arg("inherit".to_string()).expect("sandbox state");
+        assert_eq!(parsed, "inherit");
+    }
+
+    #[test]
     fn sandbox_state_from_cli_args_workspace_write_defaults_restricted() {
         let state = sandbox_state_from_cli_args(SandboxCliArgs {
             mode: Some(SandboxModeArg::WorkspaceWrite),
@@ -578,6 +593,16 @@ mod tests {
             }
             other => panic!("expected workspace-write policy, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sandbox_state_from_cli_args_inherit_returns_none() {
+        let parsed = sandbox_state_from_cli_args(SandboxCliArgs {
+            sandbox_state: Some("inherit".to_string()),
+            ..Default::default()
+        })
+        .expect("sandbox state");
+        assert!(parsed.is_none());
     }
 
     #[test]

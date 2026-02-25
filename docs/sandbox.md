@@ -17,6 +17,7 @@ The worker also gets a per-session temp directory, exported as:
 
 ## Configure sandbox policy
 
+- CLI state selector: `mcp-repl --sandbox-state inherit|read-only|workspace-write|danger-full-access|<json>`
 - CLI mode: `mcp-repl --sandbox-mode read-only|workspace-write|danger-full-access`
 - CLI network toggle (workspace-write only): `mcp-repl --sandbox-network-access restricted|enabled`
 - CLI writable roots (workspace-write only, repeatable): `mcp-repl --writable-root /absolute/path`
