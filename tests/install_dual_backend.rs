@@ -39,14 +39,16 @@ fn install_codex_defaults_to_r_and_python_servers() -> TestResult<()> {
     let exe = resolve_exe()?;
 
     let status = Command::new(exe)
-        .arg("install-codex")
+        .arg("install")
+        .arg("--client")
+        .arg("codex")
         .arg("--command")
         .arg("/usr/local/bin/mcp-repl")
         .env("CODEX_HOME", &codex_home)
         .status()?;
     assert!(
         status.success(),
-        "install-codex failed with status {status}"
+        "install --client codex failed with status {status}"
     );
 
     let config_path = codex_home.join("config.toml");
@@ -105,14 +107,16 @@ fn install_claude_defaults_to_r_and_python_servers() -> TestResult<()> {
     let exe = resolve_exe()?;
 
     let status = Command::new(exe)
-        .arg("install-claude")
+        .arg("install")
+        .arg("--client")
+        .arg("claude")
         .arg("--command")
         .arg("/usr/local/bin/mcp-repl")
         .env("HOME", temp.path())
         .status()?;
     assert!(
         status.success(),
-        "install-claude failed with status {status}"
+        "install --client claude failed with status {status}"
     );
 
     let config_path = claude_home.join("settings.json");
@@ -156,6 +160,32 @@ fn install_claude_defaults_to_r_and_python_servers() -> TestResult<()> {
         py_has_interpreter_python,
         "expected python_repl args to include python interpreter selection"
     );
+
+    Ok(())
+}
+
+#[test]
+fn install_codex_and_install_claude_commands_are_rejected() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let codex_home = temp.path().join("codex-home");
+    let claude_home = temp.path().join(".claude");
+    std::fs::create_dir_all(&codex_home)?;
+    std::fs::create_dir_all(&claude_home)?;
+    let exe = resolve_exe()?;
+
+    for cmd in ["install-codex", "install-claude"] {
+        let status = Command::new(&exe)
+            .arg(cmd)
+            .arg("--command")
+            .arg("/usr/local/bin/mcp-repl")
+            .env("CODEX_HOME", &codex_home)
+            .env("HOME", temp.path())
+            .status()?;
+        assert!(
+            !status.success(),
+            "expected `{cmd}` to be rejected, got status {status}"
+        );
+    }
 
     Ok(())
 }
