@@ -292,7 +292,10 @@ struct ArgParser {
 impl ArgParser {
     fn new() -> Self {
         Self {
-            args: std::env::args().skip(1).collect(),
+            args: std::env::args_os()
+                .skip(1)
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect(),
             index: 0,
         }
     }

@@ -121,7 +121,9 @@ fn startup_payload(context: &StartupContext, file_path: &Path) -> JsonValue {
     let cwd = std::env::current_dir()
         .ok()
         .map(|path| path.to_string_lossy().to_string());
-    let argv: Vec<String> = std::env::args().collect();
+    let argv: Vec<String> = std::env::args_os()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     let codex_session_id = codex_session_id();
     let codex_env = visible_codex_env();
     json!({

@@ -70,4 +70,41 @@ mod unix {
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn debug_events_do_not_panic_on_non_utf8_argv() -> TestResult<()> {
+        let exe = resolve_exe()?;
+        let temp = tempfile::tempdir()?;
+        let debug_dir = temp.path().join("events");
+        let invalid_arg = OsString::from_vec(vec![b'-', b'-', b'b', b'a', b'd', b'-', 0x80]);
+
+        let output = time::timeout(
+            Duration::from_secs(15),
+            Command::new(exe)
+                .arg("--debug-events-dir")
+                .arg(&debug_dir)
+                .arg("--backend")
+                .arg("python")
+                .arg(invalid_arg)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output(),
+        )
+        .await
+        .map_err(|_| "server startup timed out")??;
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_ne!(
+            output.status.code(),
+            Some(101),
+            "startup panicked with non-UTF-8 argv; stderr: {stderr}"
+        );
+        assert!(
+            !stderr.contains("panicked at"),
+            "startup panicked with non-UTF-8 argv; stderr: {stderr}"
+        );
+
+        Ok(())
+    }
 }
