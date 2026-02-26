@@ -153,7 +153,10 @@ fn codex_session_id() -> Option<String> {
 }
 
 fn visible_codex_env() -> BTreeMap<String, String> {
-    visible_codex_env_from_iter(std::env::vars())
+    visible_codex_env_from_iter(std::env::vars_os().filter_map(|(raw_key, raw_value)| {
+        let key = raw_key.into_string().ok()?;
+        Some((key, raw_value.to_string_lossy().into_owned()))
+    }))
 }
 
 fn visible_codex_env_from_iter<I>(iter: I) -> BTreeMap<String, String>
