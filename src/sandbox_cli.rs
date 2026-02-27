@@ -51,6 +51,34 @@ pub struct SandboxCliPlan {
     pub operations: Vec<SandboxCliOperation>,
 }
 
+impl SandboxCliPlan {
+    pub fn allow_local_binding_override(&self) -> Option<bool> {
+        let mut result = None;
+        for op in &self.operations {
+            if let SandboxCliOperation::Config(SandboxConfigOperation::SetAllowLocalBinding(
+                value,
+            )) = op
+            {
+                result = Some(*value);
+            }
+        }
+        result
+    }
+
+    pub fn use_linux_sandbox_bwrap_override(&self) -> Option<bool> {
+        let mut result = None;
+        for op in &self.operations {
+            if let SandboxCliOperation::Config(SandboxConfigOperation::SetUseLinuxSandboxBwrap(
+                value,
+            )) = op
+            {
+                result = Some(*value);
+            }
+        }
+        result
+    }
+}
+
 pub fn parse_sandbox_config_override(raw: &str) -> Result<SandboxConfigOperation, String> {
     let (raw_key, raw_value) = raw
         .split_once('=')
@@ -222,14 +250,12 @@ fn apply_mode(
             state.sandbox_cwd = inherited.sandbox_cwd.clone();
             state.codex_linux_sandbox_exe = inherited.codex_linux_sandbox_exe.clone();
             state.use_linux_sandbox_bwrap = inherited.use_linux_sandbox_bwrap;
-            state.use_linux_sandbox_bwrap_overridden = inherited.use_linux_sandbox_bwrap_overridden;
         }
         SandboxModeArg::ReadOnly => {
             state.sandbox_policy = SandboxPolicy::ReadOnly;
             state.sandbox_cwd = defaults.sandbox_cwd.clone();
             state.codex_linux_sandbox_exe = defaults.codex_linux_sandbox_exe.clone();
             state.use_linux_sandbox_bwrap = defaults.use_linux_sandbox_bwrap;
-            state.use_linux_sandbox_bwrap_overridden = defaults.use_linux_sandbox_bwrap_overridden;
         }
         SandboxModeArg::WorkspaceWrite => {
             state.sandbox_policy = SandboxPolicy::WorkspaceWrite {
@@ -241,14 +267,12 @@ fn apply_mode(
             state.sandbox_cwd = defaults.sandbox_cwd.clone();
             state.codex_linux_sandbox_exe = defaults.codex_linux_sandbox_exe.clone();
             state.use_linux_sandbox_bwrap = defaults.use_linux_sandbox_bwrap;
-            state.use_linux_sandbox_bwrap_overridden = defaults.use_linux_sandbox_bwrap_overridden;
         }
         SandboxModeArg::DangerFullAccess => {
             state.sandbox_policy = SandboxPolicy::DangerFullAccess;
             state.sandbox_cwd = defaults.sandbox_cwd.clone();
             state.codex_linux_sandbox_exe = defaults.codex_linux_sandbox_exe.clone();
             state.use_linux_sandbox_bwrap = defaults.use_linux_sandbox_bwrap;
-            state.use_linux_sandbox_bwrap_overridden = defaults.use_linux_sandbox_bwrap_overridden;
         }
     }
     Ok(())
@@ -327,12 +351,10 @@ fn apply_config_op(
         }
         SandboxConfigOperation::SetAllowLocalBinding(value) => {
             state.managed_network_policy.allow_local_binding = *value;
-            state.managed_network_policy.allow_local_binding_overridden = true;
             Ok(())
         }
         SandboxConfigOperation::SetUseLinuxSandboxBwrap(value) => {
             state.use_linux_sandbox_bwrap = *value;
-            state.use_linux_sandbox_bwrap_overridden = true;
             Ok(())
         }
     }

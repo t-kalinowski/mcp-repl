@@ -464,6 +464,9 @@ pub struct WorkerManager {
     backend: Backend,
     process: Option<WorkerProcess>,
     sandbox_plan: SandboxCliPlan,
+    allow_local_binding_override: Option<bool>,
+    use_linux_sandbox_bwrap_cli_override: Option<bool>,
+    use_linux_sandbox_bwrap_update_override: Option<bool>,
     inherited_sandbox_state: Option<SandboxState>,
     sandbox_defaults: SandboxState,
     sandbox_state: SandboxState,
@@ -490,7 +493,9 @@ impl WorkerManager {
         let sandbox_defaults = SandboxState::default();
         let mut inherited_state = sandbox_defaults.clone();
         let mut inherited_update_received = false;
+        let mut use_linux_sandbox_bwrap_update_override = None;
         if let Some(update) = crate::sandbox::initial_sandbox_state_update() {
+            use_linux_sandbox_bwrap_update_override = update.use_linux_sandbox_bwrap;
             inherited_state.apply_update(update);
             inherited_update_received = true;
         }
@@ -516,6 +521,9 @@ impl WorkerManager {
             exe_path,
             backend,
             process: None,
+            allow_local_binding_override: sandbox_plan.allow_local_binding_override(),
+            use_linux_sandbox_bwrap_cli_override: sandbox_plan.use_linux_sandbox_bwrap_override(),
+            use_linux_sandbox_bwrap_update_override,
             sandbox_plan,
             inherited_sandbox_state: inherited_update_received.then_some(inherited_state),
             sandbox_defaults,
@@ -1465,6 +1473,9 @@ impl WorkerManager {
         let update_for_log = serde_json::to_value(&update)
             .unwrap_or_else(|err| serde_json::json!({"serialize_error": err.to_string()}));
         crate::sandbox::log_sandbox_policy_update(&update.sandbox_policy);
+        if let Some(value) = update.use_linux_sandbox_bwrap {
+            self.use_linux_sandbox_bwrap_update_override = Some(value);
+        }
         let mut inherited_state = self
             .inherited_sandbox_state
             .clone()
@@ -1547,15 +1558,33 @@ impl WorkerManager {
         }
     }
 
+    fn effective_allow_local_binding_override(&self) -> Option<bool> {
+        self.allow_local_binding_override
+    }
+
+    fn effective_use_linux_sandbox_bwrap_override(&self) -> Option<bool> {
+        if self.use_linux_sandbox_bwrap_cli_override.is_some()
+            || self.use_linux_sandbox_bwrap_update_override.is_some()
+        {
+            Some(self.sandbox_state.use_linux_sandbox_bwrap)
+        } else {
+            None
+        }
+    }
+
     fn spawn_process(&mut self) -> Result<WorkerProcess, WorkerError> {
         self.reset_output_state(false);
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state, Some(false))
         });
+        let allow_local_binding_override = self.effective_allow_local_binding_override();
+        let use_linux_sandbox_bwrap_override = self.effective_use_linux_sandbox_bwrap_override();
         let process = WorkerProcess::spawn(
             self.backend,
             &self.exe_path,
             &self.sandbox_state,
+            allow_local_binding_override,
+            use_linux_sandbox_bwrap_override,
             self.output_timeline.clone(),
             self.guardrail.clone(),
         )?;
@@ -1594,10 +1623,14 @@ impl WorkerManager {
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state, Some(preserve_pager))
         });
+        let allow_local_binding_override = self.effective_allow_local_binding_override();
+        let use_linux_sandbox_bwrap_override = self.effective_use_linux_sandbox_bwrap_override();
         let process = WorkerProcess::spawn(
             self.backend,
             &self.exe_path,
             &self.sandbox_state,
+            allow_local_binding_override,
+            use_linux_sandbox_bwrap_override,
             self.output_timeline.clone(),
             self.guardrail.clone(),
         )?;
@@ -2583,6 +2616,8 @@ impl WorkerProcess {
         backend: Backend,
         exe_path: &Path,
         sandbox_state: &SandboxState,
+        allow_local_binding_override: Option<bool>,
+        use_linux_sandbox_bwrap_override: Option<bool>,
         output_timeline: OutputTimeline,
         guardrail: GuardrailShared,
     ) -> Result<Self, WorkerError> {
@@ -2600,12 +2635,18 @@ impl WorkerProcess {
             Backend::R => Self::spawn_r_worker(
                 exe_path,
                 sandbox_state,
+                allow_local_binding_override,
+                use_linux_sandbox_bwrap_override,
                 output_timeline.clone(),
                 &mut ipc_server,
             )?,
-            Backend::Python => {
-                Self::spawn_python_worker(sandbox_state, output_timeline.clone(), &mut ipc_server)?
-            }
+            Backend::Python => Self::spawn_python_worker(
+                sandbox_state,
+                allow_local_binding_override,
+                use_linux_sandbox_bwrap_override,
+                output_timeline.clone(),
+                &mut ipc_server,
+            )?,
         };
         #[allow(unused_mut)]
         let mut child = child;
@@ -2665,12 +2706,19 @@ impl WorkerProcess {
     fn spawn_r_worker(
         exe_path: &Path,
         sandbox_state: &SandboxState,
+        allow_local_binding_override: Option<bool>,
+        use_linux_sandbox_bwrap_override: Option<bool>,
         output_timeline: OutputTimeline,
         ipc_server: &mut IpcServer,
     ) -> Result<SpawnedWorker, WorkerError> {
-        let prepared =
-            prepare_worker_command(exe_path, vec![WORKER_MODE_ARG.to_string()], sandbox_state)
-                .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+        let prepared = prepare_worker_command(
+            exe_path,
+            vec![WORKER_MODE_ARG.to_string()],
+            sandbox_state,
+            allow_local_binding_override,
+            use_linux_sandbox_bwrap_override,
+        )
+        .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
         let session_tmpdir = prepared
             .env
             .get(R_SESSION_TMPDIR_ENV)
@@ -2765,12 +2813,16 @@ impl WorkerProcess {
 
     fn spawn_python_worker(
         sandbox_state: &SandboxState,
+        allow_local_binding_override: Option<bool>,
+        use_linux_sandbox_bwrap_override: Option<bool>,
         output_timeline: OutputTimeline,
         ipc_server: &mut IpcServer,
     ) -> Result<SpawnedWorker, WorkerError> {
         #[cfg(not(target_family = "unix"))]
         {
             let _ = sandbox_state;
+            let _ = allow_local_binding_override;
+            let _ = use_linux_sandbox_bwrap_override;
             let _ = output_timeline;
             let _ = ipc_server;
             Err(WorkerError::Protocol(
@@ -2780,9 +2832,14 @@ impl WorkerProcess {
         #[cfg(target_family = "unix")]
         {
             let python_program = Self::resolve_python_program();
-            let prepared =
-                prepare_worker_command(&python_program, Self::python_command_args(), sandbox_state)
-                    .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+            let prepared = prepare_worker_command(
+                &python_program,
+                Self::python_command_args(),
+                sandbox_state,
+                allow_local_binding_override,
+                use_linux_sandbox_bwrap_override,
+            )
+            .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
             let session_tmpdir = prepared
                 .env
                 .get(R_SESSION_TMPDIR_ENV)

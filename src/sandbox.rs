@@ -80,7 +80,6 @@ pub struct ManagedNetworkPolicy {
     pub allowed_domains: Vec<String>,
     pub denied_domains: Vec<String>,
     pub allow_local_binding: bool,
-    pub allow_local_binding_overridden: bool,
 }
 
 impl ManagedNetworkPolicy {
@@ -364,7 +363,6 @@ pub struct SandboxState {
     pub sandbox_cwd: PathBuf,
     pub codex_linux_sandbox_exe: Option<PathBuf>,
     pub use_linux_sandbox_bwrap: bool,
-    pub use_linux_sandbox_bwrap_overridden: bool,
     pub managed_network_policy: ManagedNetworkPolicy,
     pub session_temp_dir: PathBuf,
 }
@@ -448,7 +446,6 @@ impl SandboxState {
         }
         if let Some(use_bwrap) = update.use_linux_sandbox_bwrap {
             next.use_linux_sandbox_bwrap = use_bwrap;
-            next.use_linux_sandbox_bwrap_overridden = true;
         }
         let changed = next != *self;
         *self = next;
@@ -471,7 +468,6 @@ impl Default for SandboxState {
             sandbox_cwd,
             codex_linux_sandbox_exe,
             use_linux_sandbox_bwrap: false,
-            use_linux_sandbox_bwrap_overridden: false,
             managed_network_policy: ManagedNetworkPolicy::default(),
             session_temp_dir,
         }
@@ -492,6 +488,8 @@ pub fn prepare_worker_command(
     program: &Path,
     args: Vec<String>,
     state: &SandboxState,
+    allow_local_binding_override: Option<bool>,
+    _use_linux_sandbox_bwrap_override: Option<bool>,
 ) -> Result<PreparedCommand, SandboxError> {
     let mut env = HashMap::new();
     if !state.sandbox_policy.has_full_network_access() {
@@ -500,17 +498,17 @@ pub fn prepare_worker_command(
             "1".to_string(),
         );
     }
-    if state.managed_network_policy.allow_local_binding_overridden
-        || state.managed_network_policy.allow_local_binding
-    {
+    if let Some(value) = allow_local_binding_override {
         env.insert(
             ALLOW_LOCAL_BINDING_ENV_KEY.to_string(),
-            if state.managed_network_policy.allow_local_binding {
+            if value {
                 "1".to_string()
             } else {
                 "0".to_string()
             },
         );
+    } else if state.managed_network_policy.allow_local_binding {
+        env.insert(ALLOW_LOCAL_BINDING_ENV_KEY.to_string(), "1".to_string());
     }
     if state.managed_network_policy.allowed_domains.is_empty() {
         env.remove(MANAGED_ALLOWED_DOMAINS_ENV_KEY);
@@ -637,11 +635,9 @@ pub fn prepare_worker_command(
         }
         let policy = sanitize_linux_sandbox_policy(&policy);
         let command = build_command_vec(program, &args);
-        let use_bwrap_sandbox = if state.use_linux_sandbox_bwrap_overridden {
-            state.use_linux_sandbox_bwrap
-        } else {
+        let use_bwrap_sandbox = _use_linux_sandbox_bwrap_override.unwrap_or_else(|| {
             state.use_linux_sandbox_bwrap || env_var_truthy(LINUX_BWRAP_ENABLED_ENV)
-        };
+        });
         let sandbox_args = create_linux_sandbox_command_args(
             command,
             &policy,
@@ -2311,9 +2307,14 @@ mod tests {
         state.sandbox_policy = SandboxPolicy::DangerFullAccess;
         state.managed_network_policy.allow_local_binding = false;
 
-        let prepared =
-            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
-                .expect("prepare_worker_command should succeed");
+        let prepared = prepare_worker_command(
+            Path::new("/bin/echo"),
+            vec!["ok".to_string()],
+            &state,
+            None,
+            None,
+        )
+        .expect("prepare_worker_command should succeed");
         assert!(
             !prepared.env.contains_key(ALLOW_LOCAL_BINDING_ENV_KEY),
             "ALLOW_LOCAL_BINDING should be omitted when not explicitly enabled"
@@ -2325,11 +2326,15 @@ mod tests {
         let mut state = SandboxState::default();
         state.sandbox_policy = SandboxPolicy::DangerFullAccess;
         state.managed_network_policy.allow_local_binding = false;
-        state.managed_network_policy.allow_local_binding_overridden = true;
 
-        let prepared =
-            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
-                .expect("prepare_worker_command should succeed");
+        let prepared = prepare_worker_command(
+            Path::new("/bin/echo"),
+            vec!["ok".to_string()],
+            &state,
+            Some(false),
+            None,
+        )
+        .expect("prepare_worker_command should succeed");
         assert_eq!(
             prepared
                 .env
@@ -2356,11 +2361,15 @@ mod tests {
             exclude_slash_tmp: false,
         };
         state.use_linux_sandbox_bwrap = false;
-        state.use_linux_sandbox_bwrap_overridden = true;
 
-        let prepared =
-            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
-                .expect("prepare_worker_command should succeed");
+        let prepared = prepare_worker_command(
+            Path::new("/bin/echo"),
+            vec!["ok".to_string()],
+            &state,
+            None,
+            Some(false),
+        )
+        .expect("prepare_worker_command should succeed");
 
         match previous {
             Some(value) => unsafe {
