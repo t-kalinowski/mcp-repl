@@ -33,7 +33,7 @@ fn is_restart_transient_output(text: &str) -> bool {
 
 async fn spawn_interrupt_session() -> TestResult<common::McpTestSession> {
     common::spawn_server_with_args(vec![
-        "--sandbox-state".to_string(),
+        "--sandbox".to_string(),
         "danger-full-access".to_string(),
     ])
     .await

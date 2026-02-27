@@ -25,6 +25,7 @@ use self::timeouts::{
 
 use crate::backend::Backend;
 use crate::sandbox::{SANDBOX_STATE_CAPABILITY, SANDBOX_STATE_METHOD, SandboxStateUpdate};
+use crate::sandbox_cli::SandboxCliPlan;
 use crate::worker_process::{WorkerError, WorkerManager};
 
 #[cfg(test)]
@@ -41,9 +42,9 @@ struct SharedServer {
 }
 
 impl SharedServer {
-    fn new(backend: Backend) -> Result<Self, WorkerError> {
+    fn new(backend: Backend, sandbox_plan: SandboxCliPlan) -> Result<Self, WorkerError> {
         Ok(Self {
-            worker: Arc::new(Mutex::new(WorkerManager::new(backend)?)),
+            worker: Arc::new(Mutex::new(WorkerManager::new(backend, sandbox_plan)?)),
         })
     }
 
@@ -267,9 +268,9 @@ macro_rules! define_backend_tool_server {
 
         #[tool_router]
         impl $server_ty {
-            fn new(backend: Backend) -> Result<Self, WorkerError> {
+            fn new(backend: Backend, sandbox_plan: SandboxCliPlan) -> Result<Self, WorkerError> {
                 Ok(Self {
-                    shared: SharedServer::new(backend)?,
+                    shared: SharedServer::new(backend, sandbox_plan)?,
                     tool_router: Self::tool_router(),
                 })
             }
@@ -461,7 +462,10 @@ where
     result
 }
 
-pub async fn run(backend: Backend) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(
+    backend: Backend,
+    sandbox_plan: SandboxCliPlan,
+) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("starting mcp-repl server");
     crate::event_log::log(
         "server_run_begin",
@@ -471,11 +475,11 @@ pub async fn run(backend: Backend) -> Result<(), Box<dyn std::error::Error>> {
     );
     match backend {
         Backend::R => {
-            let service = RToolServer::new(backend)?;
+            let service = RToolServer::new(backend, sandbox_plan)?;
             run_backend_server(service.clone(), service.shared.worker()).await
         }
         Backend::Python => {
-            let service = PythonToolServer::new(backend)?;
+            let service = PythonToolServer::new(backend, sandbox_plan)?;
             run_backend_server(service.clone(), service.shared.worker()).await
         }
     }

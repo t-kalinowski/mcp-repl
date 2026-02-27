@@ -38,7 +38,7 @@ fn backend_unavailable(text: &str) -> bool {
 
 async fn spawn_manage_session() -> TestResult<common::McpTestSession> {
     common::spawn_server_with_args(vec![
-        "--sandbox-state".to_string(),
+        "--sandbox".to_string(),
         "danger-full-access".to_string(),
     ])
     .await

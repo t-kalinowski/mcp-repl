@@ -11,7 +11,7 @@ use toml_edit::{Array, DocumentMut, Item, Table, value};
 const CODEX_TOOL_TIMEOUT_SECS: i64 = 1_800;
 const CODEX_TOOL_TIMEOUT_COMMENT: &str =
     "\n# mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.\n";
-const CODEX_SANDBOX_INHERIT_COMMENT: &str = "\n# --sandbox-state inherit: use sandbox policy updates sent by Codex for this session.\n# If no update is sent, mcp-repl falls back to its internal default policy.\n";
+const CODEX_SANDBOX_INHERIT_COMMENT: &str = "\n# --sandbox inherit: use sandbox policy updates sent by Codex for this session.\n# If no update is sent, mcp-repl exits with an error.\n";
 pub const DEFAULT_R_SERVER_NAME: &str = "r_repl";
 pub const DEFAULT_PYTHON_SERVER_NAME: &str = "py_repl";
 
@@ -252,15 +252,53 @@ fn resolve_claude_config_path(root: &Path) -> PathBuf {
 }
 
 fn has_sandbox_config_arg(args: &[String]) -> bool {
-    args.iter().any(|arg| {
-        matches!(
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if matches!(
             arg.as_str(),
-            "--sandbox-state" | "--sandbox-mode" | "--sandbox-network-access" | "--writable-root"
-        ) || arg.starts_with("--sandbox-state=")
-            || arg.starts_with("--sandbox-mode=")
-            || arg.starts_with("--sandbox-network-access=")
-            || arg.starts_with("--writable-root=")
-    })
+            "--sandbox" | "--add-writable-root" | "--add-writeable-root" | "--add-allowed-domain"
+        ) || arg.starts_with("--sandbox=")
+            || arg.starts_with("--add-writable-root=")
+            || arg.starts_with("--add-writeable-root=")
+            || arg.starts_with("--add-allowed-domain=")
+        {
+            return true;
+        }
+        if arg == "--config" {
+            if iter
+                .next()
+                .is_some_and(|value| is_sandbox_config_override(value))
+            {
+                return true;
+            }
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--config=")
+            && is_sandbox_config_override(value)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_sandbox_config_override(raw: &str) -> bool {
+    let Some((key, _value)) = raw.split_once('=') else {
+        return false;
+    };
+    matches!(
+        key.trim(),
+        "sandbox_mode"
+            | "sandbox_workspace_write.network_access"
+            | "sandbox_workspace_write.writable_roots"
+            | "sandbox_workspace_write.exclude_tmpdir_env_var"
+            | "sandbox_workspace_write.exclude_slash_tmp"
+            | "permissions.network.allowed_domains"
+            | "permissions.network.denied_domains"
+            | "permissions.network.allow_local_binding"
+            | "features.use_linux_sandbox_bwrap"
+            | "use_linux_sandbox_bwrap"
+    )
 }
 
 fn has_interpreter_config_arg(args: &[String]) -> bool {
@@ -320,7 +358,7 @@ fn effective_interpreters(configured: &[InstallInterpreter]) -> Vec<InstallInter
 fn codex_install_args(base_args: &[String]) -> Vec<String> {
     let mut args = base_args.to_vec();
     if !has_sandbox_config_arg(base_args) {
-        args.push("--sandbox-state".to_string());
+        args.push("--sandbox".to_string());
         args.push("inherit".to_string());
     }
     args
@@ -329,7 +367,7 @@ fn codex_install_args(base_args: &[String]) -> Vec<String> {
 fn claude_install_args(base_args: &[String]) -> Vec<String> {
     let mut args = base_args.to_vec();
     if !has_sandbox_config_arg(base_args) {
-        args.push("--sandbox-state".to_string());
+        args.push("--sandbox".to_string());
         args.push("workspace-write".to_string());
     }
     args
@@ -338,14 +376,14 @@ fn claude_install_args(base_args: &[String]) -> Vec<String> {
 fn contains_sandbox_state_value(args: &[String], target: &str) -> bool {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
-        if arg == "--sandbox-state" {
+        if arg == "--sandbox" {
             if iter.next().is_some_and(|value| value == target) {
                 return true;
             }
             continue;
         }
         if arg
-            .strip_prefix("--sandbox-state=")
+            .strip_prefix("--sandbox=")
             .is_some_and(|value| value == target)
         {
             return true;
@@ -666,10 +704,10 @@ repl = { command = "/usr/local/bin/old-mcp-repl", args = ["--backend", "r"] }
             "repl",
             "/path/to/mcp-repl",
             &[
-                "--sandbox-mode".to_string(),
+                "--sandbox".to_string(),
                 "workspace-write".to_string(),
-                "--sandbox-network-access".to_string(),
-                "restricted".to_string(),
+                "--config".to_string(),
+                "sandbox_workspace_write.network_access=false".to_string(),
             ],
         )
         .expect("upsert codex");
@@ -772,13 +810,13 @@ name="demo"
             &config,
             "repl",
             "/path/to/mcp-repl",
-            &["--sandbox-state".to_string(), "inherit".to_string()],
+            &["--sandbox".to_string(), "inherit".to_string()],
         )
         .expect("upsert codex");
 
         let text = fs::read_to_string(config).expect("read config");
         assert!(
-            text.contains("--sandbox-state inherit: use sandbox policy updates sent by Codex"),
+            text.contains("--sandbox inherit: use sandbox policy updates sent by Codex"),
             "expected inherit comment in codex config"
         );
     }
@@ -791,20 +829,20 @@ name="demo"
             &config,
             "repl",
             "/path/to/mcp-repl",
-            &["--sandbox-state".to_string(), "inherit".to_string()],
+            &["--sandbox".to_string(), "inherit".to_string()],
         )
         .expect("upsert codex inherit");
         upsert_codex_mcp_server(
             &config,
             "repl",
             "/path/to/mcp-repl",
-            &["--sandbox-state".to_string(), "workspace-write".to_string()],
+            &["--sandbox".to_string(), "workspace-write".to_string()],
         )
         .expect("upsert codex workspace-write");
 
         let text = fs::read_to_string(config).expect("read config");
         assert!(
-            !text.contains("--sandbox-state inherit: use sandbox policy updates sent by Codex"),
+            !text.contains("--sandbox inherit: use sandbox policy updates sent by Codex"),
             "inherit-only comment should be removed when inherit is no longer configured"
         );
     }
@@ -817,7 +855,7 @@ name="demo"
             vec![
                 "--interpreter".to_string(),
                 "python".to_string(),
-                "--sandbox-state".to_string(),
+                "--sandbox".to_string(),
                 "inherit".to_string()
             ]
         );
@@ -831,7 +869,7 @@ name="demo"
             vec![
                 "--interpreter".to_string(),
                 "python".to_string(),
-                "--sandbox-state".to_string(),
+                "--sandbox".to_string(),
                 "workspace-write".to_string()
             ]
         );
@@ -840,8 +878,31 @@ name="demo"
     #[test]
     fn install_args_preserve_explicit_sandbox_config() {
         let base = vec![
-            "--sandbox-state".to_string(),
+            "--sandbox".to_string(),
             "read-only".to_string(),
+            "--interpreter".to_string(),
+            "python".to_string(),
+        ];
+        assert_eq!(codex_install_args(&base), base);
+        assert_eq!(claude_install_args(&base), base);
+    }
+
+    #[test]
+    fn install_args_preserve_explicit_sandbox_config_via_config_flag() {
+        let base = vec![
+            "--config".to_string(),
+            "sandbox_mode=read-only".to_string(),
+            "--interpreter".to_string(),
+            "python".to_string(),
+        ];
+        assert_eq!(codex_install_args(&base), base);
+        assert_eq!(claude_install_args(&base), base);
+    }
+
+    #[test]
+    fn install_args_preserve_explicit_sandbox_config_via_config_equals() {
+        let base = vec![
+            "--config=sandbox_workspace_write.network_access=true".to_string(),
             "--interpreter".to_string(),
             "python".to_string(),
         ];
@@ -852,13 +913,13 @@ name="demo"
     #[test]
     fn with_interpreter_arg_adds_python_interpreter_when_missing() {
         let args = with_interpreter_arg(
-            &["--sandbox-state".to_string(), "workspace-write".to_string()],
+            &["--sandbox".to_string(), "workspace-write".to_string()],
             InstallInterpreter::Python,
         );
         assert_eq!(
             args,
             vec![
-                "--sandbox-state".to_string(),
+                "--sandbox".to_string(),
                 "workspace-write".to_string(),
                 "--interpreter".to_string(),
                 "python".to_string(),
@@ -870,7 +931,7 @@ name="demo"
     fn with_interpreter_arg_preserves_existing_python_interpreter() {
         let args = with_interpreter_arg(
             &[
-                "--sandbox-state".to_string(),
+                "--sandbox".to_string(),
                 "workspace-write".to_string(),
                 "--interpreter".to_string(),
                 "python".to_string(),
@@ -880,7 +941,7 @@ name="demo"
         assert_eq!(
             args,
             vec![
-                "--sandbox-state".to_string(),
+                "--sandbox".to_string(),
                 "workspace-write".to_string(),
                 "--interpreter".to_string(),
                 "python".to_string(),
@@ -925,7 +986,7 @@ name="demo"
             &[
                 "--interpreter".to_string(),
                 "python".to_string(),
-                "--sandbox-state".to_string(),
+                "--sandbox".to_string(),
                 "workspace-write".to_string(),
             ],
         )
@@ -946,8 +1007,8 @@ name="demo"
         );
         assert_eq!(
             server["args"][2].as_str(),
-            Some("--sandbox-state"),
-            "expected explicit sandbox-state arg in claude config"
+            Some("--sandbox"),
+            "expected explicit sandbox arg in claude config"
         );
         assert_eq!(
             server["args"][3].as_str(),
@@ -959,12 +1020,12 @@ name="demo"
             "expected related interpreter args to share one line"
         );
         assert!(
-            text.contains("\"--sandbox-state\", \"workspace-write\""),
+            text.contains("\"--sandbox\", \"workspace-write\""),
             "expected related sandbox args to share one line"
         );
         assert!(
             server.get("_comment_sandbox_state").is_none(),
-            "did not expect sandbox-state comment field in claude config"
+            "did not expect sandbox comment field in claude config"
         );
     }
 

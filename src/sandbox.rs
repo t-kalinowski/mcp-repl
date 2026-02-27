@@ -17,6 +17,8 @@ use tempfile::Builder;
 
 pub const SANDBOX_STATE_CAPABILITY: &str = "codex/sandbox-state";
 pub const SANDBOX_STATE_METHOD: &str = "codex/sandbox-state/update";
+pub const MANAGED_ALLOWED_DOMAINS_ENV_KEY: &str = "MCP_CONSOLE_ALLOWED_DOMAINS";
+pub const MANAGED_DENIED_DOMAINS_ENV_KEY: &str = "MCP_CONSOLE_DENIED_DOMAINS";
 #[cfg(target_os = "macos")]
 pub const CODEX_SANDBOX_ENV_VAR: &str = "CODEX_SANDBOX";
 pub const CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR: &str = "CODEX_SANDBOX_NETWORK_DISABLED";
@@ -70,6 +72,19 @@ pub enum NetworkAccess {
 impl NetworkAccess {
     pub fn is_enabled(self) -> bool {
         matches!(self, NetworkAccess::Enabled)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ManagedNetworkPolicy {
+    pub allowed_domains: Vec<String>,
+    pub denied_domains: Vec<String>,
+    pub allow_local_binding: bool,
+}
+
+impl ManagedNetworkPolicy {
+    pub fn has_domain_restrictions(&self) -> bool {
+        !self.allowed_domains.is_empty() || !self.denied_domains.is_empty()
     }
 }
 
@@ -347,6 +362,8 @@ pub struct SandboxState {
     pub sandbox_policy: SandboxPolicy,
     pub sandbox_cwd: PathBuf,
     pub codex_linux_sandbox_exe: Option<PathBuf>,
+    pub use_linux_sandbox_bwrap: bool,
+    pub managed_network_policy: ManagedNetworkPolicy,
     pub session_temp_dir: PathBuf,
 }
 
@@ -402,6 +419,8 @@ pub struct SandboxStateUpdate {
     pub sandbox_cwd: Option<PathBuf>,
     #[serde(default)]
     pub codex_linux_sandbox_exe: Option<PathBuf>,
+    #[serde(default)]
+    pub use_linux_sandbox_bwrap: Option<bool>,
 }
 
 pub fn initial_sandbox_state_update() -> Option<SandboxStateUpdate> {
@@ -425,6 +444,9 @@ impl SandboxState {
         if let Some(exe) = update.codex_linux_sandbox_exe {
             next.codex_linux_sandbox_exe = Some(exe);
         }
+        if let Some(use_bwrap) = update.use_linux_sandbox_bwrap {
+            next.use_linux_sandbox_bwrap = use_bwrap;
+        }
         let changed = next != *self;
         *self = next;
         changed
@@ -445,6 +467,8 @@ impl Default for SandboxState {
             },
             sandbox_cwd,
             codex_linux_sandbox_exe,
+            use_linux_sandbox_bwrap: false,
+            managed_network_policy: ManagedNetworkPolicy::default(),
             session_temp_dir,
         }
     }
@@ -471,6 +495,33 @@ pub fn prepare_worker_command(
             CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR.to_string(),
             "1".to_string(),
         );
+    }
+    env.insert(
+        ALLOW_LOCAL_BINDING_ENV_KEY.to_string(),
+        if state.managed_network_policy.allow_local_binding {
+            "1".to_string()
+        } else {
+            "0".to_string()
+        },
+    );
+    if state.managed_network_policy.allowed_domains.is_empty() {
+        env.remove(MANAGED_ALLOWED_DOMAINS_ENV_KEY);
+    } else {
+        env.insert(
+            MANAGED_ALLOWED_DOMAINS_ENV_KEY.to_string(),
+            state.managed_network_policy.allowed_domains.join(","),
+        );
+    }
+    if state.managed_network_policy.denied_domains.is_empty() {
+        env.remove(MANAGED_DENIED_DOMAINS_ENV_KEY);
+    } else {
+        env.insert(
+            MANAGED_DENIED_DOMAINS_ENV_KEY.to_string(),
+            state.managed_network_policy.denied_domains.join(","),
+        );
+    }
+    if state.managed_network_policy.has_domain_restrictions() {
+        env.insert(MANAGED_NETWORK_ENV_KEY.to_string(), "1".to_string());
     }
 
     prepare_session_temp_dir(&state.session_temp_dir)?;
@@ -510,10 +561,23 @@ pub fn prepare_worker_command(
             return Err(SandboxError::SeatbeltMissing);
         }
 
+        let mut network_env = sandbox_network_env_snapshot();
+        for key in [
+            ALLOW_LOCAL_BINDING_ENV_KEY,
+            MANAGED_NETWORK_ENV_KEY,
+            MANAGED_ALLOWED_DOMAINS_ENV_KEY,
+            MANAGED_DENIED_DOMAINS_ENV_KEY,
+        ] {
+            if let Some(value) = env.get(key) {
+                network_env.insert(key.to_string(), value.clone());
+            }
+        }
         let command = build_command_vec(program, &args);
         let mut seatbelt_args = create_seatbelt_command_args(
             command,
             &state.sandbox_policy,
+            &state.managed_network_policy,
+            &network_env,
             &state.sandbox_cwd,
             &state.session_temp_dir,
         );
@@ -569,7 +633,7 @@ pub fn prepare_worker_command(
             command,
             &policy,
             &policy_cwd,
-            env_var_truthy(LINUX_BWRAP_ENABLED_ENV),
+            state.use_linux_sandbox_bwrap || env_var_truthy(LINUX_BWRAP_ENABLED_ENV),
             env_var_truthy(LINUX_BWRAP_NO_PROC_ENV),
         );
         let sandbox_program = state
@@ -760,9 +824,7 @@ const PROXY_URL_ENV_KEYS: [&str; 6] = [
     "https_proxy",
     "all_proxy",
 ];
-#[cfg(target_os = "macos")]
 const MANAGED_NETWORK_ENV_KEY: &str = "MCP_CONSOLE_MANAGED_NETWORK";
-#[cfg(target_os = "macos")]
 const ALLOW_LOCAL_BINDING_ENV_KEY: &str = "ALLOW_LOCAL_BINDING";
 
 #[cfg(target_os = "macos")]
@@ -770,7 +832,6 @@ const ALLOW_LOCAL_BINDING_ENV_KEY: &str = "ALLOW_LOCAL_BINDING";
 struct ProxyPolicyInputs {
     ports: Vec<u16>,
     has_proxy_config: bool,
-    allow_local_binding: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -844,7 +905,6 @@ fn proxy_policy_inputs_from_env(env: &HashMap<String, String>) -> ProxyPolicyInp
     ProxyPolicyInputs {
         ports: proxy_loopback_ports_from_env(env),
         has_proxy_config: has_proxy_url_env_vars(env),
-        allow_local_binding: env_bool(env.get(ALLOW_LOCAL_BINDING_ENV_KEY).map(String::as_str)),
     }
 }
 
@@ -857,6 +917,7 @@ fn managed_network_enabled(env: &HashMap<String, String>) -> bool {
 fn dynamic_network_policy(
     sandbox_policy: &SandboxPolicy,
     enforce_managed_network: bool,
+    allow_local_binding: bool,
     proxy: &ProxyPolicyInputs,
 ) -> String {
     if !sandbox_policy.has_full_network_access() {
@@ -866,7 +927,7 @@ fn dynamic_network_policy(
     if !proxy.ports.is_empty() {
         let mut policy =
             String::from("; allow outbound access only to configured loopback proxy endpoints\n");
-        if proxy.allow_local_binding {
+        if allow_local_binding {
             policy.push_str("; allow localhost-only binding and loopback traffic\n");
             policy.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
             policy.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
@@ -907,6 +968,8 @@ fn sandbox_network_env_snapshot() -> HashMap<String, String> {
 fn create_seatbelt_command_args(
     command: Vec<String>,
     sandbox_policy: &SandboxPolicy,
+    managed_network_policy: &ManagedNetworkPolicy,
+    network_env: &HashMap<String, String>,
     sandbox_policy_cwd: &Path,
     session_temp_dir: &Path,
 ) -> Vec<String> {
@@ -1009,10 +1072,21 @@ fn create_seatbelt_command_args(
         ""
     };
 
-    let network_env = sandbox_network_env_snapshot();
-    let proxy = proxy_policy_inputs_from_env(&network_env);
-    let enforce_managed_network = managed_network_enabled(&network_env);
-    let network_policy = dynamic_network_policy(sandbox_policy, enforce_managed_network, &proxy);
+    let proxy = proxy_policy_inputs_from_env(network_env);
+    let allow_local_binding = managed_network_policy.allow_local_binding
+        || env_bool(
+            network_env
+                .get(ALLOW_LOCAL_BINDING_ENV_KEY)
+                .map(String::as_str),
+        );
+    let enforce_managed_network =
+        managed_network_enabled(network_env) || managed_network_policy.has_domain_restrictions();
+    let network_policy = dynamic_network_policy(
+        sandbox_policy,
+        enforce_managed_network,
+        allow_local_binding,
+        &proxy,
+    );
 
     let full_policy = format!(
         "{MACOS_SEATBELT_BASE_POLICY}\n{file_read_policy}\n{file_write_policy}\n{network_policy}"
@@ -2167,7 +2241,7 @@ mod tests {
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
         };
-        let rendered = dynamic_network_policy(&policy, false, &proxy);
+        let rendered = dynamic_network_policy(&policy, false, false, &proxy);
         assert!(rendered.is_empty(), "expected fail-closed policy");
     }
 
@@ -2183,7 +2257,7 @@ mod tests {
             exclude_slash_tmp: false,
         };
 
-        let rendered = dynamic_network_policy(&policy, true, &proxy);
+        let rendered = dynamic_network_policy(&policy, true, false, &proxy);
         assert!(rendered.is_empty(), "expected fail-closed policy");
     }
 
@@ -2203,7 +2277,7 @@ mod tests {
             exclude_slash_tmp: false,
         };
 
-        let rendered = dynamic_network_policy(&policy, false, &proxy);
+        let rendered = dynamic_network_policy(&policy, false, false, &proxy);
         assert!(rendered.contains("localhost:8080"));
         assert!(!rendered.contains("(allow network-inbound)\n"));
     }

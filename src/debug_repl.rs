@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use crate::backend::Backend;
 use crate::pager;
+use crate::sandbox_cli::SandboxCliPlan;
 use crate::worker_process::{WorkerError, WorkerManager};
 use crate::worker_protocol::{TextStream, WorkerContent, WorkerReply};
 
@@ -16,7 +17,10 @@ const DEBUG_REPL_PAGE_CHARS: u64 = 300;
 const INITIAL_PROMPT_WAIT: Duration = Duration::from_secs(5);
 const INITIAL_PROMPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-pub(crate) fn run(backend: Backend) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run(
+    backend: Backend,
+    sandbox_plan: SandboxCliPlan,
+) -> Result<(), Box<dyn std::error::Error>> {
     ensure_debug_repl_page_size();
     let image_support = detect_image_support();
     eprintln!(
@@ -29,7 +33,7 @@ pub(crate) fn run(backend: Backend) -> Result<(), Box<dyn std::error::Error>> {
     let mut stderr = io::stderr();
     let server_timeout = apply_safety_margin(DEFAULT_WRITE_STDIN_TIMEOUT);
 
-    let mut worker = WorkerManager::new(backend)?;
+    let mut worker = WorkerManager::new(backend, sandbox_plan)?;
     worker.warm_start()?;
     let reply = wait_for_initial_prompt(&mut worker, server_timeout)?;
     render_reply(reply, &mut stdout, &mut stderr, image_support)?;

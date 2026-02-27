@@ -326,8 +326,9 @@ cat("MARKER_EXISTS=", file.exists({marker}), "\n", sep = "")
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 async fn spawn_server_with_sandbox_state(state: String) -> TestResult<common::McpTestSession> {
+    let args = sandbox_args_from_state(&state)?;
     common::spawn_server_with_args_env_and_pager_page_chars(
-        vec!["--sandbox-state".to_string(), state],
+        args,
         Vec::new(),
         SANDBOX_PAGER_PAGE_CHARS,
     )
@@ -339,12 +340,55 @@ async fn spawn_server_with_sandbox_state_and_env(
     state: String,
     env: Vec<(String, String)>,
 ) -> TestResult<common::McpTestSession> {
-    common::spawn_server_with_args_env_and_pager_page_chars(
-        vec!["--sandbox-state".to_string(), state],
-        env,
-        SANDBOX_PAGER_PAGE_CHARS,
-    )
-    .await
+    let args = sandbox_args_from_state(&state)?;
+    common::spawn_server_with_args_env_and_pager_page_chars(args, env, SANDBOX_PAGER_PAGE_CHARS)
+        .await
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn sandbox_args_from_state(state: &str) -> TestResult<Vec<String>> {
+    let parsed: serde_json::Value = serde_json::from_str(state)?;
+    let policy = parsed
+        .get("sandboxPolicy")
+        .and_then(serde_json::Value::as_object)
+        .ok_or("missing sandboxPolicy object in test fixture")?;
+    let policy_type = policy
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or("missing sandboxPolicy.type in test fixture")?;
+
+    let mut args = vec!["--sandbox".to_string(), policy_type.to_string()];
+    match policy_type {
+        "read-only" | "danger-full-access" => {}
+        "workspace-write" => {
+            if let Some(network_access) = policy
+                .get("network_access")
+                .and_then(serde_json::Value::as_bool)
+            {
+                args.push("--config".to_string());
+                args.push(format!(
+                    "sandbox_workspace_write.network_access={network_access}"
+                ));
+            }
+
+            if let Some(roots) = policy
+                .get("writable_roots")
+                .and_then(serde_json::Value::as_array)
+            {
+                for root in roots {
+                    let root = root.as_str().ok_or(
+                        "sandboxPolicy.writable_roots must be an array of strings in test fixture",
+                    )?;
+                    args.push("--add-writable-root".to_string());
+                    args.push(root.to_string());
+                }
+            }
+        }
+        other => {
+            return Err(format!("unsupported sandboxPolicy.type in test fixture: {other}").into());
+        }
+    }
+    Ok(args)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]

@@ -48,7 +48,7 @@ async fn spawn_behavior_session() -> TestResult<common::McpTestSession> {
     #[cfg(target_os = "windows")]
     {
         common::spawn_server_with_args(vec![
-            "--sandbox-state".to_string(),
+            "--sandbox".to_string(),
             "danger-full-access".to_string(),
         ])
         .await

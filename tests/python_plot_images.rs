@@ -319,7 +319,7 @@ async fn spawn_python_server_with_pager_page_chars(
         vec![
             "--backend".to_string(),
             "python".to_string(),
-            "--sandbox-state".to_string(),
+            "--sandbox".to_string(),
             "danger-full-access".to_string(),
         ],
         Vec::new(),
