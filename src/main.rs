@@ -25,6 +25,8 @@ use std::path::PathBuf;
 use crate::backend::{Backend, backend_from_env};
 use crate::sandbox::{INITIAL_SANDBOX_STATE_ENV, SandboxPolicy, SandboxStateUpdate};
 
+const SANDBOX_STATE_INHERIT: &str = "inherit";
+
 enum CliCommand {
     RunServer(CliOptions),
     Install(install::InstallOptions),
@@ -116,34 +118,14 @@ fn ignore_sigpipe() {
 
 fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
     let mut parser = ArgParser::new();
-    if let Some(arg) = parser.peek() {
-        match arg {
-            "install" => {
-                parser.next();
-                return Ok(CliCommand::Install(parse_install_args(
-                    &mut parser,
-                    Vec::new(),
-                    true,
-                )?));
-            }
-            "install-codex" => {
-                parser.next();
-                return Ok(CliCommand::Install(parse_install_args(
-                    &mut parser,
-                    vec![install::InstallTarget::Codex],
-                    false,
-                )?));
-            }
-            "install-claude" => {
-                parser.next();
-                return Ok(CliCommand::Install(parse_install_args(
-                    &mut parser,
-                    vec![install::InstallTarget::Claude],
-                    false,
-                )?));
-            }
-            _ => {}
-        }
+    if let Some(arg) = parser.peek()
+        && arg == "install"
+    {
+        parser.next();
+        return Ok(CliCommand::Install(parse_install_args(
+            &mut parser,
+            Vec::new(),
+        )?));
     }
 
     let mut sandbox_args = SandboxCliArgs::default();
@@ -207,23 +189,13 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
                     .writable_roots
                     .push(parse_writable_root(value)?);
             }
-            "--backend" => {
-                let value = parser.next_value("--backend")?;
-                backend = Some(Backend::parse(&value).map_err(|err| err.to_string())?);
-            }
-            _ if arg.starts_with("--backend=") => {
-                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
-                if value.is_empty() {
-                    return Err("missing value for --backend".into());
-                }
-                backend = Some(Backend::parse(value).map_err(|err| err.to_string())?);
-            }
             "--debug-repl" => {
                 debug_repl = true;
             }
-            _ => {
-                return Err(format!("unknown argument: {arg}").into());
-            }
+            _ => match parse_backend_arg(&arg, &mut parser)? {
+                Some(parsed_backend) => backend = Some(parsed_backend),
+                None => return Err(format!("unknown argument: {arg}").into()),
+            },
         }
     }
 
@@ -234,6 +206,33 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
         debug_repl,
         backend: backend.unwrap_or(Backend::R),
     }))
+}
+
+fn parse_backend_arg(
+    arg: &str,
+    parser: &mut ArgParser,
+) -> Result<Option<Backend>, Box<dyn std::error::Error>> {
+    if arg == "--interpreter" {
+        let value = parser.next_value("--interpreter")?;
+        return Ok(Some(Backend::parse(&value).map_err(|err| err.to_string())?));
+    }
+    if arg == "--backend" {
+        let value = parser.next_value("--backend")?;
+        return Ok(Some(Backend::parse(&value).map_err(|err| err.to_string())?));
+    }
+    if let Some(value) = arg.strip_prefix("--interpreter=") {
+        if value.is_empty() {
+            return Err("missing value for --interpreter".into());
+        }
+        return Ok(Some(Backend::parse(value).map_err(|err| err.to_string())?));
+    }
+    if let Some(value) = arg.strip_prefix("--backend=") {
+        if value.is_empty() {
+            return Err("missing value for --backend".into());
+        }
+        return Ok(Some(Backend::parse(value).map_err(|err| err.to_string())?));
+    }
+    Ok(None)
 }
 
 struct ArgParser {
@@ -268,11 +267,12 @@ impl ArgParser {
 fn parse_install_args(
     parser: &mut ArgParser,
     mut targets: Vec<install::InstallTarget>,
-    allow_positional_targets: bool,
 ) -> Result<install::InstallOptions, Box<dyn std::error::Error>> {
-    let mut server_name = "r_repl".to_string();
+    let mut server_name = install::DEFAULT_R_SERVER_NAME.to_string();
+    let mut server_name_explicit = false;
     let mut command = None;
     let mut args = Vec::new();
+    let mut interpreters: Vec<install::InstallInterpreter> = Vec::new();
 
     while let Some(arg) = parser.next() {
         match arg.as_str() {
@@ -280,8 +280,31 @@ fn parse_install_args(
                 print_install_usage();
                 std::process::exit(0);
             }
+            "--interpreter" => {
+                let value = parser.next_value("--interpreter")?;
+                parse_install_interpreters_value(&value, &mut interpreters)?;
+            }
+            _ if arg.starts_with("--interpreter=") => {
+                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
+                if value.is_empty() {
+                    return Err("missing value for --interpreter".into());
+                }
+                parse_install_interpreters_value(value, &mut interpreters)?;
+            }
+            "--client" => {
+                let value = parser.next_value("--client")?;
+                parse_install_targets_value(&value, &mut targets)?;
+            }
+            _ if arg.starts_with("--client=") => {
+                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
+                if value.is_empty() {
+                    return Err("missing value for --client".into());
+                }
+                parse_install_targets_value(value, &mut targets)?;
+            }
             "--server-name" => {
                 server_name = parser.next_value("--server-name")?;
+                server_name_explicit = true;
             }
             _ if arg.starts_with("--server-name=") => {
                 let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
@@ -289,6 +312,7 @@ fn parse_install_args(
                     return Err("missing value for --server-name".into());
                 }
                 server_name = value.to_string();
+                server_name_explicit = true;
             }
             "--command" => {
                 command = Some(parser.next_value("--command")?);
@@ -314,9 +338,6 @@ fn parse_install_args(
                 if let Some(flag) = arg.strip_prefix('-') {
                     return Err(format!("unknown install option: -{flag}").into());
                 }
-                if !allow_positional_targets {
-                    return Err(format!("unexpected install argument: {arg}").into());
-                }
                 targets.push(
                     install::InstallTarget::parse(&arg)
                         .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?,
@@ -327,14 +348,53 @@ fn parse_install_args(
 
     Ok(install::InstallOptions {
         targets,
+        interpreters,
         server_name,
+        server_name_explicit,
         command,
         args,
     })
 }
 
+fn parse_install_interpreters_value(
+    raw: &str,
+    interpreters: &mut Vec<install::InstallInterpreter>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            return Err("empty --interpreter value (expected r|python)".into());
+        }
+        interpreters.push(
+            install::InstallInterpreter::parse(trimmed)
+                .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?,
+        );
+    }
+    Ok(())
+}
+
+fn parse_install_targets_value(
+    raw: &str,
+    targets: &mut Vec<install::InstallTarget>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for part in raw.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            return Err("empty --client value (expected codex|claude)".into());
+        }
+        targets.push(
+            install::InstallTarget::parse(trimmed)
+                .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?,
+        );
+    }
+    Ok(())
+}
+
 fn sandbox_state_arg(raw: String) -> Result<String, Box<dyn std::error::Error>> {
     let trimmed = raw.trim();
+    if trimmed == SANDBOX_STATE_INHERIT {
+        return Ok(SANDBOX_STATE_INHERIT.to_string());
+    }
     if trimmed.starts_with('{') {
         let parsed: SandboxStateUpdate = serde_json::from_str(trimmed)?;
         let payload = serde_json::to_string(&parsed)?;
@@ -352,7 +412,7 @@ fn sandbox_state_arg(raw: String) -> Result<String, Box<dyn std::error::Error>> 
         "danger-full-access" => SandboxPolicy::DangerFullAccess,
         _ => {
             return Err(format!(
-                "invalid --sandbox-state value: {trimmed} (expected JSON or read-only|workspace-write|danger-full-access)"
+                "invalid --sandbox-state value: {trimmed} (expected inherit, JSON, or read-only|workspace-write|danger-full-access)"
             )
             .into());
         }
@@ -399,6 +459,9 @@ fn sandbox_state_from_cli_args(
         );
     }
     if let Some(state) = args.sandbox_state {
+        if state == SANDBOX_STATE_INHERIT {
+            return Ok(None);
+        }
         return Ok(Some(state));
     }
     if args.mode.is_none() && args.network_access.is_none() && args.writable_roots.is_empty() {
@@ -454,35 +517,69 @@ fn sandbox_state_from_cli_args(
 fn print_usage() {
     println!(
         "Usage:\n\
-mcp-repl [--debug-repl] [--backend <r|python>] [--sandbox-mode <mode>] [--sandbox-network-access <restricted|enabled>] [--writable-root <abs-path>]...\n\
-mcp-repl install [codex] [claude] [--server-name <name>] [--command <path>] [--arg <value>]...\n\
-mcp-repl install-codex [--server-name <name>] [--command <path>] [--arg <value>]...\n\
-mcp-repl install-claude [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
+mcp-repl [--debug-repl] [--interpreter <r|python>] [--sandbox-mode <mode>] [--sandbox-network-access <restricted|enabled>] [--writable-root <abs-path>]...\n\
+mcp-repl install [codex] [claude] [--client <codex|claude>]... [--interpreter <r|python>[,r|python]...]... [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
 --debug-repl: run an interactive debug REPL over stdio\n\
---backend: choose REPL backend (default: r; env MCP_REPL_BACKEND)\n\
+--interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER, compatibility env MCP_REPL_BACKEND)\n\
+--backend: compatibility alias for --interpreter\n\
+--sandbox-state: inherit | JSON | read-only | workspace-write | danger-full-access\n\
 --sandbox-mode: read-only | workspace-write | danger-full-access (default: workspace-write when sandbox flags are provided)\n\
 --sandbox-network-access: restricted | enabled (workspace-write only; default: restricted)\n\
 --writable-root: additional absolute writable path (repeatable; workspace-write only)\n\
-install: update MCP config for existing agent homes only (does not create ~/.codex or ~/.claude)"
+install: update MCP config for existing agent homes only (does not create ~/.codex or ~/.claude)\n\
+install defaults to the full interpreter grid for each selected client (currently r_repl + py_repl)"
     );
 }
 
 fn print_install_usage() {
     println!(
         "Usage:\n\
-mcp-repl install [codex] [claude] [--server-name <name>] [--command <path>] [--arg <value>]...\n\
-mcp-repl install-codex [--server-name <name>] [--command <path>] [--arg <value>]...\n\
-mcp-repl install-claude [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
+mcp-repl install [codex] [claude] [--client <codex|claude>]... [--interpreter <r|python>[,r|python]...]... [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
 If no target is specified for `install`, all existing agent homes are used:\n\
 - codex: $CODEX_HOME or ~/.codex\n\
 - claude: ~/.claude\n\
-Missing homes are not created."
+Missing homes are not created.\n\
+If no --interpreter is specified, install uses the full interpreter grid for each selected client."
     );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_backend_arg_accepts_interpreter_flag_forms() {
+        let mut parser = ArgParser {
+            args: vec!["python".to_string()],
+            index: 0,
+        };
+        let parsed = parse_backend_arg("--interpreter", &mut parser).expect("parse flag");
+        assert_eq!(parsed, Some(Backend::Python));
+
+        let mut parser = ArgParser {
+            args: Vec::new(),
+            index: 0,
+        };
+        let parsed = parse_backend_arg("--interpreter=python", &mut parser).expect("parse flag");
+        assert_eq!(parsed, Some(Backend::Python));
+    }
+
+    #[test]
+    fn parse_backend_arg_accepts_backend_compatibility_forms() {
+        let mut parser = ArgParser {
+            args: vec!["python".to_string()],
+            index: 0,
+        };
+        let parsed = parse_backend_arg("--backend", &mut parser).expect("parse flag");
+        assert_eq!(parsed, Some(Backend::Python));
+
+        let mut parser = ArgParser {
+            args: Vec::new(),
+            index: 0,
+        };
+        let parsed = parse_backend_arg("--backend=python", &mut parser).expect("parse flag");
+        assert_eq!(parsed, Some(Backend::Python));
+    }
 
     #[test]
     fn parse_sandbox_network_access_accepts_expected_values() {
@@ -496,8 +593,89 @@ mod tests {
             args: Vec::new(),
             index: 0,
         };
-        let parsed = parse_install_args(&mut parser, Vec::new(), true).expect("parse install args");
-        assert_eq!(parsed.server_name, "r_repl");
+        let parsed = parse_install_args(&mut parser, Vec::new()).expect("parse install args");
+        assert_eq!(parsed.server_name, install::DEFAULT_R_SERVER_NAME);
+        assert!(!parsed.server_name_explicit);
+        assert!(parsed.interpreters.is_empty());
+    }
+
+    #[test]
+    fn parse_install_args_accepts_repeatable_interpreters() {
+        let mut parser = ArgParser {
+            args: vec![
+                "--interpreter".to_string(),
+                "r".to_string(),
+                "--interpreter".to_string(),
+                "python".to_string(),
+            ],
+            index: 0,
+        };
+        let parsed = parse_install_args(&mut parser, Vec::new()).expect("parse install args");
+        assert_eq!(
+            parsed.interpreters,
+            vec![
+                install::InstallInterpreter::R,
+                install::InstallInterpreter::Python
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_install_args_accepts_comma_separated_interpreters() {
+        let mut parser = ArgParser {
+            args: vec!["--interpreter=python,r".to_string()],
+            index: 0,
+        };
+        let parsed = parse_install_args(&mut parser, Vec::new()).expect("parse install args");
+        assert_eq!(
+            parsed.interpreters,
+            vec![
+                install::InstallInterpreter::Python,
+                install::InstallInterpreter::R
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_install_args_accepts_client_flag() {
+        let mut parser = ArgParser {
+            args: vec!["--client".to_string(), "codex,claude".to_string()],
+            index: 0,
+        };
+        let parsed = parse_install_args(&mut parser, Vec::new()).expect("parse install args");
+        assert_eq!(
+            parsed.targets,
+            vec![
+                install::InstallTarget::Codex,
+                install::InstallTarget::Claude
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_install_interpreters_value_rejects_empty_values() {
+        let mut interpreters = Vec::new();
+        let err = parse_install_interpreters_value("", &mut interpreters).expect_err("empty value");
+        assert!(
+            err.to_string().contains("empty --interpreter value"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_install_targets_value_rejects_empty_values() {
+        let mut targets = Vec::new();
+        let err = parse_install_targets_value(",", &mut targets).expect_err("empty value");
+        assert!(
+            err.to_string().contains("empty --client value"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn sandbox_state_arg_accepts_inherit() {
+        let parsed = sandbox_state_arg("inherit".to_string()).expect("sandbox state");
+        assert_eq!(parsed, "inherit");
     }
 
     #[test]
@@ -526,6 +704,16 @@ mod tests {
             }
             other => panic!("expected workspace-write policy, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn sandbox_state_from_cli_args_inherit_returns_none() {
+        let parsed = sandbox_state_from_cli_args(SandboxCliArgs {
+            sandbox_state: Some("inherit".to_string()),
+            ..Default::default()
+        })
+        .expect("sandbox state");
+        assert!(parsed.is_none());
     }
 
     #[test]

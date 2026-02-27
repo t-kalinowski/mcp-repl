@@ -2,7 +2,8 @@
 
 `mcp-repl` is an MCP server that exposes a long-lived interactive REPL runtime over stdio.
 
-It is backend-agnostic in design. The default backend is R, with an opt-in Python backend (`--backend python`).
+It currently supports R and Python interpreters.
+
 Session state persists across calls, so agents can iterate in place, inspect intermediate values, debug, and read docs in-band.
 
 ## Why use it
@@ -69,74 +70,101 @@ Point your MCP client at the binary (either via `PATH` or by using an explicit p
 You can auto-install into existing agent config files:
 
 ```sh
-# update existing ~/.codex/config.toml
-mcp-repl install-codex
-
-# update existing ~/.claude/settings.json (or ~/.claude/config.json)
-# Note: there may be some rough edges with Claude.
-# This has been primarily developed and tested with Codex.
-mcp-repl install-claude
-
 # install to all existing agent homes (does not create ~/.codex or ~/.claude)
 mcp-repl install
+
+# install only codex MCP config
+mcp-repl install --client codex
+
+# install only claude MCP config
+# Note: there may be some rough edges with Claude.
+# This has been primarily developed and tested with Codex.
+mcp-repl install --client claude
+
+# install only one interpreter for a specific client
+mcp-repl install --client codex --interpreter r
 ```
 
-`install-codex` also runs a one-time `R` probe and can annotate
-`~/.codex/config.toml` with additional writable roots (outside `cwd`) for R tooling.
+`install --client codex` writes `--sandbox-state inherit` by default. That sentinel means `mcp-repl` should
+inherit sandbox policy updates from Codex for the session.
 
-Example `R` REPL Codex config (paths vary by OS/user). This minimal example keeps only
-the R cache path writable:
+Example `R` REPL Codex config (paths vary by OS/user):
 
 ```toml
 [mcp_servers.r_repl]
 command = "/Users/alice/.cargo/bin/mcp-repl"
 # mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.
 tool_timeout_sec = 1800
-# additional roots the REPL can write to (outside cwd):
-# discovered at install time using R:
-# tools::R_user_dir("", which = "cache")
-# Re-run `mcp-repl install-codex` to refresh this list.
+# --sandbox-state inherit: use sandbox policy updates sent by Codex for this session.
+# If no update is sent, mcp-repl falls back to its internal default policy.
 args = [
-  "--sandbox-mode", "workspace-write",
-  "--sandbox-network-access", "restricted",
-  "--writable-root", "/Users/alice/Library/Caches/org.R-project.R/R",
+  "--sandbox-state", "inherit",
+  "--interpreter", "r",
 ]
 ```
 
 Example `Python` REPL Codex config:
 
 ```toml
-[mcp_servers.python_repl]
+[mcp_servers.py_repl]
 command = "/Users/alice/.cargo/bin/mcp-repl"
+# mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.
+tool_timeout_sec = 1800
+# --sandbox-state inherit: use sandbox policy updates sent by Codex for this session.
+# If no update is sent, mcp-repl falls back to its internal default policy.
 args = [
-  "--backend", "python",
-  "--sandbox-mode", "workspace-write",
-  "--sandbox-network-access", "restricted",
+  "--sandbox-state", "inherit",
+  "--interpreter", "python",
 ]
 ```
 
-### 3) Pick backend (optional)
+For Claude, `install --client claude` writes explicit sandbox mode by default because Claude does not
+propagate sandbox state updates to MCP servers:
 
-- Default backend: R
-- CLI: `mcp-repl --backend r|python`
-- Environment: `MCP_REPL_BACKEND=r|python`
+```json
+{
+  "mcpServers": {
+    "r_repl": {
+      "command": "/Users/alice/.cargo/bin/mcp-repl",
+      "args": ["--sandbox-state", "workspace-write", "--interpreter", "r"]
+    },
+    "py_repl": {
+      "command": "/Users/alice/.cargo/bin/mcp-repl",
+      "args": ["--sandbox-state", "workspace-write", "--interpreter", "python"]
+    }
+  }
+}
+```
+
+By default install creates one entry per supported interpreter:
+- `r_repl`
+- `py_repl`
+
+Use `--interpreter r`, `--interpreter python`, or comma-separated/repeatable forms
+to limit which interpreters are installed.
+
+### 3) Pick interpreter (optional)
+
+- Default interpreter: R
+- CLI: `mcp-repl --interpreter r|python`
+- Environment: `MCP_REPL_INTERPRETER=r|python`
 
 ## Runtime discovery
 
-### Backend selection order
+### Interpreter selection order
 
-`mcp-repl` chooses backend in this order:
-- `--backend <r|python>` (if provided)
-- `MCP_REPL_BACKEND`
+`mcp-repl` chooses interpreter in this order:
+- `--interpreter <r|python>` (if provided)
+- `MCP_REPL_INTERPRETER`
 - default: `r`
 
-### R backend: which R installation is used
+### R interpreter: which R installation is used
 
 - To force a specific R installation, set `R_HOME` in the environment that launches `mcp-repl`.
 - If `R_HOME` is not set, `mcp-repl` discovers it from `R` on `PATH` (via `R RHOME`).
 - To verify which R is active, run `R.home()` in the console session.
 
-### Python backend: which Python installation is used
+### Python interpreter: which Python installation is used
 
 Interpreter resolution order:
 - nearest `.venv/bin/python` from current working directory upward

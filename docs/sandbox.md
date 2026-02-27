@@ -17,6 +17,7 @@ The worker also gets a per-session temp directory, exported as:
 
 ## Configure sandbox policy
 
+- CLI state selector: `mcp-repl --sandbox-state inherit|read-only|workspace-write|danger-full-access|<json>`
 - CLI mode: `mcp-repl --sandbox-mode read-only|workspace-write|danger-full-access`
 - CLI network toggle (workspace-write only): `mcp-repl --sandbox-network-access restricted|enabled`
 - CLI writable roots (workspace-write only, repeatable): `mcp-repl --writable-root /absolute/path`
@@ -30,7 +31,7 @@ For `workspace-write`, writable roots include:
 
 - configured `writable_roots` (absolute paths only),
 - current working directory,
-- R cache roots configured in client policy (for Codex configs installed via `mcp-repl install-codex`, this cache root is auto-populated at install time via a one-time `R` probe),
+- R cache roots configured in client policy,
 - temp roots (`/tmp`, `TMPDIR` when absolute), and
 - the per-session temp directory.
 

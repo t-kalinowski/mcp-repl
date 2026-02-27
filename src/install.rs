@@ -3,7 +3,6 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use toml_edit::{Array, DocumentMut, Item, Table, value};
@@ -11,6 +10,39 @@ use toml_edit::{Array, DocumentMut, Item, Table, value};
 const CODEX_TOOL_TIMEOUT_SECS: i64 = 1_800;
 const CODEX_TOOL_TIMEOUT_COMMENT: &str =
     "\n# mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.\n";
+const CODEX_SANDBOX_INHERIT_COMMENT: &str = "\n# --sandbox-state inherit: use sandbox policy updates sent by Codex for this session.\n# If no update is sent, mcp-repl falls back to its internal default policy.\n";
+pub const DEFAULT_R_SERVER_NAME: &str = "r_repl";
+pub const DEFAULT_PYTHON_SERVER_NAME: &str = "py_repl";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallInterpreter {
+    R,
+    Python,
+}
+
+impl InstallInterpreter {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw.trim().to_lowercase().as_str() {
+            "r" => Ok(Self::R),
+            "python" => Ok(Self::Python),
+            _ => Err(format!("invalid interpreter: {raw} (expected r|python)")),
+        }
+    }
+
+    fn cli_value(self) -> &'static str {
+        match self {
+            Self::R => "r",
+            Self::Python => "python",
+        }
+    }
+
+    fn default_server_name(self) -> &'static str {
+        match self {
+            Self::R => DEFAULT_R_SERVER_NAME,
+            Self::Python => DEFAULT_PYTHON_SERVER_NAME,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum InstallTarget {
@@ -40,60 +72,62 @@ impl InstallTarget {
 #[derive(Debug, Clone)]
 pub struct InstallOptions {
     pub targets: Vec<InstallTarget>,
+    pub interpreters: Vec<InstallInterpreter>,
     pub server_name: String,
+    pub server_name_explicit: bool,
     pub command: Option<String>,
     pub args: Vec<String>,
 }
 
 pub fn run(options: InstallOptions) -> Result<(), Box<dyn std::error::Error>> {
+    if has_interpreter_config_arg(&options.args) {
+        return Err(
+            "install does not accept interpreter selection via --arg; use --interpreter r|python instead"
+                .into(),
+        );
+    }
     let command = options.command.unwrap_or_else(default_command);
     let targets = resolve_target_roots(&options.targets)?;
-    let install_codex = targets
-        .iter()
-        .any(|(target, _)| matches!(target, InstallTarget::Codex));
-    let additional_writable_roots = if install_codex {
-        install_time_r_writable_roots()
-    } else {
-        Vec::new()
-    };
-    if install_codex {
-        if additional_writable_roots.is_empty() {
-            println!(
-                "No additional R writable roots discovered at install time (outside workspace/cwd)."
-            );
-        } else {
-            println!("Discovered additional R writable roots (outside workspace/cwd):");
-            for root in &additional_writable_roots {
-                println!("- {}", root.display());
+    let codex_args = codex_install_args(&options.args);
+    let claude_args = claude_install_args(&options.args);
+    let interpreters = effective_interpreters(&options.interpreters);
+    let mut server_specs = Vec::new();
+    let mut used_server_names = std::collections::BTreeSet::new();
+    for (idx, interpreter) in interpreters.iter().enumerate() {
+        let server_name = if idx == 0 {
+            if options.server_name_explicit {
+                options.server_name.clone()
+            } else {
+                interpreter.default_server_name().to_string()
             }
+        } else {
+            interpreter.default_server_name().to_string()
+        };
+        if !used_server_names.insert(server_name.clone()) {
+            return Err(format!(
+                "duplicate server name generated for install: {server_name} (check --server-name and --interpreter values)"
+            )
+            .into());
         }
-    }
-    let codex_effective_args = build_server_args(&options.args, &additional_writable_roots);
-    if install_codex
-        && !additional_writable_roots.is_empty()
-        && !codex_effective_args.injected_sandbox_args
-    {
-        println!(
-            "Skipped auto-injecting sandbox args because install args already include sandbox configuration."
-        );
+        server_specs.push((server_name, *interpreter));
     }
 
     for (target, root) in targets {
         match target {
             InstallTarget::Codex => {
                 let path = root.join("config.toml");
-                upsert_codex_mcp_server(
-                    &path,
-                    &options.server_name,
-                    &command,
-                    &codex_effective_args.args,
-                    &additional_writable_roots,
-                )?;
+                for (server_name, interpreter) in &server_specs {
+                    let server_args = with_interpreter_arg(&codex_args, *interpreter);
+                    upsert_codex_mcp_server(&path, server_name, &command, &server_args)?;
+                }
                 println!("Updated codex MCP config: {}", path.display());
             }
             InstallTarget::Claude => {
                 let path = resolve_claude_config_path(&root);
-                upsert_claude_mcp_server(&path, &options.server_name, &command, &options.args)?;
+                for (server_name, interpreter) in &server_specs {
+                    let server_args = with_interpreter_arg(&claude_args, *interpreter);
+                    upsert_claude_mcp_server(&path, server_name, &command, &server_args)?;
+                }
                 println!("Updated claude MCP config: {}", path.display());
             }
         }
@@ -216,12 +250,6 @@ fn resolve_claude_config_path(root: &Path) -> PathBuf {
     settings
 }
 
-#[derive(Debug, Clone)]
-struct EffectiveArgs {
-    args: Vec<String>,
-    injected_sandbox_args: bool,
-}
-
 fn has_sandbox_config_arg(args: &[String]) -> bool {
     args.iter().any(|arg| {
         matches!(
@@ -234,87 +262,95 @@ fn has_sandbox_config_arg(args: &[String]) -> bool {
     })
 }
 
-fn install_time_r_writable_roots() -> Vec<PathBuf> {
-    let mut roots = probe_r_writable_roots();
-    roots.sort();
-    roots.dedup();
-    roots
+fn has_interpreter_config_arg(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        matches!(arg.as_str(), "--interpreter" | "--backend")
+            || arg.starts_with("--interpreter=")
+            || arg.starts_with("--backend=")
+    })
 }
 
-fn build_server_args(base_args: &[String], additional_writable_roots: &[PathBuf]) -> EffectiveArgs {
+fn has_interpreter_value(args: &[String], target: &str) -> bool {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--interpreter" || arg == "--backend" {
+            if iter.next().is_some_and(|value| value == target) {
+                return true;
+            }
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--interpreter=")
+            && value == target
+        {
+            return true;
+        }
+        if let Some(value) = arg.strip_prefix("--backend=")
+            && value == target
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn with_interpreter_arg(base_args: &[String], interpreter: InstallInterpreter) -> Vec<String> {
+    if has_interpreter_value(base_args, interpreter.cli_value()) {
+        return base_args.to_vec();
+    }
     let mut args = base_args.to_vec();
-    let mut injected_sandbox_args = false;
-    if !additional_writable_roots.is_empty() && !has_sandbox_config_arg(base_args) {
-        args.push("--sandbox-mode".to_string());
+    args.push("--interpreter".to_string());
+    args.push(interpreter.cli_value().to_string());
+    args
+}
+
+fn effective_interpreters(configured: &[InstallInterpreter]) -> Vec<InstallInterpreter> {
+    if configured.is_empty() {
+        return vec![InstallInterpreter::R, InstallInterpreter::Python];
+    }
+    let mut out = Vec::new();
+    for interpreter in configured {
+        if !out.contains(interpreter) {
+            out.push(*interpreter);
+        }
+    }
+    out
+}
+
+fn codex_install_args(base_args: &[String]) -> Vec<String> {
+    let mut args = base_args.to_vec();
+    if !has_sandbox_config_arg(base_args) {
+        args.push("--sandbox-state".to_string());
+        args.push("inherit".to_string());
+    }
+    args
+}
+
+fn claude_install_args(base_args: &[String]) -> Vec<String> {
+    let mut args = base_args.to_vec();
+    if !has_sandbox_config_arg(base_args) {
+        args.push("--sandbox-state".to_string());
         args.push("workspace-write".to_string());
-        args.push("--sandbox-network-access".to_string());
-        args.push("restricted".to_string());
-        for root in additional_writable_roots {
-            args.push("--writable-root".to_string());
-            args.push(root.to_string_lossy().to_string());
-        }
-        injected_sandbox_args = true;
     }
-    EffectiveArgs {
-        args,
-        injected_sandbox_args,
-    }
+    args
 }
 
-fn probe_r_writable_roots() -> Vec<PathBuf> {
-    let output = Command::new("R")
-        .stdin(Stdio::null())
-        .arg("-s")
-        .arg("-e")
-        .arg(
-            r#"cat(
-sep = "",
-"MCP_CONSOLE_INSTALL_R_CACHE_ROOT=", tools::R_user_dir("", which = "cache"), "\n"
-)"#,
-        )
-        .output();
-    let Ok(output) = output else {
-        return Vec::new();
-    };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    let Ok(stdout) = String::from_utf8(output.stdout) else {
-        return Vec::new();
-    };
-    parse_r_writable_roots_probe_output(&stdout)
-}
-
-fn parse_r_writable_roots_probe_output(stdout: &str) -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-    for line in stdout.lines() {
-        let Some((key, value)) = line.trim_start().split_once('=') else {
-            continue;
-        };
-        if !matches!(key, "MCP_CONSOLE_INSTALL_R_CACHE_ROOT") {
+fn contains_sandbox_state_value(args: &[String], target: &str) -> bool {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--sandbox-state" {
+            if iter.next().is_some_and(|value| value == target) {
+                return true;
+            }
             continue;
         }
-        let value = value.trim();
-        if value.is_empty() {
-            continue;
-        }
-        if is_absolute_probe_path(value) {
-            roots.push(PathBuf::from(value));
+        if arg
+            .strip_prefix("--sandbox-state=")
+            .is_some_and(|value| value == target)
+        {
+            return true;
         }
     }
-    roots
-}
-
-fn is_absolute_probe_path(raw_path: &str) -> bool {
-    let bytes = raw_path.as_bytes();
-    let is_drive_absolute = bytes.len() >= 3
-        && bytes[0].is_ascii_alphabetic()
-        && bytes[1] == b':'
-        && matches!(bytes[2], b'\\' | b'/');
-    raw_path.starts_with('/')
-        || raw_path.starts_with(r"\\")
-        || is_drive_absolute
-        || Path::new(raw_path).is_absolute()
+    false
 }
 
 fn upsert_codex_mcp_server(
@@ -322,7 +358,6 @@ fn upsert_codex_mcp_server(
     server_name: &str,
     command: &str,
     args: &[String],
-    additional_writable_roots: &[PathBuf],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut doc = if config_path.is_file() {
         let raw = fs::read_to_string(config_path)?;
@@ -349,39 +384,27 @@ fn upsert_codex_mcp_server(
     }
     format_toml_array_multiline(&mut toml_args);
     doc["mcp_servers"][server_name]["args"] = Item::Value(toml_args.into());
-    if let Some(server_table) = doc["mcp_servers"][server_name].as_table_mut() {
-        if let Some(mut timeout_key) = server_table.key_mut("tool_timeout_sec") {
-            timeout_key
-                .leaf_decor_mut()
-                .set_prefix(CODEX_TOOL_TIMEOUT_COMMENT);
-        }
-        if let Some(mut args_key) = server_table.key_mut("args") {
+    if let Some(server_table) = doc["mcp_servers"][server_name].as_table_mut()
+        && let Some(mut timeout_key) = server_table.key_mut("tool_timeout_sec")
+    {
+        timeout_key
+            .leaf_decor_mut()
+            .set_prefix(CODEX_TOOL_TIMEOUT_COMMENT);
+    }
+    if let Some(server_table) = doc["mcp_servers"][server_name].as_table_mut()
+        && let Some(mut args_key) = server_table.key_mut("args")
+    {
+        if contains_sandbox_state_value(args, "inherit") {
             args_key
                 .leaf_decor_mut()
-                .set_prefix(codex_r_writable_roots_comment(additional_writable_roots));
+                .set_prefix(CODEX_SANDBOX_INHERIT_COMMENT);
+        } else {
+            args_key.leaf_decor_mut().set_prefix("");
         }
     }
 
     atomic_write(config_path, &doc.to_string())?;
     Ok(())
-}
-
-fn codex_r_writable_roots_comment(additional_writable_roots: &[PathBuf]) -> String {
-    let mut lines = vec![
-        "".to_string(),
-        "# additional roots the REPL can write to (outside cwd):".to_string(),
-        "# discovered at install time using R:".to_string(),
-        "# tools::R_user_dir(\"\", which = \"cache\")".to_string(),
-    ];
-    if additional_writable_roots.is_empty() {
-        lines.push("# - none discovered".to_string());
-    } else {
-        for root in additional_writable_roots {
-            lines.push(format!("# - {}", root.display()));
-        }
-    }
-    lines.push("# Re-run `mcp-repl install-codex` to refresh this list.".to_string());
-    lines.join("\n") + "\n"
 }
 
 fn format_toml_array_multiline(array: &mut Array) {
@@ -510,7 +533,6 @@ mod tests {
             "console",
             "/usr/local/bin/mcp-console",
             &["--backend".to_string(), "python".to_string()],
-            &[PathBuf::from("/tmp/cache-root")],
         )
         .expect("upsert codex");
         let text = fs::read_to_string(config).expect("read config");
@@ -541,14 +563,6 @@ mod tests {
             text.contains("mcp-repl handles the primary timeout"),
             "expected generated timeout rationale comment in config"
         );
-        assert!(
-            text.contains("additional roots the REPL can write to"),
-            "expected generated writable-roots annotation comment in config"
-        );
-        assert!(
-            text.contains("# - /tmp/cache-root"),
-            "expected writable-roots comment to include discovered cache root"
-        );
     }
 
     #[test]
@@ -566,14 +580,13 @@ repl = { command = "/usr/local/bin/old-mcp-repl", args = ["--backend", "r"] }
         upsert_codex_mcp_server(
             &config,
             "repl",
-            "/usr/local/bin/mcp-repl",
+            "/path/to/mcp-repl",
             &[
                 "--sandbox-mode".to_string(),
                 "workspace-write".to_string(),
                 "--sandbox-network-access".to_string(),
                 "restricted".to_string(),
             ],
-            &[],
         )
         .expect("upsert codex");
 
@@ -585,7 +598,7 @@ repl = { command = "/usr/local/bin/old-mcp-repl", args = ["--backend", "r"] }
         );
         assert_eq!(
             doc["mcp_servers"]["repl"]["command"].as_str(),
-            Some("/usr/local/bin/mcp-repl")
+            Some("/path/to/mcp-repl")
         );
         assert_eq!(
             doc["mcp_servers"]["repl"]["tool_timeout_sec"].as_integer(),
@@ -615,9 +628,8 @@ name="demo"
         upsert_codex_mcp_server(
             &config,
             "repl",
-            "/usr/local/bin/mcp-repl",
+            "/path/to/mcp-repl",
             &["--backend".to_string(), "r".to_string()],
-            &[],
         )
         .expect("upsert codex");
 
@@ -648,9 +660,8 @@ name="demo"
         upsert_codex_mcp_server(
             &config,
             "repl",
-            "/usr/local/bin/mcp-repl",
+            "/path/to/mcp-repl",
             &["--backend".to_string(), "r".to_string()],
-            &[],
         )
         .expect("upsert codex");
 
@@ -658,7 +669,7 @@ name="demo"
         let doc = text.parse::<DocumentMut>().expect("parse generated config");
         assert_eq!(
             doc["mcp_servers"]["repl"]["command"].as_str(),
-            Some("/usr/local/bin/mcp-repl")
+            Some("/path/to/mcp-repl")
         );
         assert_eq!(
             doc["mcp_servers"]["repl"]["args"]
@@ -670,65 +681,184 @@ name="demo"
     }
 
     #[test]
-    fn build_server_args_injects_sandbox_args_for_discovered_roots() {
-        let roots = vec![PathBuf::from("/tmp/example-r-root")];
-        let effective = build_server_args(&["--backend".to_string(), "r".to_string()], &roots);
-        assert!(effective.injected_sandbox_args);
+    fn upsert_codex_mcp_server_adds_inherit_comment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        upsert_codex_mcp_server(
+            &config,
+            "repl",
+            "/path/to/mcp-repl",
+            &["--sandbox-state".to_string(), "inherit".to_string()],
+        )
+        .expect("upsert codex");
+
+        let text = fs::read_to_string(config).expect("read config");
         assert!(
-            effective.args.iter().any(|arg| arg == "--sandbox-mode"),
-            "expected --sandbox-mode to be injected"
-        );
-        assert!(
-            effective
-                .args
-                .windows(2)
-                .any(|pair| pair[0] == "--writable-root" && pair[1] == "/tmp/example-r-root"),
-            "expected injected writable root"
+            text.contains("--sandbox-state inherit: use sandbox policy updates sent by Codex"),
+            "expected inherit comment in codex config"
         );
     }
 
     #[test]
-    fn build_server_args_does_not_override_existing_sandbox_config() {
-        let roots = vec![PathBuf::from("/tmp/example-r-root")];
-        let effective = build_server_args(
-            &[
-                "--sandbox-mode".to_string(),
-                "workspace-write".to_string(),
-                "--backend".to_string(),
-                "r".to_string(),
-            ],
-            &roots,
+    fn upsert_codex_mcp_server_clears_stale_inherit_comment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        upsert_codex_mcp_server(
+            &config,
+            "repl",
+            "/path/to/mcp-repl",
+            &["--sandbox-state".to_string(), "inherit".to_string()],
+        )
+        .expect("upsert codex");
+        upsert_codex_mcp_server(
+            &config,
+            "repl",
+            "/path/to/mcp-repl",
+            &["--sandbox-state".to_string(), "workspace-write".to_string()],
+        )
+        .expect("upsert codex");
+
+        let text = fs::read_to_string(config).expect("read config");
+        assert!(
+            !text.contains("--sandbox-state inherit: use sandbox policy updates sent by Codex"),
+            "did not expect stale inherit comment in codex config"
         );
-        assert!(!effective.injected_sandbox_args);
-        let count = effective
-            .args
-            .iter()
-            .filter(|arg| arg.as_str() == "--sandbox-mode")
-            .count();
-        assert_eq!(count, 1, "expected existing sandbox args to be preserved");
     }
 
     #[test]
-    fn build_server_args_skips_injection_without_discovered_roots() {
-        let effective = build_server_args(&["--backend".to_string(), "r".to_string()], &[]);
-        assert!(!effective.injected_sandbox_args);
+    fn codex_install_args_defaults_to_inherit() {
+        let args = codex_install_args(&["--interpreter".to_string(), "python".to_string()]);
         assert_eq!(
-            effective.args,
-            vec!["--backend".to_string(), "r".to_string()]
+            args,
+            vec![
+                "--interpreter".to_string(),
+                "python".to_string(),
+                "--sandbox-state".to_string(),
+                "inherit".to_string()
+            ]
         );
     }
 
     #[test]
-    fn parse_r_writable_roots_probe_output_keeps_absolute_values() {
-        let parsed = parse_r_writable_roots_probe_output(
-            "noise\nMCP_CONSOLE_INSTALL_R_CACHE_ROOT=relative/path\nMCP_CONSOLE_INSTALL_R_CACHE_ROOT=/tmp/cache-root\nMCP_CONSOLE_INSTALL_R_DATA_ROOT=/tmp/data-root\nMCP_CONSOLE_INSTALL_R_CONFIG_ROOT=/tmp/config-root\n",
+    fn claude_install_args_defaults_to_workspace_write() {
+        let args = claude_install_args(&["--interpreter".to_string(), "python".to_string()]);
+        assert_eq!(
+            args,
+            vec![
+                "--interpreter".to_string(),
+                "python".to_string(),
+                "--sandbox-state".to_string(),
+                "workspace-write".to_string()
+            ]
         );
-        assert_eq!(parsed, vec![PathBuf::from("/tmp/cache-root")]);
     }
 
     #[test]
-    fn is_absolute_probe_path_accepts_posix_paths() {
-        assert!(is_absolute_probe_path("/tmp/cache-root"));
+    fn install_args_preserve_explicit_sandbox_config() {
+        let base = vec![
+            "--sandbox-state".to_string(),
+            "read-only".to_string(),
+            "--interpreter".to_string(),
+            "python".to_string(),
+        ];
+        assert_eq!(codex_install_args(&base), base);
+        assert_eq!(claude_install_args(&base), base);
+    }
+
+    #[test]
+    fn with_interpreter_arg_adds_python_interpreter_when_missing() {
+        let args = with_interpreter_arg(
+            &["--sandbox-state".to_string(), "workspace-write".to_string()],
+            InstallInterpreter::Python,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--sandbox-state".to_string(),
+                "workspace-write".to_string(),
+                "--interpreter".to_string(),
+                "python".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn with_interpreter_arg_preserves_existing_python_interpreter() {
+        let args = with_interpreter_arg(
+            &[
+                "--sandbox-state".to_string(),
+                "workspace-write".to_string(),
+                "--interpreter".to_string(),
+                "python".to_string(),
+            ],
+            InstallInterpreter::Python,
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--sandbox-state".to_string(),
+                "workspace-write".to_string(),
+                "--interpreter".to_string(),
+                "python".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn run_rejects_interpreter_via_arg() {
+        let err = run(InstallOptions {
+            targets: vec![InstallTarget::Codex],
+            interpreters: vec![InstallInterpreter::R],
+            server_name: DEFAULT_R_SERVER_NAME.to_string(),
+            server_name_explicit: false,
+            command: Some("/path/to/mcp-repl".to_string()),
+            args: vec!["--interpreter".to_string(), "python".to_string()],
+        })
+        .expect_err("expected rejection");
+        assert!(
+            err.to_string()
+                .contains("install does not accept interpreter selection via --arg"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn effective_interpreters_defaults_to_full_grid() {
+        assert_eq!(
+            effective_interpreters(&[]),
+            vec![InstallInterpreter::R, InstallInterpreter::Python]
+        );
+    }
+
+    #[test]
+    fn upsert_claude_mcp_server_does_not_add_sandbox_comment_field() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("settings.json");
+        upsert_claude_mcp_server(
+            &config,
+            "repl",
+            "/path/to/mcp-repl",
+            &["--sandbox-state".to_string(), "workspace-write".to_string()],
+        )
+        .expect("upsert claude");
+
+        let text = fs::read_to_string(config).expect("read config");
+        let root: JsonValue = serde_json::from_str(&text).expect("parse json");
+        let server = &root["mcpServers"]["repl"];
+        assert_eq!(
+            server["args"][0].as_str(),
+            Some("--sandbox-state"),
+            "expected explicit sandbox-state arg in claude config"
+        );
+        assert_eq!(
+            server["args"][1].as_str(),
+            Some("workspace-write"),
+            "expected workspace-write default in claude config"
+        );
+        assert!(
+            server.get("_comment_sandbox_state").is_none(),
+            "did not expect sandbox-state comment field in claude config"
+        );
     }
 
     #[test]
