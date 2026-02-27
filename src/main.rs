@@ -682,4 +682,24 @@ mod tests {
             "unexpected error: {err}"
         );
     }
+
+    #[test]
+    fn inherit_mode_copies_managed_network_policy() {
+        let plan = SandboxCliPlan {
+            operations: vec![SandboxCliOperation::SetMode(SandboxModeArg::Inherit)],
+        };
+        let mut inherited = SandboxState::default();
+        inherited.managed_network_policy.allowed_domains =
+            vec!["example.com".to_string(), "*.example.org".to_string()];
+        inherited.managed_network_policy.denied_domains = vec!["blocked.example".to_string()];
+        inherited.managed_network_policy.allow_local_binding = true;
+
+        let resolved = resolve_effective_sandbox_state(&plan, Some(&inherited))
+            .expect("effective sandbox state");
+
+        assert_eq!(
+            resolved.managed_network_policy, inherited.managed_network_policy,
+            "inherit mode should copy managed network policy from client state"
+        );
+    }
 }

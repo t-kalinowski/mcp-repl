@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::sandbox::{ManagedNetworkPolicy, SandboxPolicy, SandboxState};
+use crate::sandbox::{SandboxPolicy, SandboxState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxModeArg {
@@ -49,34 +49,6 @@ pub enum SandboxCliOperation {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SandboxCliPlan {
     pub operations: Vec<SandboxCliOperation>,
-}
-
-impl SandboxCliPlan {
-    pub fn allow_local_binding_override(&self) -> Option<bool> {
-        let mut result = None;
-        for op in &self.operations {
-            if let SandboxCliOperation::Config(SandboxConfigOperation::SetAllowLocalBinding(
-                value,
-            )) = op
-            {
-                result = Some(*value);
-            }
-        }
-        result
-    }
-
-    pub fn use_linux_sandbox_bwrap_override(&self) -> Option<bool> {
-        let mut result = None;
-        for op in &self.operations {
-            if let SandboxCliOperation::Config(SandboxConfigOperation::SetUseLinuxSandboxBwrap(
-                value,
-            )) = op
-            {
-                result = Some(*value);
-            }
-        }
-        result
-    }
 }
 
 pub fn parse_sandbox_config_override(raw: &str) -> Result<SandboxConfigOperation, String> {
@@ -191,7 +163,6 @@ pub fn resolve_effective_sandbox_state_with_defaults(
     }
 
     let mut state = defaults.clone();
-    state.managed_network_policy = ManagedNetworkPolicy::default();
     for op in &plan.operations {
         match op {
             SandboxCliOperation::SetMode(mode) => {
@@ -246,33 +217,24 @@ fn apply_mode(
             let inherited = inherited.ok_or_else(|| {
                 "--sandbox inherit requested but no client sandbox state was provided".to_string()
             })?;
-            state.sandbox_policy = inherited.sandbox_policy.clone();
-            state.sandbox_cwd = inherited.sandbox_cwd.clone();
-            state.codex_linux_sandbox_exe = inherited.codex_linux_sandbox_exe.clone();
-            state.use_linux_sandbox_bwrap = inherited.use_linux_sandbox_bwrap;
+            *state = inherited.clone();
         }
         SandboxModeArg::ReadOnly => {
+            *state = defaults.clone();
             state.sandbox_policy = SandboxPolicy::ReadOnly;
-            state.sandbox_cwd = defaults.sandbox_cwd.clone();
-            state.codex_linux_sandbox_exe = defaults.codex_linux_sandbox_exe.clone();
-            state.use_linux_sandbox_bwrap = defaults.use_linux_sandbox_bwrap;
         }
         SandboxModeArg::WorkspaceWrite => {
+            *state = defaults.clone();
             state.sandbox_policy = SandboxPolicy::WorkspaceWrite {
                 writable_roots: Vec::new(),
                 network_access: false,
                 exclude_tmpdir_env_var: false,
                 exclude_slash_tmp: false,
             };
-            state.sandbox_cwd = defaults.sandbox_cwd.clone();
-            state.codex_linux_sandbox_exe = defaults.codex_linux_sandbox_exe.clone();
-            state.use_linux_sandbox_bwrap = defaults.use_linux_sandbox_bwrap;
         }
         SandboxModeArg::DangerFullAccess => {
+            *state = defaults.clone();
             state.sandbox_policy = SandboxPolicy::DangerFullAccess;
-            state.sandbox_cwd = defaults.sandbox_cwd.clone();
-            state.codex_linux_sandbox_exe = defaults.codex_linux_sandbox_exe.clone();
-            state.use_linux_sandbox_bwrap = defaults.use_linux_sandbox_bwrap;
         }
     }
     Ok(())

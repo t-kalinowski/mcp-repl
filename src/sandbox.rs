@@ -219,7 +219,6 @@ fn ensure_absolute(path: PathBuf) -> Option<PathBuf> {
     if path.is_absolute() { Some(path) } else { None }
 }
 
-#[cfg(target_os = "linux")]
 fn env_var_truthy(key: &str) -> bool {
     std::env::var(key).ok().is_some_and(|value| {
         let trimmed = value.trim();
@@ -488,8 +487,6 @@ pub fn prepare_worker_command(
     program: &Path,
     args: Vec<String>,
     state: &SandboxState,
-    allow_local_binding_override: Option<bool>,
-    _use_linux_sandbox_bwrap_override: Option<bool>,
 ) -> Result<PreparedCommand, SandboxError> {
     let mut env = HashMap::new();
     if !state.sandbox_policy.has_full_network_access() {
@@ -498,18 +495,14 @@ pub fn prepare_worker_command(
             "1".to_string(),
         );
     }
-    if let Some(value) = allow_local_binding_override {
-        env.insert(
-            ALLOW_LOCAL_BINDING_ENV_KEY.to_string(),
-            if value {
-                "1".to_string()
-            } else {
-                "0".to_string()
-            },
-        );
-    } else if state.managed_network_policy.allow_local_binding {
-        env.insert(ALLOW_LOCAL_BINDING_ENV_KEY.to_string(), "1".to_string());
-    }
+    env.insert(
+        ALLOW_LOCAL_BINDING_ENV_KEY.to_string(),
+        if state.managed_network_policy.allow_local_binding {
+            "1".to_string()
+        } else {
+            "0".to_string()
+        },
+    );
     if state.managed_network_policy.allowed_domains.is_empty() {
         env.remove(MANAGED_ALLOWED_DOMAINS_ENV_KEY);
     } else {
@@ -635,14 +628,11 @@ pub fn prepare_worker_command(
         }
         let policy = sanitize_linux_sandbox_policy(&policy);
         let command = build_command_vec(program, &args);
-        let use_bwrap_sandbox = _use_linux_sandbox_bwrap_override.unwrap_or_else(|| {
-            state.use_linux_sandbox_bwrap || env_var_truthy(LINUX_BWRAP_ENABLED_ENV)
-        });
         let sandbox_args = create_linux_sandbox_command_args(
             command,
             &policy,
             &policy_cwd,
-            use_bwrap_sandbox,
+            state.use_linux_sandbox_bwrap,
             env_var_truthy(LINUX_BWRAP_NO_PROC_ENV),
         );
         let sandbox_program = state
@@ -835,6 +825,17 @@ const PROXY_URL_ENV_KEYS: [&str; 6] = [
 ];
 const MANAGED_NETWORK_ENV_KEY: &str = "MCP_CONSOLE_MANAGED_NETWORK";
 const ALLOW_LOCAL_BINDING_ENV_KEY: &str = "ALLOW_LOCAL_BINDING";
+
+pub fn sandbox_state_defaults_with_environment() -> SandboxState {
+    let mut defaults = SandboxState::default();
+    defaults.managed_network_policy.allow_local_binding =
+        env_var_truthy(ALLOW_LOCAL_BINDING_ENV_KEY);
+    #[cfg(target_os = "linux")]
+    {
+        defaults.use_linux_sandbox_bwrap = env_var_truthy(LINUX_BWRAP_ENABLED_ENV);
+    }
+    defaults
+}
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Default)]
@@ -1082,12 +1083,7 @@ fn create_seatbelt_command_args(
     };
 
     let proxy = proxy_policy_inputs_from_env(network_env);
-    let allow_local_binding = managed_network_policy.allow_local_binding
-        || env_bool(
-            network_env
-                .get(ALLOW_LOCAL_BINDING_ENV_KEY)
-                .map(String::as_str),
-        );
+    let allow_local_binding = managed_network_policy.allow_local_binding;
     let enforce_managed_network =
         managed_network_enabled(network_env) || managed_network_policy.has_domain_restrictions();
     let network_policy = dynamic_network_policy(
@@ -2302,22 +2298,21 @@ mod tests {
     }
 
     #[test]
-    fn prepare_worker_command_does_not_override_allow_local_binding_when_disabled() {
+    fn prepare_worker_command_sets_allow_local_binding_one_when_enabled() {
         let mut state = SandboxState::default();
         state.sandbox_policy = SandboxPolicy::DangerFullAccess;
-        state.managed_network_policy.allow_local_binding = false;
+        state.managed_network_policy.allow_local_binding = true;
 
-        let prepared = prepare_worker_command(
-            Path::new("/bin/echo"),
-            vec!["ok".to_string()],
-            &state,
-            None,
-            None,
-        )
-        .expect("prepare_worker_command should succeed");
-        assert!(
-            !prepared.env.contains_key(ALLOW_LOCAL_BINDING_ENV_KEY),
-            "ALLOW_LOCAL_BINDING should be omitted when not explicitly enabled"
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("prepare_worker_command should succeed");
+        assert_eq!(
+            prepared
+                .env
+                .get(ALLOW_LOCAL_BINDING_ENV_KEY)
+                .map(String::as_str),
+            Some("1"),
+            "explicit true value should enable local binding"
         );
     }
 
@@ -2327,14 +2322,9 @@ mod tests {
         state.sandbox_policy = SandboxPolicy::DangerFullAccess;
         state.managed_network_policy.allow_local_binding = false;
 
-        let prepared = prepare_worker_command(
-            Path::new("/bin/echo"),
-            vec!["ok".to_string()],
-            &state,
-            Some(false),
-            None,
-        )
-        .expect("prepare_worker_command should succeed");
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("prepare_worker_command should succeed");
         assert_eq!(
             prepared
                 .env
@@ -2348,7 +2338,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn prepare_worker_command_bwrap_env_does_not_override_explicit_false() {
-        let previous = std::env::var_os(LINUX_BWRAP_ENABLED_ENV);
+        let previous_env = std::env::var_os(LINUX_BWRAP_ENABLED_ENV);
         unsafe {
             std::env::set_var(LINUX_BWRAP_ENABLED_ENV, "1");
         }
@@ -2362,16 +2352,11 @@ mod tests {
         };
         state.use_linux_sandbox_bwrap = false;
 
-        let prepared = prepare_worker_command(
-            Path::new("/bin/echo"),
-            vec!["ok".to_string()],
-            &state,
-            None,
-            Some(false),
-        )
-        .expect("prepare_worker_command should succeed");
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("prepare_worker_command should succeed");
 
-        match previous {
+        match previous_env {
             Some(value) => unsafe {
                 std::env::set_var(LINUX_BWRAP_ENABLED_ENV, value);
             },
@@ -2383,6 +2368,28 @@ mod tests {
         assert!(
             !prepared.args.contains(&"--use-bwrap-sandbox".to_string()),
             "explicit false override should disable bwrap even when env enables it"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_state_defaults_with_environment_respects_linux_bwrap_env() {
+        let previous_env = std::env::var_os(LINUX_BWRAP_ENABLED_ENV);
+        unsafe {
+            std::env::set_var(LINUX_BWRAP_ENABLED_ENV, "1");
+        }
+        let defaults = sandbox_state_defaults_with_environment();
+        match previous_env {
+            Some(value) => unsafe {
+                std::env::set_var(LINUX_BWRAP_ENABLED_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(LINUX_BWRAP_ENABLED_ENV);
+            },
+        }
+        assert!(
+            defaults.use_linux_sandbox_bwrap,
+            "Linux bwrap env should be applied at defaults layer"
         );
     }
 }
