@@ -2,7 +2,8 @@
 
 `mcp-repl` is an MCP server that exposes a long-lived interactive REPL runtime over stdio.
 
-It currently supports R and Python interpreters. The default interpreter is R, with an opt-in Python interpreter (`--interpreter python`).
+It currently supports R and Python interpreters.
+
 Session state persists across calls, so agents can iterate in place, inspect intermediate values, debug, and read docs in-band.
 
 ## Why use it
@@ -69,22 +70,20 @@ Point your MCP client at the binary (either via `PATH` or by using an explicit p
 You can auto-install into existing agent config files:
 
 ```sh
-# update existing ~/.claude/settings.json (or ~/.claude/config.json)
+# install to all existing agent homes (does not create ~/.codex or ~/.claude)
+mcp-repl install
+
+# install only codex MCP config
+mcp-repl install --client codex
+
+# install only claude MCP config
 # Note: there may be some rough edges with Claude.
 # This has been primarily developed and tested with Codex.
 mcp-repl install --client claude
 
-# default install writes the full interpreter grid (currently r_repl + python_repl)
-mcp-repl install --client codex
-
-# install only one interpreter
+# install only one interpreter for a specific client
 mcp-repl install --client codex --interpreter r
-
-# install to all existing agent homes (does not create ~/.codex or ~/.claude)
-mcp-repl install
 ```
-
-`install-codex` and `install-claude` are no longer supported; use `install --client ...` instead.
 
 `install --client codex` writes `--sandbox-state inherit` by default. That sentinel means `mcp-repl` should
 inherit sandbox policy updates from Codex for the session.
@@ -127,13 +126,11 @@ propagate sandbox state updates to MCP servers:
   "mcpServers": {
     "r_repl": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
-      "args": ["--sandbox-state", "workspace-write", "--interpreter", "r"],
-      "_comment_sandbox_state": "sandbox-state values: read-only | workspace-write | danger-full-access"
+      "args": ["--sandbox-state", "workspace-write", "--interpreter", "r"]
     },
     "python_repl": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
-      "args": ["--sandbox-state", "workspace-write", "--interpreter", "python"],
-      "_comment_sandbox_state": "sandbox-state values: read-only | workspace-write | danger-full-access"
+      "args": ["--sandbox-state", "workspace-write", "--interpreter", "python"]
     }
   }
 }
@@ -150,7 +147,7 @@ to limit which interpreters are installed.
 
 - Default interpreter: R
 - CLI: `mcp-repl --interpreter r|python`
-- Environment: `MCP_REPL_INTERPRETER=r|python` (compatibility alias: `MCP_REPL_BACKEND`)
+- Environment: `MCP_REPL_INTERPRETER=r|python`
 
 ## Runtime discovery
 
@@ -158,9 +155,7 @@ to limit which interpreters are installed.
 
 `mcp-repl` chooses interpreter in this order:
 - `--interpreter <r|python>` (if provided)
-- compatibility CLI alias: `--backend <r|python>`
 - `MCP_REPL_INTERPRETER`
-- compatibility env alias: `MCP_REPL_BACKEND`
 - default: `r`
 
 ### R interpreter: which R installation is used

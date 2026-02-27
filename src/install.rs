@@ -11,9 +11,6 @@ const CODEX_TOOL_TIMEOUT_SECS: i64 = 1_800;
 const CODEX_TOOL_TIMEOUT_COMMENT: &str =
     "\n# mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.\n";
 const CODEX_SANDBOX_INHERIT_COMMENT: &str = "\n# --sandbox-state inherit: use sandbox policy updates sent by Codex for this session.\n# If no update is sent, mcp-repl falls back to its internal default policy.\n";
-const CLAUDE_SANDBOX_STATE_COMMENT_FIELD: &str = "_comment_sandbox_state";
-const CLAUDE_SANDBOX_STATE_COMMENT: &str =
-    "sandbox-state values: read-only | workspace-write | danger-full-access";
 pub const DEFAULT_R_SERVER_NAME: &str = "r_repl";
 pub const DEFAULT_PYTHON_SERVER_NAME: &str = "python_repl";
 
@@ -492,10 +489,6 @@ fn upsert_claude_mcp_server(
                 "args".to_string(),
                 JsonValue::Array(args.iter().cloned().map(JsonValue::String).collect()),
             ),
-            (
-                CLAUDE_SANDBOX_STATE_COMMENT_FIELD.to_string(),
-                JsonValue::String(CLAUDE_SANDBOX_STATE_COMMENT.to_string()),
-            ),
         ])),
     );
 
@@ -584,7 +577,7 @@ repl = { command = "/usr/local/bin/old-mcp-repl", args = ["--backend", "r"] }
         upsert_codex_mcp_server(
             &config,
             "repl",
-            "/usr/local/bin/mcp-repl",
+            "/path/to/mcp-repl",
             &[
                 "--sandbox-mode".to_string(),
                 "workspace-write".to_string(),
@@ -602,7 +595,7 @@ repl = { command = "/usr/local/bin/old-mcp-repl", args = ["--backend", "r"] }
         );
         assert_eq!(
             doc["mcp_servers"]["repl"]["command"].as_str(),
-            Some("/usr/local/bin/mcp-repl")
+            Some("/path/to/mcp-repl")
         );
         assert_eq!(
             doc["mcp_servers"]["repl"]["tool_timeout_sec"].as_integer(),
@@ -632,7 +625,7 @@ name="demo"
         upsert_codex_mcp_server(
             &config,
             "repl",
-            "/usr/local/bin/mcp-repl",
+            "/path/to/mcp-repl",
             &["--backend".to_string(), "r".to_string()],
         )
         .expect("upsert codex");
@@ -664,7 +657,7 @@ name="demo"
         upsert_codex_mcp_server(
             &config,
             "repl",
-            "/usr/local/bin/mcp-repl",
+            "/path/to/mcp-repl",
             &["--backend".to_string(), "r".to_string()],
         )
         .expect("upsert codex");
@@ -673,7 +666,7 @@ name="demo"
         let doc = text.parse::<DocumentMut>().expect("parse generated config");
         assert_eq!(
             doc["mcp_servers"]["repl"]["command"].as_str(),
-            Some("/usr/local/bin/mcp-repl")
+            Some("/path/to/mcp-repl")
         );
         assert_eq!(
             doc["mcp_servers"]["repl"]["args"]
@@ -691,7 +684,7 @@ name="demo"
         upsert_codex_mcp_server(
             &config,
             "repl",
-            "/usr/local/bin/mcp-repl",
+            "/path/to/mcp-repl",
             &["--sandbox-state".to_string(), "inherit".to_string()],
         )
         .expect("upsert codex");
@@ -789,7 +782,7 @@ name="demo"
             interpreters: vec![InstallInterpreter::R],
             server_name: DEFAULT_R_SERVER_NAME.to_string(),
             server_name_explicit: false,
-            command: Some("/usr/local/bin/mcp-repl".to_string()),
+            command: Some("/path/to/mcp-repl".to_string()),
             args: vec!["--interpreter".to_string(), "python".to_string()],
         })
         .expect_err("expected rejection");
@@ -809,13 +802,13 @@ name="demo"
     }
 
     #[test]
-    fn upsert_claude_mcp_server_adds_sandbox_comment_field() {
+    fn upsert_claude_mcp_server_does_not_add_sandbox_comment_field() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = dir.path().join("settings.json");
         upsert_claude_mcp_server(
             &config,
             "repl",
-            "/usr/local/bin/mcp-repl",
+            "/path/to/mcp-repl",
             &["--sandbox-state".to_string(), "workspace-write".to_string()],
         )
         .expect("upsert claude");
@@ -833,10 +826,9 @@ name="demo"
             Some("workspace-write"),
             "expected workspace-write default in claude config"
         );
-        assert_eq!(
-            server[CLAUDE_SANDBOX_STATE_COMMENT_FIELD].as_str(),
-            Some(CLAUDE_SANDBOX_STATE_COMMENT),
-            "expected sandbox-state comment field in claude config"
+        assert!(
+            server.get("_comment_sandbox_state").is_none(),
+            "did not expect sandbox-state comment field in claude config"
         );
     }
 
