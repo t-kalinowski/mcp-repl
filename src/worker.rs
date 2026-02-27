@@ -50,7 +50,9 @@ struct QueuedRequest {
 }
 
 pub fn is_worker_mode() -> bool {
-    std::env::args().any(|arg| arg == WORKER_MODE_ARG || arg == format!("--{WORKER_MODE_ARG}"))
+    let bare = std::ffi::OsStr::new(WORKER_MODE_ARG);
+    let flag = std::ffi::OsString::from(format!("--{WORKER_MODE_ARG}"));
+    std::env::args_os().any(|arg| arg == bare || arg == flag)
 }
 
 pub fn run() -> Result<(), Box<dyn std::error::Error>> {

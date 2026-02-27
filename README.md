@@ -2,7 +2,7 @@
 
 `mcp-repl` is an MCP server that exposes a long-lived interactive REPL runtime over stdio.
 
-It currently supports R and Python interpreters.
+It is backend-agnostic in design. The default interpreter is R, with an opt-in Python interpreter (`--interpreter python`).
 
 Session state persists across calls, so agents can iterate in place, inspect intermediate values, debug, and read docs in-band.
 
@@ -143,11 +143,19 @@ By default install creates one entry per supported interpreter:
 Use `--interpreter r`, `--interpreter python`, or comma-separated/repeatable forms
 to limit which interpreters are installed.
 
+Optional: enable rich JSONL debug logs for each `mcp-repl` startup:
+
+- CLI arg: `--debug-events-dir /path/to/log-dir`
+- Environment: `MCP_REPL_DEBUG_EVENTS_DIR=/path/to/log-dir`
+
+When enabled, each startup writes a new `mcp-repl-*.jsonl` file containing startup
+metadata (cwd, argv, Codex session hints) plus tool calls and sandbox state updates.
+
 ### 3) Pick interpreter (optional)
 
 - Default interpreter: R
 - CLI: `mcp-repl --interpreter r|python`
-- Environment: `MCP_REPL_INTERPRETER=r|python`
+- Environment: `MCP_REPL_INTERPRETER=r|python` (compatibility alias: `MCP_REPL_BACKEND`)
 
 ## Runtime discovery
 
@@ -155,7 +163,9 @@ to limit which interpreters are installed.
 
 `mcp-repl` chooses interpreter in this order:
 - `--interpreter <r|python>` (if provided)
+- compatibility CLI alias: `--backend <r|python>`
 - `MCP_REPL_INTERPRETER`
+- compatibility env alias: `MCP_REPL_BACKEND`
 - default: `r`
 
 ### R interpreter: which R installation is used

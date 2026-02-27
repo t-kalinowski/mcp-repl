@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -391,16 +392,15 @@ fn upsert_codex_mcp_server(
             .leaf_decor_mut()
             .set_prefix(CODEX_TOOL_TIMEOUT_COMMENT);
     }
+    let args_prefix = if contains_sandbox_state_value(args, "inherit") {
+        CODEX_SANDBOX_INHERIT_COMMENT
+    } else {
+        ""
+    };
     if let Some(server_table) = doc["mcp_servers"][server_name].as_table_mut()
         && let Some(mut args_key) = server_table.key_mut("args")
     {
-        if contains_sandbox_state_value(args, "inherit") {
-            args_key
-                .leaf_decor_mut()
-                .set_prefix(CODEX_SANDBOX_INHERIT_COMMENT);
-        } else {
-            args_key.leaf_decor_mut().set_prefix("");
-        }
+        args_key.leaf_decor_mut().set_prefix(args_prefix);
     }
 
     atomic_write(config_path, &doc.to_string())?;
@@ -495,8 +495,92 @@ fn upsert_claude_mcp_server(
         ])),
     );
 
-    let serialized = serde_json::to_string_pretty(&root)?;
-    atomic_write(config_path, &(serialized + "\n"))?;
+    let serialized = serialize_json_pretty_with_paired_args(&root)?;
+    atomic_write(config_path, &serialized)?;
+    Ok(())
+}
+
+fn serialize_json_pretty_with_paired_args(
+    value: &JsonValue,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut out = String::new();
+    write_json_pretty_value(&mut out, value, 0, None)?;
+    out.push('\n');
+    Ok(out)
+}
+
+fn write_json_pretty_value(
+    out: &mut String,
+    value: &JsonValue,
+    indent: usize,
+    key: Option<&str>,
+) -> Result<(), serde_json::Error> {
+    match value {
+        JsonValue::Null | JsonValue::Bool(_) | JsonValue::Number(_) | JsonValue::String(_) => {
+            out.push_str(&serde_json::to_string(value)?);
+        }
+        JsonValue::Array(values) => {
+            if values.is_empty() {
+                out.push_str("[]");
+                return Ok(());
+            }
+            if key == Some("args") && values.iter().all(JsonValue::is_string) {
+                out.push('[');
+                out.push('\n');
+                let mut idx = 0;
+                while idx < values.len() {
+                    out.push_str(&" ".repeat(indent + 2));
+                    out.push_str(&serde_json::to_string(&values[idx])?);
+                    if idx + 1 < values.len() {
+                        out.push_str(", ");
+                        out.push_str(&serde_json::to_string(&values[idx + 1])?);
+                    }
+                    idx += 2;
+                    if idx < values.len() {
+                        out.push(',');
+                    }
+                    out.push('\n');
+                }
+                out.push_str(&" ".repeat(indent));
+                out.push(']');
+                return Ok(());
+            }
+
+            out.push('[');
+            out.push('\n');
+            for (idx, item) in values.iter().enumerate() {
+                out.push_str(&" ".repeat(indent + 2));
+                write_json_pretty_value(out, item, indent + 2, None)?;
+                if idx + 1 < values.len() {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            out.push_str(&" ".repeat(indent));
+            out.push(']');
+        }
+        JsonValue::Object(entries) => {
+            if entries.is_empty() {
+                out.push_str("{}");
+                return Ok(());
+            }
+            out.push('{');
+            out.push('\n');
+            let len = entries.len();
+            for (idx, (entry_key, entry_value)) in entries.iter().enumerate() {
+                out.push_str(&" ".repeat(indent + 2));
+                write!(out, "{}: ", serde_json::to_string(entry_key)?)
+                    .expect("writing to String should not fail");
+                write_json_pretty_value(out, entry_value, indent + 2, Some(entry_key.as_str()))?;
+                if idx + 1 < len {
+                    out.push(',');
+                }
+                out.push('\n');
+            }
+            out.push_str(&" ".repeat(indent));
+            out.push('}');
+        }
+    }
     Ok(())
 }
 
@@ -700,7 +784,7 @@ name="demo"
     }
 
     #[test]
-    fn upsert_codex_mcp_server_clears_stale_inherit_comment() {
+    fn upsert_codex_mcp_server_clears_inherit_comment_when_not_using_inherit() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = dir.path().join("config.toml");
         upsert_codex_mcp_server(
@@ -709,19 +793,19 @@ name="demo"
             "/path/to/mcp-repl",
             &["--sandbox-state".to_string(), "inherit".to_string()],
         )
-        .expect("upsert codex");
+        .expect("upsert codex inherit");
         upsert_codex_mcp_server(
             &config,
             "repl",
             "/path/to/mcp-repl",
             &["--sandbox-state".to_string(), "workspace-write".to_string()],
         )
-        .expect("upsert codex");
+        .expect("upsert codex workspace-write");
 
         let text = fs::read_to_string(config).expect("read config");
         assert!(
             !text.contains("--sandbox-state inherit: use sandbox policy updates sent by Codex"),
-            "did not expect stale inherit comment in codex config"
+            "inherit-only comment should be removed when inherit is no longer configured"
         );
     }
 
@@ -838,7 +922,12 @@ name="demo"
             &config,
             "repl",
             "/path/to/mcp-repl",
-            &["--sandbox-state".to_string(), "workspace-write".to_string()],
+            &[
+                "--interpreter".to_string(),
+                "python".to_string(),
+                "--sandbox-state".to_string(),
+                "workspace-write".to_string(),
+            ],
         )
         .expect("upsert claude");
 
@@ -847,13 +936,31 @@ name="demo"
         let server = &root["mcpServers"]["repl"];
         assert_eq!(
             server["args"][0].as_str(),
+            Some("--interpreter"),
+            "expected explicit interpreter arg in claude config"
+        );
+        assert_eq!(
+            server["args"][1].as_str(),
+            Some("python"),
+            "expected explicit python interpreter in claude config"
+        );
+        assert_eq!(
+            server["args"][2].as_str(),
             Some("--sandbox-state"),
             "expected explicit sandbox-state arg in claude config"
         );
         assert_eq!(
-            server["args"][1].as_str(),
+            server["args"][3].as_str(),
             Some("workspace-write"),
             "expected workspace-write default in claude config"
+        );
+        assert!(
+            text.contains("\"--interpreter\", \"python\""),
+            "expected related interpreter args to share one line"
+        );
+        assert!(
+            text.contains("\"--sandbox-state\", \"workspace-write\""),
+            "expected related sandbox args to share one line"
         );
         assert!(
             server.get("_comment_sandbox_state").is_none(),

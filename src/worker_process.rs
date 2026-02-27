@@ -424,6 +424,34 @@ fn split_write_stdin_control_prefix(input: &str) -> Option<(WriteStdinControlAct
     Some((action, tail))
 }
 
+fn worker_context_event_payload(
+    backend: Backend,
+    sandbox_state: &SandboxState,
+    preserve_pager: Option<bool>,
+) -> serde_json::Value {
+    let sandbox_policy = serde_json::to_value(&sandbox_state.sandbox_policy)
+        .unwrap_or_else(|err| serde_json::json!({ "serialize_error": err.to_string() }));
+    let mut payload = serde_json::json!({
+        "backend": format!("{backend:?}"),
+        "sandbox_policy": sandbox_policy,
+        "sandbox_cwd": sandbox_state.sandbox_cwd.to_string_lossy().to_string(),
+        "session_temp_dir": sandbox_state.session_temp_dir.to_string_lossy().to_string(),
+        "codex_linux_sandbox_exe": sandbox_state
+            .codex_linux_sandbox_exe
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string()),
+    });
+    if let Some(preserve_pager) = preserve_pager
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert(
+            "preserve_pager".to_string(),
+            serde_json::Value::Bool(preserve_pager),
+        );
+    }
+    payload
+}
+
 pub struct WorkerManager {
     exe_path: PathBuf,
     backend: Backend,
@@ -453,6 +481,9 @@ impl WorkerManager {
         if let Some(update) = crate::sandbox::initial_sandbox_state_update() {
             sandbox_state.apply_update(update);
         }
+        crate::event_log::log_lazy("worker_manager_created", || {
+            worker_context_event_payload(backend, &sandbox_state, None)
+        });
         let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
         reset_output_ring();
         reset_last_reply_marker_offset();
@@ -1188,6 +1219,12 @@ impl WorkerManager {
     }
 
     pub fn interrupt(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
+        crate::event_log::log(
+            "worker_interrupt_begin",
+            serde_json::json!({
+                "timeout_ms": timeout.as_millis(),
+            }),
+        );
         self.ensure_process()?;
         if let Err(err) = self.driver.interrupt(
             self.process
@@ -1195,6 +1232,12 @@ impl WorkerManager {
                 .expect("worker process should be available"),
         ) {
             self.reset()?;
+            crate::event_log::log(
+                "worker_interrupt_error",
+                serde_json::json!({
+                    "error": err.to_string(),
+                }),
+            );
             return Err(err);
         }
 
@@ -1301,10 +1344,23 @@ impl WorkerManager {
                 .and(resolved_prompt),
             prompt_variants: None,
         };
+        crate::event_log::log(
+            "worker_interrupt_end",
+            serde_json::json!({
+                "timed_out": timed_out,
+                "session_end": session_end,
+            }),
+        );
         Ok(self.finalize_reply(ReplyWithOffset { reply, end_offset }))
     }
 
     pub fn restart(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
+        crate::event_log::log(
+            "worker_restart_begin",
+            serde_json::json!({
+                "timeout_ms": timeout.as_millis(),
+            }),
+        );
         if let Some(process) = self.process.take() {
             let _ = process.shutdown_graceful(timeout);
         }
@@ -1313,10 +1369,12 @@ impl WorkerManager {
         let page_bytes = pager::resolve_page_bytes(None);
         let reply = self.build_session_reset_reply(page_bytes, "new session started");
         self.reset_output_state(false);
+        crate::event_log::log("worker_restart_end", serde_json::json!({"status": "ok"}));
         Ok(self.finalize_reply(reply))
     }
 
     pub fn shutdown(&mut self) {
+        crate::event_log::log("worker_shutdown", serde_json::json!({}));
         if let Some(process) = self.process.take() {
             let _ = process.kill();
         }
@@ -1340,20 +1398,35 @@ impl WorkerManager {
     }
 
     fn reset(&mut self) -> Result<(), WorkerError> {
+        crate::event_log::log("worker_reset_begin", serde_json::json!({}));
         if let Some(process) = self.process.take() {
             let _ = process.kill();
         }
         self.guardrail.busy.store(false, Ordering::Relaxed);
         self.process = Some(self.spawn_process()?);
+        crate::event_log::log("worker_reset_end", serde_json::json!({"status": "ok"}));
         Ok(())
     }
 
     fn reset_with_pager(&mut self, preserve_pager: bool) -> Result<(), WorkerError> {
+        crate::event_log::log(
+            "worker_reset_with_pager_begin",
+            serde_json::json!({
+                "preserve_pager": preserve_pager,
+            }),
+        );
         if let Some(process) = self.process.take() {
             let _ = process.kill();
         }
         self.guardrail.busy.store(false, Ordering::Relaxed);
         self.process = Some(self.spawn_process_with_pager(preserve_pager)?);
+        crate::event_log::log(
+            "worker_reset_with_pager_end",
+            serde_json::json!({
+                "status": "ok",
+                "preserve_pager": preserve_pager,
+            }),
+        );
         Ok(())
     }
 
@@ -1362,8 +1435,18 @@ impl WorkerManager {
         update: SandboxStateUpdate,
         timeout: Duration,
     ) -> Result<bool, WorkerError> {
+        let update_for_log = serde_json::to_value(&update)
+            .unwrap_or_else(|err| serde_json::json!({"serialize_error": err.to_string()}));
         crate::sandbox::log_sandbox_policy_update(&update.sandbox_policy);
         let changed = self.sandbox_state.apply_update(update);
+        crate::event_log::log(
+            "worker_sandbox_state_update",
+            serde_json::json!({
+                "changed": changed,
+                "timeout_ms": timeout.as_millis(),
+                "update": update_for_log,
+            }),
+        );
         if !changed {
             return Ok(false);
         }
@@ -1426,6 +1509,9 @@ impl WorkerManager {
 
     fn spawn_process(&mut self) -> Result<WorkerProcess, WorkerError> {
         self.reset_output_state(false);
+        crate::event_log::log_lazy("worker_spawn_begin", || {
+            worker_context_event_payload(self.backend, &self.sandbox_state, Some(false))
+        });
         let process = WorkerProcess::spawn(
             self.backend,
             &self.exe_path,
@@ -1439,10 +1525,24 @@ impl WorkerManager {
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
         if let Err(err) = self.driver.refresh_backend_info(ipc, BACKEND_INFO_TIMEOUT) {
             let _ = process.kill();
+            crate::event_log::log(
+                "worker_spawn_error",
+                serde_json::json!({
+                    "error": err.to_string(),
+                    "backend": format!("{:?}", self.backend),
+                }),
+            );
             return Err(err);
         }
         self.seed_last_prompt_from_process(&process);
         self.record_spawn();
+        crate::event_log::log(
+            "worker_spawn_end",
+            serde_json::json!({
+                "backend": format!("{:?}", self.backend),
+                "spawn_count": self.spawn_count,
+            }),
+        );
         Ok(process)
     }
 
@@ -1451,6 +1551,9 @@ impl WorkerManager {
         preserve_pager: bool,
     ) -> Result<WorkerProcess, WorkerError> {
         self.reset_output_state(preserve_pager);
+        crate::event_log::log_lazy("worker_spawn_begin", || {
+            worker_context_event_payload(self.backend, &self.sandbox_state, Some(preserve_pager))
+        });
         let process = WorkerProcess::spawn(
             self.backend,
             &self.exe_path,
@@ -1464,10 +1567,25 @@ impl WorkerManager {
             .ok_or_else(|| WorkerError::Protocol("worker ipc unavailable".to_string()))?;
         if let Err(err) = self.driver.refresh_backend_info(ipc, BACKEND_INFO_TIMEOUT) {
             let _ = process.kill();
+            crate::event_log::log(
+                "worker_spawn_error",
+                serde_json::json!({
+                    "error": err.to_string(),
+                    "backend": format!("{:?}", self.backend),
+                }),
+            );
             return Err(err);
         }
         self.seed_last_prompt_from_process(&process);
         self.record_spawn();
+        crate::event_log::log(
+            "worker_spawn_end",
+            serde_json::json!({
+                "backend": format!("{:?}", self.backend),
+                "spawn_count": self.spawn_count,
+                "preserve_pager": preserve_pager,
+            }),
+        );
         Ok(process)
     }
 
@@ -3327,6 +3445,12 @@ fn worker_error_code(err: &WorkerError) -> Option<WorkerErrorCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn cwd_test_mutex() -> &'static Mutex<()> {
+        static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+        TEST_MUTEX.get_or_init(|| Mutex::new(()))
+    }
 
     fn echo_event(prompt: &str, line: &str) -> IpcEchoEvent {
         IpcEchoEvent {
@@ -3450,6 +3574,33 @@ mod tests {
             }
             _ => panic!("expected stdin_write control message"),
         }
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn worker_manager_new_does_not_panic_for_non_utf8_tmpdir_env() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let _guard = cwd_test_mutex().lock().expect("cwd mutex");
+        let original_tmpdir = std::env::var_os("TMPDIR");
+        let non_utf8_tmpdir = OsString::from_vec(b"/tmp/non-utf8-\xFF-tmp".to_vec());
+
+        unsafe {
+            std::env::set_var("TMPDIR", &non_utf8_tmpdir);
+        }
+        let result = std::panic::catch_unwind(|| WorkerManager::new(Backend::Python));
+
+        match original_tmpdir {
+            Some(value) => unsafe {
+                std::env::set_var("TMPDIR", value);
+            },
+            None => unsafe {
+                std::env::remove_var("TMPDIR");
+            },
+        }
+
+        assert!(result.is_ok(), "WorkerManager::new should not panic");
     }
 
     #[cfg(target_family = "windows")]
