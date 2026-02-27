@@ -503,25 +503,22 @@ pub fn prepare_worker_command(
             "0".to_string()
         },
     );
-    if state.managed_network_policy.allowed_domains.is_empty() {
-        env.remove(MANAGED_ALLOWED_DOMAINS_ENV_KEY);
-    } else {
-        env.insert(
-            MANAGED_ALLOWED_DOMAINS_ENV_KEY.to_string(),
-            state.managed_network_policy.allowed_domains.join(","),
-        );
-    }
-    if state.managed_network_policy.denied_domains.is_empty() {
-        env.remove(MANAGED_DENIED_DOMAINS_ENV_KEY);
-    } else {
-        env.insert(
-            MANAGED_DENIED_DOMAINS_ENV_KEY.to_string(),
-            state.managed_network_policy.denied_domains.join(","),
-        );
-    }
-    if state.managed_network_policy.has_domain_restrictions() {
-        env.insert(MANAGED_NETWORK_ENV_KEY.to_string(), "1".to_string());
-    }
+    env.insert(
+        MANAGED_ALLOWED_DOMAINS_ENV_KEY.to_string(),
+        state.managed_network_policy.allowed_domains.join(","),
+    );
+    env.insert(
+        MANAGED_DENIED_DOMAINS_ENV_KEY.to_string(),
+        state.managed_network_policy.denied_domains.join(","),
+    );
+    env.insert(
+        MANAGED_NETWORK_ENV_KEY.to_string(),
+        if state.managed_network_policy.has_domain_restrictions() {
+            "1".to_string()
+        } else {
+            "0".to_string()
+        },
+    );
 
     prepare_session_temp_dir(&state.session_temp_dir)?;
     {
@@ -2332,6 +2329,43 @@ mod tests {
                 .map(String::as_str),
             Some("0"),
             "explicit false override should disable local binding even when inherited env enables it"
+        );
+    }
+
+    #[test]
+    fn prepare_worker_command_clears_managed_domain_env_when_lists_are_empty() {
+        let mut state = SandboxState::default();
+        state.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        state.managed_network_policy.allowed_domains = Vec::new();
+        state.managed_network_policy.denied_domains = Vec::new();
+
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("prepare_worker_command should succeed");
+
+        assert_eq!(
+            prepared
+                .env
+                .get(MANAGED_ALLOWED_DOMAINS_ENV_KEY)
+                .map(String::as_str),
+            Some(""),
+            "allowed domains must be explicitly cleared for child processes"
+        );
+        assert_eq!(
+            prepared
+                .env
+                .get(MANAGED_DENIED_DOMAINS_ENV_KEY)
+                .map(String::as_str),
+            Some(""),
+            "denied domains must be explicitly cleared for child processes"
+        );
+        assert_eq!(
+            prepared
+                .env
+                .get(MANAGED_NETWORK_ENV_KEY)
+                .map(String::as_str),
+            Some("0"),
+            "managed network marker must be explicitly disabled when no domain restrictions exist"
         );
     }
 
