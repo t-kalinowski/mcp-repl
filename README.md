@@ -106,7 +106,7 @@ args = [
 Example `Python` REPL Codex config:
 
 ```toml
-[mcp_servers.python_repl]
+[mcp_servers.py_repl]
 command = "/Users/alice/.cargo/bin/mcp-repl"
 # mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.
 tool_timeout_sec = 1800
@@ -128,7 +128,7 @@ propagate sandbox state updates to MCP servers:
       "command": "/Users/alice/.cargo/bin/mcp-repl",
       "args": ["--sandbox-state", "workspace-write", "--interpreter", "r"]
     },
-    "python_repl": {
+    "py_repl": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
       "args": ["--sandbox-state", "workspace-write", "--interpreter", "python"]
     }
@@ -138,7 +138,7 @@ propagate sandbox state updates to MCP servers:
 
 By default install creates one entry per supported interpreter:
 - `r_repl`
-- `python_repl`
+- `py_repl`
 
 Use `--interpreter r`, `--interpreter python`, or comma-separated/repeatable forms
 to limit which interpreters are installed.

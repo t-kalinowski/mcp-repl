@@ -12,7 +12,7 @@ const CODEX_TOOL_TIMEOUT_COMMENT: &str =
     "\n# mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.\n";
 const CODEX_SANDBOX_INHERIT_COMMENT: &str = "\n# --sandbox-state inherit: use sandbox policy updates sent by Codex for this session.\n# If no update is sent, mcp-repl falls back to its internal default policy.\n";
 pub const DEFAULT_R_SERVER_NAME: &str = "r_repl";
-pub const DEFAULT_PYTHON_SERVER_NAME: &str = "python_repl";
+pub const DEFAULT_PYTHON_SERVER_NAME: &str = "py_repl";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallInterpreter {
@@ -391,13 +391,16 @@ fn upsert_codex_mcp_server(
             .leaf_decor_mut()
             .set_prefix(CODEX_TOOL_TIMEOUT_COMMENT);
     }
-    if contains_sandbox_state_value(args, "inherit")
-        && let Some(server_table) = doc["mcp_servers"][server_name].as_table_mut()
+    if let Some(server_table) = doc["mcp_servers"][server_name].as_table_mut()
         && let Some(mut args_key) = server_table.key_mut("args")
     {
-        args_key
-            .leaf_decor_mut()
-            .set_prefix(CODEX_SANDBOX_INHERIT_COMMENT);
+        if contains_sandbox_state_value(args, "inherit") {
+            args_key
+                .leaf_decor_mut()
+                .set_prefix(CODEX_SANDBOX_INHERIT_COMMENT);
+        } else {
+            args_key.leaf_decor_mut().set_prefix("");
+        }
     }
 
     atomic_write(config_path, &doc.to_string())?;
@@ -693,6 +696,32 @@ name="demo"
         assert!(
             text.contains("--sandbox-state inherit: use sandbox policy updates sent by Codex"),
             "expected inherit comment in codex config"
+        );
+    }
+
+    #[test]
+    fn upsert_codex_mcp_server_clears_stale_inherit_comment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("config.toml");
+        upsert_codex_mcp_server(
+            &config,
+            "repl",
+            "/path/to/mcp-repl",
+            &["--sandbox-state".to_string(), "inherit".to_string()],
+        )
+        .expect("upsert codex");
+        upsert_codex_mcp_server(
+            &config,
+            "repl",
+            "/path/to/mcp-repl",
+            &["--sandbox-state".to_string(), "workspace-write".to_string()],
+        )
+        .expect("upsert codex");
+
+        let text = fs::read_to_string(config).expect("read config");
+        assert!(
+            !text.contains("--sandbox-state inherit: use sandbox policy updates sent by Codex"),
+            "did not expect stale inherit comment in codex config"
         );
     }
 

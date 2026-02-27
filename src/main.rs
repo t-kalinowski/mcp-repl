@@ -380,7 +380,7 @@ fn parse_install_targets_value(
     for part in raw.split(',') {
         let trimmed = part.trim();
         if trimmed.is_empty() {
-            continue;
+            return Err("empty --client value (expected codex|claude)".into());
         }
         targets.push(
             install::InstallTarget::parse(trimmed)
@@ -527,7 +527,7 @@ mcp-repl install [codex] [claude] [--client <codex|claude>]... [--interpreter <r
 --sandbox-network-access: restricted | enabled (workspace-write only; default: restricted)\n\
 --writable-root: additional absolute writable path (repeatable; workspace-write only)\n\
 install: update MCP config for existing agent homes only (does not create ~/.codex or ~/.claude)\n\
-install defaults to the full interpreter grid for each selected client (currently r_repl + python_repl)"
+install defaults to the full interpreter grid for each selected client (currently r_repl + py_repl)"
     );
 }
 
@@ -658,6 +658,16 @@ mod tests {
         let err = parse_install_interpreters_value("", &mut interpreters).expect_err("empty value");
         assert!(
             err.to_string().contains("empty --interpreter value"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_install_targets_value_rejects_empty_values() {
+        let mut targets = Vec::new();
+        let err = parse_install_targets_value(",", &mut targets).expect_err("empty value");
+        assert!(
+            err.to_string().contains("empty --client value"),
             "unexpected error: {err}"
         );
     }
