@@ -6,6 +6,7 @@ use common::TestResult;
 use rmcp::model::RawContent;
 use rmcp::service::ServiceError;
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant};
 
 fn test_mutex() -> &'static Mutex<()> {
     static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -113,11 +114,27 @@ async fn write_stdin_accepts_crlf_input() -> TestResult<()> {
 
     let input = "cat('A\\n')\r\ncat('B\\n')";
     let result = session.write_stdin_raw_with(input, Some(10.0)).await?;
-    let text = result_text(&result);
+    let mut text = result_text(&result);
     if backend_unavailable(&text) {
         eprintln!("write_stdin_edge_cases backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
+    }
+    if text.contains("<<console status: busy") {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while text.contains("<<console status: busy") && Instant::now() < deadline {
+            let polled = session
+                .write_stdin_raw_unterminated_with("", Some(5.0))
+                .await?;
+            text = result_text(&polled);
+            if backend_unavailable(&text) {
+                eprintln!(
+                    "write_stdin_edge_cases backend unavailable in this environment; skipping"
+                );
+                session.cancel().await?;
+                return Ok(());
+            }
+        }
     }
     session.cancel().await?;
     assert!(

@@ -37,6 +37,7 @@ writable_roots = [
 
 - This is intentionally deferred.
 - Current implementation uses explicit repeatable CLI flags:
-  - `--sandbox-mode`
-  - `--sandbox-network-access`
-  - `--writable-root`
+  - `--sandbox`
+  - `--add-writable-root`
+  - `--add-allowed-domain`
+  - `--config key=value` for advanced overrides

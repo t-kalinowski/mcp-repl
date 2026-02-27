@@ -49,7 +49,7 @@ fn assert_no_console_encoding_artifacts(text: &str) {
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_windows_output_has_no_utf8_marker_artifacts() -> TestResult<()> {
     let mut session = common::spawn_server_with_args(vec![
-        "--sandbox-state".to_string(),
+        "--sandbox".to_string(),
         "danger-full-access".to_string(),
     ])
     .await?;

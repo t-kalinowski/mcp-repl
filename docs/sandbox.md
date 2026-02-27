@@ -5,10 +5,13 @@
 
 ## Default policy
 
-When no sandbox update is provided by the MCP client, the default is:
+When no CLI sandbox mode is provided, the default is:
 
 - `workspace-write`
 - `network_access: false`
+
+When `--sandbox inherit` is used, startup requires a client sandbox update
+(`codex/sandbox-state/update`). If no update is provided, startup fails fast.
 
 The worker also gets a per-session temp directory, exported as:
 
@@ -17,11 +20,18 @@ The worker also gets a per-session temp directory, exported as:
 
 ## Configure sandbox policy
 
-- CLI state selector: `mcp-repl --sandbox-state inherit|read-only|workspace-write|danger-full-access|<json>`
-- CLI mode: `mcp-repl --sandbox-mode read-only|workspace-write|danger-full-access`
-- CLI network toggle (workspace-write only): `mcp-repl --sandbox-network-access restricted|enabled`
-- CLI writable roots (workspace-write only, repeatable): `mcp-repl --writable-root /absolute/path`
-- MCP custom method: `codex/sandbox-state/update` (experimental capability `codex/sandbox-state`)
+- Base mode: `mcp-repl --sandbox inherit|read-only|workspace-write|danger-full-access`
+- Add writable roots (workspace-write only, repeatable):
+  `mcp-repl --add-writable-root /absolute/path`
+- Add allowed domains (repeatable):
+  `mcp-repl --add-allowed-domain <pattern>`
+- Advanced overrides:
+  `mcp-repl --config key=value` with Codex-shaped keys
+- MCP sandbox update method:
+  `codex/sandbox-state/update` (capability `codex/sandbox-state`)
+
+Operations are applied strictly in CLI argument order. Later operations win.
+`--sandbox ...` resets the base policy at the point where it appears.
 
 ## macOS behavior
 
@@ -35,7 +45,8 @@ For `workspace-write`, writable roots include:
 - temp roots (`/tmp`, `TMPDIR` when absolute), and
 - the per-session temp directory.
 
-If you also need R data/config roots, add them explicitly with repeatable `--writable-root` entries.
+If you also need R data/config roots, add them explicitly with repeatable
+`--add-writable-root` entries.
 
 Within writable roots, these subpaths are forced read-only when present:
 

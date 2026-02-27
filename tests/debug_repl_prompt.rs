@@ -53,7 +53,7 @@ fn debug_repl_prints_initial_prompt() -> TestResult<()> {
     cmd.arg("--debug-repl");
     #[cfg(target_os = "macos")]
     if !sandbox_exec_available() {
-        cmd.arg("--sandbox-state").arg("danger-full-access");
+        cmd.arg("--sandbox").arg("danger-full-access");
     }
     let mut child = cmd
         .env("MCP_CONSOLE_REPL_IMAGES", "0")

@@ -33,6 +33,7 @@ use crate::pager::{self, Pager};
 use crate::sandbox::{
     R_SESSION_TMPDIR_ENV, SandboxState, SandboxStateUpdate, prepare_worker_command,
 };
+use crate::sandbox_cli::{SandboxCliPlan, resolve_effective_sandbox_state_with_defaults};
 use crate::worker_protocol::{
     TextStream, WORKER_MODE_ARG, WorkerContent, WorkerErrorCode, WorkerReply,
 };
@@ -440,6 +441,12 @@ fn worker_context_event_payload(
             .codex_linux_sandbox_exe
             .as_ref()
             .map(|path| path.to_string_lossy().to_string()),
+        "use_linux_sandbox_bwrap": sandbox_state.use_linux_sandbox_bwrap,
+        "managed_network_policy": {
+            "allowed_domains": sandbox_state.managed_network_policy.allowed_domains.clone(),
+            "denied_domains": sandbox_state.managed_network_policy.denied_domains.clone(),
+            "allow_local_binding": sandbox_state.managed_network_policy.allow_local_binding,
+        },
     });
     if let Some(preserve_pager) = preserve_pager
         && let Some(object) = payload.as_object_mut()
@@ -456,6 +463,9 @@ pub struct WorkerManager {
     exe_path: PathBuf,
     backend: Backend,
     process: Option<WorkerProcess>,
+    sandbox_plan: SandboxCliPlan,
+    inherited_sandbox_state: Option<SandboxState>,
+    sandbox_defaults: SandboxState,
     sandbox_state: SandboxState,
     output: OutputBuffer,
     pager: Pager,
@@ -475,12 +485,26 @@ pub struct WorkerManager {
 }
 
 impl WorkerManager {
-    pub fn new(backend: Backend) -> Result<Self, WorkerError> {
+    pub fn new(backend: Backend, sandbox_plan: SandboxCliPlan) -> Result<Self, WorkerError> {
         let exe_path = std::env::current_exe()?;
-        let mut sandbox_state = SandboxState::default();
+        let sandbox_defaults = crate::sandbox::sandbox_state_defaults_with_environment();
+        let mut inherited_state = sandbox_defaults.clone();
+        let mut inherited_update_received = false;
         if let Some(update) = crate::sandbox::initial_sandbox_state_update() {
-            sandbox_state.apply_update(update);
+            inherited_state.apply_update(update);
+            inherited_update_received = true;
         }
+        let inherited = if inherited_update_received {
+            Some(&inherited_state)
+        } else {
+            None
+        };
+        let sandbox_state = resolve_effective_sandbox_state_with_defaults(
+            &sandbox_plan,
+            inherited,
+            &sandbox_defaults,
+        )
+        .map_err(WorkerError::Sandbox)?;
         crate::event_log::log_lazy("worker_manager_created", || {
             worker_context_event_payload(backend, &sandbox_state, None)
         });
@@ -492,6 +516,9 @@ impl WorkerManager {
             exe_path,
             backend,
             process: None,
+            sandbox_plan,
+            inherited_sandbox_state: inherited_update_received.then_some(inherited_state),
+            sandbox_defaults,
             sandbox_state,
             output: OutputBuffer::default(),
             pager: Pager::default(),
@@ -1438,7 +1465,20 @@ impl WorkerManager {
         let update_for_log = serde_json::to_value(&update)
             .unwrap_or_else(|err| serde_json::json!({"serialize_error": err.to_string()}));
         crate::sandbox::log_sandbox_policy_update(&update.sandbox_policy);
-        let changed = self.sandbox_state.apply_update(update);
+        let mut inherited_state = self
+            .inherited_sandbox_state
+            .clone()
+            .unwrap_or_else(|| self.sandbox_defaults.clone());
+        inherited_state.apply_update(update);
+        let resolved_state = resolve_effective_sandbox_state_with_defaults(
+            &self.sandbox_plan,
+            Some(&inherited_state),
+            &self.sandbox_defaults,
+        )
+        .map_err(WorkerError::Sandbox)?;
+        self.inherited_sandbox_state = Some(inherited_state);
+        let changed = self.sandbox_state != resolved_state;
+        self.sandbox_state = resolved_state;
         crate::event_log::log(
             "worker_sandbox_state_update",
             serde_json::json!({
@@ -3253,7 +3293,7 @@ fn maybe_report_sandbox_exec_failure(
             .is_some_and(|name| name == "sandbox-exec");
         if is_sandbox_exec && _status.code() == Some(71) {
             return Err(WorkerError::Sandbox(
-                "sandbox-exec failed (Operation not permitted). Start mcp-console with --sandbox-state danger-full-access to disable sandboxing."
+                "sandbox-exec failed (Operation not permitted). Start mcp-repl with --sandbox danger-full-access to disable sandboxing."
                     .to_string(),
             ));
         }
@@ -3445,6 +3485,7 @@ fn worker_error_code(err: &WorkerError) -> Option<WorkerErrorCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::SandboxPolicy;
     use std::sync::{Mutex, OnceLock};
 
     fn cwd_test_mutex() -> &'static Mutex<()> {
@@ -3589,7 +3630,9 @@ mod tests {
         unsafe {
             std::env::set_var("TMPDIR", &non_utf8_tmpdir);
         }
-        let result = std::panic::catch_unwind(|| WorkerManager::new(Backend::Python));
+        let result = std::panic::catch_unwind(|| {
+            WorkerManager::new(Backend::Python, SandboxCliPlan::default())
+        });
 
         match original_tmpdir {
             Some(value) => unsafe {
@@ -3601,6 +3644,71 @@ mod tests {
         }
 
         assert!(result.is_ok(), "WorkerManager::new should not panic");
+    }
+
+    #[test]
+    fn failed_sandbox_update_does_not_commit_inherited_state() {
+        let _guard = cwd_test_mutex().lock().expect("cwd mutex");
+        let original_initial = std::env::var_os(crate::sandbox::INITIAL_SANDBOX_STATE_ENV);
+        let initial = serde_json::json!({
+            "sandboxPolicy": {
+                "type": "workspace-write",
+                "writable_roots": [],
+                "network_access": false,
+                "exclude_tmpdir_env_var": false,
+                "exclude_slash_tmp": false
+            }
+        })
+        .to_string();
+        unsafe {
+            std::env::set_var(crate::sandbox::INITIAL_SANDBOX_STATE_ENV, initial);
+        }
+
+        let plan = crate::sandbox_cli::SandboxCliPlan {
+            operations: vec![
+                crate::sandbox_cli::SandboxCliOperation::SetMode(
+                    crate::sandbox_cli::SandboxModeArg::Inherit,
+                ),
+                crate::sandbox_cli::SandboxCliOperation::Config(
+                    crate::sandbox_cli::SandboxConfigOperation::SetWorkspaceNetworkAccess(true),
+                ),
+            ],
+        };
+        let mut manager = WorkerManager::new(Backend::Python, plan).expect("worker manager");
+        let inherited_before = manager
+            .inherited_sandbox_state
+            .clone()
+            .expect("inherited state should be present");
+
+        let err = manager
+            .update_sandbox_state(
+                SandboxStateUpdate {
+                    sandbox_policy: SandboxPolicy::DangerFullAccess,
+                    sandbox_cwd: None,
+                    codex_linux_sandbox_exe: None,
+                    use_linux_sandbox_bwrap: None,
+                },
+                Duration::from_millis(1),
+            )
+            .expect_err("danger-full-access should fail workspace-write-only config");
+        assert!(
+            matches!(err, WorkerError::Sandbox(ref msg) if msg.contains("requires workspace-write mode")),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            manager.inherited_sandbox_state,
+            Some(inherited_before),
+            "failed updates must not mutate inherited sandbox baseline"
+        );
+
+        match original_initial {
+            Some(value) => unsafe {
+                std::env::set_var(crate::sandbox::INITIAL_SANDBOX_STATE_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(crate::sandbox::INITIAL_SANDBOX_STATE_ENV);
+            },
+        }
     }
 
     #[cfg(target_family = "windows")]

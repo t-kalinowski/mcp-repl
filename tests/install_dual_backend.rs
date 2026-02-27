@@ -70,10 +70,10 @@ fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     let has_sandbox_inherit = r_args
         .iter()
         .zip(r_args.iter().skip(1))
-        .any(|(a, b)| a.as_str() == Some("--sandbox-state") && b.as_str() == Some("inherit"));
+        .any(|(a, b)| a.as_str() == Some("--sandbox") && b.as_str() == Some("inherit"));
     assert!(
         has_sandbox_inherit,
-        "expected r_repl args to include `--sandbox-state inherit`"
+        "expected r_repl args to include `--sandbox inherit`"
     );
 
     let py_args = doc["mcp_servers"]["py_repl"]["args"]
@@ -90,10 +90,10 @@ fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     let py_has_sandbox_inherit = py_args
         .iter()
         .zip(py_args.iter().skip(1))
-        .any(|(a, b)| a.as_str() == Some("--sandbox-state") && b.as_str() == Some("inherit"));
+        .any(|(a, b)| a.as_str() == Some("--sandbox") && b.as_str() == Some("inherit"));
     assert!(
         py_has_sandbox_inherit,
-        "expected py_repl args to include `--sandbox-state inherit`"
+        "expected py_repl args to include `--sandbox inherit`"
     );
 
     Ok(())
@@ -131,23 +131,25 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     let r_args = root["mcpServers"]["r_repl"]["args"]
         .as_array()
         .expect("expected r_repl args array");
-    let r_has_workspace_write = r_args.iter().zip(r_args.iter().skip(1)).any(|(a, b)| {
-        a.as_str() == Some("--sandbox-state") && b.as_str() == Some("workspace-write")
-    });
+    let r_has_workspace_write = r_args
+        .iter()
+        .zip(r_args.iter().skip(1))
+        .any(|(a, b)| a.as_str() == Some("--sandbox") && b.as_str() == Some("workspace-write"));
     assert!(
         r_has_workspace_write,
-        "expected r_repl args to include `--sandbox-state workspace-write`"
+        "expected r_repl args to include `--sandbox workspace-write`"
     );
 
     let py_args = root["mcpServers"]["py_repl"]["args"]
         .as_array()
         .expect("expected py_repl args array");
-    let py_has_workspace_write = py_args.iter().zip(py_args.iter().skip(1)).any(|(a, b)| {
-        a.as_str() == Some("--sandbox-state") && b.as_str() == Some("workspace-write")
-    });
+    let py_has_workspace_write = py_args
+        .iter()
+        .zip(py_args.iter().skip(1))
+        .any(|(a, b)| a.as_str() == Some("--sandbox") && b.as_str() == Some("workspace-write"));
     assert!(
         py_has_workspace_write,
-        "expected py_repl args to include `--sandbox-state workspace-write`"
+        "expected py_repl args to include `--sandbox workspace-write`"
     );
     let py_has_interpreter_python = py_args.iter().zip(py_args.iter().skip(1)).any(|(a, b)| {
         (a.as_str() == Some("--interpreter") || a.as_str() == Some("--backend"))

@@ -923,7 +923,7 @@ pub async fn spawn_python_server() -> TestResult<McpTestSession> {
     spawn_server_with_args(vec![
         "--interpreter".to_string(),
         "python".to_string(),
-        "--sandbox-state".to_string(),
+        "--sandbox".to_string(),
         "danger-full-access".to_string(),
     ])
     .await
@@ -970,9 +970,9 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
     if !sandbox_exec_available()
         && !args
             .iter()
-            .any(|arg| arg == "--sandbox-state" || arg.starts_with("--sandbox-state="))
+            .any(|arg| arg == "--sandbox" || arg.starts_with("--sandbox="))
     {
-        args.push("--sandbox-state".to_string());
+        args.push("--sandbox".to_string());
         args.push("danger-full-access".to_string());
     }
     let transport = TokioChildProcess::new(Command::new(exe).configure(|cmd| {

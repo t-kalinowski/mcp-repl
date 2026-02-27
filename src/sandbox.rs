@@ -17,6 +17,8 @@ use tempfile::Builder;
 
 pub const SANDBOX_STATE_CAPABILITY: &str = "codex/sandbox-state";
 pub const SANDBOX_STATE_METHOD: &str = "codex/sandbox-state/update";
+pub const MANAGED_ALLOWED_DOMAINS_ENV_KEY: &str = "MCP_CONSOLE_ALLOWED_DOMAINS";
+pub const MANAGED_DENIED_DOMAINS_ENV_KEY: &str = "MCP_CONSOLE_DENIED_DOMAINS";
 #[cfg(target_os = "macos")]
 pub const CODEX_SANDBOX_ENV_VAR: &str = "CODEX_SANDBOX";
 pub const CODEX_SANDBOX_NETWORK_DISABLED_ENV_VAR: &str = "CODEX_SANDBOX_NETWORK_DISABLED";
@@ -70,6 +72,19 @@ pub enum NetworkAccess {
 impl NetworkAccess {
     pub fn is_enabled(self) -> bool {
         matches!(self, NetworkAccess::Enabled)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ManagedNetworkPolicy {
+    pub allowed_domains: Vec<String>,
+    pub denied_domains: Vec<String>,
+    pub allow_local_binding: bool,
+}
+
+impl ManagedNetworkPolicy {
+    pub fn has_domain_restrictions(&self) -> bool {
+        !self.allowed_domains.is_empty() || !self.denied_domains.is_empty()
     }
 }
 
@@ -204,7 +219,6 @@ fn ensure_absolute(path: PathBuf) -> Option<PathBuf> {
     if path.is_absolute() { Some(path) } else { None }
 }
 
-#[cfg(target_os = "linux")]
 fn env_var_truthy(key: &str) -> bool {
     std::env::var(key).ok().is_some_and(|value| {
         let trimmed = value.trim();
@@ -347,6 +361,8 @@ pub struct SandboxState {
     pub sandbox_policy: SandboxPolicy,
     pub sandbox_cwd: PathBuf,
     pub codex_linux_sandbox_exe: Option<PathBuf>,
+    pub use_linux_sandbox_bwrap: bool,
+    pub managed_network_policy: ManagedNetworkPolicy,
     pub session_temp_dir: PathBuf,
 }
 
@@ -402,6 +418,8 @@ pub struct SandboxStateUpdate {
     pub sandbox_cwd: Option<PathBuf>,
     #[serde(default)]
     pub codex_linux_sandbox_exe: Option<PathBuf>,
+    #[serde(default)]
+    pub use_linux_sandbox_bwrap: Option<bool>,
 }
 
 pub fn initial_sandbox_state_update() -> Option<SandboxStateUpdate> {
@@ -425,6 +443,9 @@ impl SandboxState {
         if let Some(exe) = update.codex_linux_sandbox_exe {
             next.codex_linux_sandbox_exe = Some(exe);
         }
+        if let Some(use_bwrap) = update.use_linux_sandbox_bwrap {
+            next.use_linux_sandbox_bwrap = use_bwrap;
+        }
         let changed = next != *self;
         *self = next;
         changed
@@ -445,6 +466,8 @@ impl Default for SandboxState {
             },
             sandbox_cwd,
             codex_linux_sandbox_exe,
+            use_linux_sandbox_bwrap: false,
+            managed_network_policy: ManagedNetworkPolicy::default(),
             session_temp_dir,
         }
     }
@@ -472,6 +495,30 @@ pub fn prepare_worker_command(
             "1".to_string(),
         );
     }
+    env.insert(
+        ALLOW_LOCAL_BINDING_ENV_KEY.to_string(),
+        if state.managed_network_policy.allow_local_binding {
+            "1".to_string()
+        } else {
+            "0".to_string()
+        },
+    );
+    env.insert(
+        MANAGED_ALLOWED_DOMAINS_ENV_KEY.to_string(),
+        state.managed_network_policy.allowed_domains.join(","),
+    );
+    env.insert(
+        MANAGED_DENIED_DOMAINS_ENV_KEY.to_string(),
+        state.managed_network_policy.denied_domains.join(","),
+    );
+    env.insert(
+        MANAGED_NETWORK_ENV_KEY.to_string(),
+        if state.managed_network_policy.has_domain_restrictions() {
+            "1".to_string()
+        } else {
+            "0".to_string()
+        },
+    );
 
     prepare_session_temp_dir(&state.session_temp_dir)?;
     {
@@ -510,10 +557,23 @@ pub fn prepare_worker_command(
             return Err(SandboxError::SeatbeltMissing);
         }
 
+        let mut network_env = sandbox_network_env_snapshot();
+        for key in [
+            ALLOW_LOCAL_BINDING_ENV_KEY,
+            MANAGED_NETWORK_ENV_KEY,
+            MANAGED_ALLOWED_DOMAINS_ENV_KEY,
+            MANAGED_DENIED_DOMAINS_ENV_KEY,
+        ] {
+            if let Some(value) = env.get(key) {
+                network_env.insert(key.to_string(), value.clone());
+            }
+        }
         let command = build_command_vec(program, &args);
         let mut seatbelt_args = create_seatbelt_command_args(
             command,
             &state.sandbox_policy,
+            &state.managed_network_policy,
+            &network_env,
             &state.sandbox_cwd,
             &state.session_temp_dir,
         );
@@ -569,7 +629,7 @@ pub fn prepare_worker_command(
             command,
             &policy,
             &policy_cwd,
-            env_var_truthy(LINUX_BWRAP_ENABLED_ENV),
+            state.use_linux_sandbox_bwrap,
             env_var_truthy(LINUX_BWRAP_NO_PROC_ENV),
         );
         let sandbox_program = state
@@ -760,17 +820,25 @@ const PROXY_URL_ENV_KEYS: [&str; 6] = [
     "https_proxy",
     "all_proxy",
 ];
-#[cfg(target_os = "macos")]
 const MANAGED_NETWORK_ENV_KEY: &str = "MCP_CONSOLE_MANAGED_NETWORK";
-#[cfg(target_os = "macos")]
 const ALLOW_LOCAL_BINDING_ENV_KEY: &str = "ALLOW_LOCAL_BINDING";
+
+pub fn sandbox_state_defaults_with_environment() -> SandboxState {
+    let mut defaults = SandboxState::default();
+    defaults.managed_network_policy.allow_local_binding =
+        env_var_truthy(ALLOW_LOCAL_BINDING_ENV_KEY);
+    #[cfg(target_os = "linux")]
+    {
+        defaults.use_linux_sandbox_bwrap = env_var_truthy(LINUX_BWRAP_ENABLED_ENV);
+    }
+    defaults
+}
 
 #[cfg(target_os = "macos")]
 #[derive(Debug, Default)]
 struct ProxyPolicyInputs {
     ports: Vec<u16>,
     has_proxy_config: bool,
-    allow_local_binding: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -844,7 +912,6 @@ fn proxy_policy_inputs_from_env(env: &HashMap<String, String>) -> ProxyPolicyInp
     ProxyPolicyInputs {
         ports: proxy_loopback_ports_from_env(env),
         has_proxy_config: has_proxy_url_env_vars(env),
-        allow_local_binding: env_bool(env.get(ALLOW_LOCAL_BINDING_ENV_KEY).map(String::as_str)),
     }
 }
 
@@ -857,6 +924,7 @@ fn managed_network_enabled(env: &HashMap<String, String>) -> bool {
 fn dynamic_network_policy(
     sandbox_policy: &SandboxPolicy,
     enforce_managed_network: bool,
+    allow_local_binding: bool,
     proxy: &ProxyPolicyInputs,
 ) -> String {
     if !sandbox_policy.has_full_network_access() {
@@ -866,7 +934,7 @@ fn dynamic_network_policy(
     if !proxy.ports.is_empty() {
         let mut policy =
             String::from("; allow outbound access only to configured loopback proxy endpoints\n");
-        if proxy.allow_local_binding {
+        if allow_local_binding {
             policy.push_str("; allow localhost-only binding and loopback traffic\n");
             policy.push_str("(allow network-bind (local ip \"localhost:*\"))\n");
             policy.push_str("(allow network-inbound (local ip \"localhost:*\"))\n");
@@ -907,6 +975,8 @@ fn sandbox_network_env_snapshot() -> HashMap<String, String> {
 fn create_seatbelt_command_args(
     command: Vec<String>,
     sandbox_policy: &SandboxPolicy,
+    managed_network_policy: &ManagedNetworkPolicy,
+    network_env: &HashMap<String, String>,
     sandbox_policy_cwd: &Path,
     session_temp_dir: &Path,
 ) -> Vec<String> {
@@ -1009,10 +1079,16 @@ fn create_seatbelt_command_args(
         ""
     };
 
-    let network_env = sandbox_network_env_snapshot();
-    let proxy = proxy_policy_inputs_from_env(&network_env);
-    let enforce_managed_network = managed_network_enabled(&network_env);
-    let network_policy = dynamic_network_policy(sandbox_policy, enforce_managed_network, &proxy);
+    let proxy = proxy_policy_inputs_from_env(network_env);
+    let allow_local_binding = managed_network_policy.allow_local_binding;
+    let enforce_managed_network =
+        managed_network_enabled(network_env) || managed_network_policy.has_domain_restrictions();
+    let network_policy = dynamic_network_policy(
+        sandbox_policy,
+        enforce_managed_network,
+        allow_local_binding,
+        &proxy,
+    );
 
     let full_policy = format!(
         "{MACOS_SEATBELT_BASE_POLICY}\n{file_read_policy}\n{file_write_policy}\n{network_policy}"
@@ -2097,6 +2173,7 @@ mod tests {
     use super::*;
     #[cfg(target_os = "macos")]
     use std::collections::HashMap;
+    use std::path::Path;
     use std::path::PathBuf;
 
     #[test]
@@ -2167,7 +2244,7 @@ mod tests {
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
         };
-        let rendered = dynamic_network_policy(&policy, false, &proxy);
+        let rendered = dynamic_network_policy(&policy, false, false, &proxy);
         assert!(rendered.is_empty(), "expected fail-closed policy");
     }
 
@@ -2183,7 +2260,7 @@ mod tests {
             exclude_slash_tmp: false,
         };
 
-        let rendered = dynamic_network_policy(&policy, true, &proxy);
+        let rendered = dynamic_network_policy(&policy, true, false, &proxy);
         assert!(rendered.is_empty(), "expected fail-closed policy");
     }
 
@@ -2203,7 +2280,7 @@ mod tests {
             exclude_slash_tmp: false,
         };
 
-        let rendered = dynamic_network_policy(&policy, false, &proxy);
+        let rendered = dynamic_network_policy(&policy, false, false, &proxy);
         assert!(rendered.contains("localhost:8080"));
         assert!(!rendered.contains("(allow network-inbound)\n"));
     }
@@ -2215,5 +2292,138 @@ mod tests {
             "bwrap: Can't mount proc on /newroot/proc: Invalid argument"
         ));
         assert!(!is_proc_mount_failure("bwrap: unrelated failure"));
+    }
+
+    #[test]
+    fn prepare_worker_command_sets_allow_local_binding_one_when_enabled() {
+        let mut state = SandboxState::default();
+        state.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        state.managed_network_policy.allow_local_binding = true;
+
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("prepare_worker_command should succeed");
+        assert_eq!(
+            prepared
+                .env
+                .get(ALLOW_LOCAL_BINDING_ENV_KEY)
+                .map(String::as_str),
+            Some("1"),
+            "explicit true value should enable local binding"
+        );
+    }
+
+    #[test]
+    fn prepare_worker_command_sets_allow_local_binding_zero_when_explicitly_disabled() {
+        let mut state = SandboxState::default();
+        state.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        state.managed_network_policy.allow_local_binding = false;
+
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("prepare_worker_command should succeed");
+        assert_eq!(
+            prepared
+                .env
+                .get(ALLOW_LOCAL_BINDING_ENV_KEY)
+                .map(String::as_str),
+            Some("0"),
+            "explicit false override should disable local binding even when inherited env enables it"
+        );
+    }
+
+    #[test]
+    fn prepare_worker_command_clears_managed_domain_env_when_lists_are_empty() {
+        let mut state = SandboxState::default();
+        state.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        state.managed_network_policy.allowed_domains = Vec::new();
+        state.managed_network_policy.denied_domains = Vec::new();
+
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("prepare_worker_command should succeed");
+
+        assert_eq!(
+            prepared
+                .env
+                .get(MANAGED_ALLOWED_DOMAINS_ENV_KEY)
+                .map(String::as_str),
+            Some(""),
+            "allowed domains must be explicitly cleared for child processes"
+        );
+        assert_eq!(
+            prepared
+                .env
+                .get(MANAGED_DENIED_DOMAINS_ENV_KEY)
+                .map(String::as_str),
+            Some(""),
+            "denied domains must be explicitly cleared for child processes"
+        );
+        assert_eq!(
+            prepared
+                .env
+                .get(MANAGED_NETWORK_ENV_KEY)
+                .map(String::as_str),
+            Some("0"),
+            "managed network marker must be explicitly disabled when no domain restrictions exist"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_worker_command_bwrap_env_does_not_override_explicit_false() {
+        let previous_env = std::env::var_os(LINUX_BWRAP_ENABLED_ENV);
+        unsafe {
+            std::env::set_var(LINUX_BWRAP_ENABLED_ENV, "1");
+        }
+
+        let mut state = SandboxState::default();
+        state.sandbox_policy = SandboxPolicy::WorkspaceWrite {
+            writable_roots: Vec::new(),
+            network_access: false,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+        };
+        state.use_linux_sandbox_bwrap = false;
+
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("prepare_worker_command should succeed");
+
+        match previous_env {
+            Some(value) => unsafe {
+                std::env::set_var(LINUX_BWRAP_ENABLED_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(LINUX_BWRAP_ENABLED_ENV);
+            },
+        }
+
+        assert!(
+            !prepared.args.contains(&"--use-bwrap-sandbox".to_string()),
+            "explicit false override should disable bwrap even when env enables it"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sandbox_state_defaults_with_environment_respects_linux_bwrap_env() {
+        let previous_env = std::env::var_os(LINUX_BWRAP_ENABLED_ENV);
+        unsafe {
+            std::env::set_var(LINUX_BWRAP_ENABLED_ENV, "1");
+        }
+        let defaults = sandbox_state_defaults_with_environment();
+        match previous_env {
+            Some(value) => unsafe {
+                std::env::set_var(LINUX_BWRAP_ENABLED_ENV, value);
+            },
+            None => unsafe {
+                std::env::remove_var(LINUX_BWRAP_ENABLED_ENV);
+            },
+        }
+        assert!(
+            defaults.use_linux_sandbox_bwrap,
+            "Linux bwrap env should be applied at defaults layer"
+        );
     }
 }

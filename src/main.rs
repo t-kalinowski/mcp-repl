@@ -14,6 +14,7 @@ mod r_graphics;
 mod r_htmd;
 mod r_session;
 mod sandbox;
+mod sandbox_cli;
 mod server;
 #[cfg(target_os = "windows")]
 mod windows_sandbox;
@@ -24,55 +25,26 @@ mod worker_protocol;
 use std::path::PathBuf;
 
 use crate::backend::{Backend, backend_from_env};
-use crate::sandbox::{INITIAL_SANDBOX_STATE_ENV, SandboxPolicy, SandboxStateUpdate};
-
-const SANDBOX_STATE_INHERIT: &str = "inherit";
+use crate::sandbox_cli::{
+    SandboxCliOperation, SandboxCliPlan, SandboxModeArg, parse_sandbox_config_override,
+};
 
 enum CliCommand {
     RunServer(CliOptions),
     Install(install::InstallOptions),
 }
 
+#[derive(Debug, Clone)]
 struct CliOptions {
-    sandbox_state_env: InitialSandboxStateEnv,
+    sandbox_plan: SandboxCliPlan,
     debug_repl: bool,
     backend: Backend,
     debug_events_dir: Option<PathBuf>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum InitialSandboxStateEnv {
-    Keep,
-    Clear,
-    Set(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SandboxModeArg {
-    ReadOnly,
-    WorkspaceWrite,
-    DangerFullAccess,
-}
-
-impl SandboxModeArg {
-    fn parse(value: &str) -> Result<Self, String> {
-        match value {
-            "read-only" => Ok(Self::ReadOnly),
-            "workspace-write" => Ok(Self::WorkspaceWrite),
-            "danger-full-access" => Ok(Self::DangerFullAccess),
-            _ => Err(format!(
-                "invalid sandbox mode: {value} (expected read-only|workspace-write|danger-full-access)"
-            )),
-        }
-    }
-}
-
 #[derive(Debug, Default)]
 struct SandboxCliArgs {
-    sandbox_state: Option<String>,
-    mode: Option<SandboxModeArg>,
-    network_access: Option<bool>,
-    writable_roots: Vec<PathBuf>,
+    plan: SandboxCliPlan,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -100,23 +72,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match parse_cli_args()? {
         CliCommand::RunServer(options) => {
-            match options.sandbox_state_env {
-                InitialSandboxStateEnv::Keep => {}
-                InitialSandboxStateEnv::Clear => {
-                    // `std::env::remove_var` is `unsafe` in Rust 2024 because mutating process-global
-                    // environment variables can violate assumptions in other threads / libraries.
-                    unsafe {
-                        std::env::remove_var(INITIAL_SANDBOX_STATE_ENV);
-                    }
-                }
-                InitialSandboxStateEnv::Set(state) => {
-                    // `std::env::set_var` is `unsafe` in Rust 2024 because mutating process-global
-                    // environment variables can violate assumptions in other threads / libraries.
-                    unsafe {
-                        std::env::set_var(INITIAL_SANDBOX_STATE_ENV, state);
-                    }
-                }
-            }
             event_log::initialize(
                 options.debug_events_dir,
                 event_log::StartupContext {
@@ -130,15 +85,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Backend::Python => "python".to_string(),
                     },
                     debug_repl: options.debug_repl,
-                    sandbox_state: std::env::var(INITIAL_SANDBOX_STATE_ENV).ok(),
+                    sandbox_state: None,
                 },
             )?;
             if options.debug_repl {
                 crate::diagnostics::startup_log("main: debug repl mode");
-                return debug_repl::run(options.backend);
+                return debug_repl::run(options.backend, options.sandbox_plan);
             }
             crate::diagnostics::startup_log("main: server mode");
-            server::run(options.backend).await
+            server::run(options.backend, options.sandbox_plan).await
         }
         CliCommand::Install(options) => install::run(options),
     }
@@ -171,57 +126,90 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
                 print_usage();
                 std::process::exit(0);
             }
-            "--sandbox-state" => {
-                let value = parser.next_value("--sandbox-state")?;
-                sandbox_args.sandbox_state = Some(sandbox_state_arg(value)?);
-            }
-            _ if arg.starts_with("--sandbox-state=") => {
-                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
-                if value.is_empty() {
-                    return Err("missing value for --sandbox-state".into());
-                }
-                sandbox_args.sandbox_state = Some(sandbox_state_arg(value.to_string())?);
-            }
-            "--sandbox-mode" => {
-                let value = parser.next_value("--sandbox-mode")?;
-                sandbox_args.mode =
-                    Some(SandboxModeArg::parse(&value).map_err(|err| err.to_string())?);
-            }
-            _ if arg.starts_with("--sandbox-mode=") => {
-                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
-                if value.is_empty() {
-                    return Err("missing value for --sandbox-mode".into());
-                }
-                sandbox_args.mode =
-                    Some(SandboxModeArg::parse(value).map_err(|err| err.to_string())?);
-            }
-            "--sandbox-network-access" => {
-                let value = parser.next_value("--sandbox-network-access")?;
-                sandbox_args.network_access =
-                    Some(parse_sandbox_network_access(&value).map_err(|err| err.to_string())?);
-            }
-            _ if arg.starts_with("--sandbox-network-access=") => {
-                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
-                if value.is_empty() {
-                    return Err("missing value for --sandbox-network-access".into());
-                }
-                sandbox_args.network_access =
-                    Some(parse_sandbox_network_access(value).map_err(|err| err.to_string())?);
-            }
-            "--writable-root" => {
-                let value = parser.next_value("--writable-root")?;
+            "--sandbox" => {
+                let value = parser.next_value("--sandbox")?;
+                let mode = SandboxModeArg::parse(&value).map_err(|err| err.to_string())?;
                 sandbox_args
-                    .writable_roots
-                    .push(parse_writable_root(&value)?);
+                    .plan
+                    .operations
+                    .push(SandboxCliOperation::SetMode(mode));
             }
-            _ if arg.starts_with("--writable-root=") => {
+            _ if arg.starts_with("--sandbox=") => {
                 let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
                 if value.is_empty() {
-                    return Err("missing value for --writable-root".into());
+                    return Err("missing value for --sandbox".into());
+                }
+                let mode = SandboxModeArg::parse(value).map_err(|err| err.to_string())?;
+                sandbox_args
+                    .plan
+                    .operations
+                    .push(SandboxCliOperation::SetMode(mode));
+            }
+            "--add-writable-root" | "--add-writeable-root" => {
+                let value = parser.next_value("--add-writable-root")?;
+                sandbox_args
+                    .plan
+                    .operations
+                    .push(SandboxCliOperation::AddWritableRoot(parse_writable_root(
+                        &value,
+                    )?));
+            }
+            _ if arg.starts_with("--add-writable-root=")
+                || arg.starts_with("--add-writeable-root=") =>
+            {
+                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
+                if value.is_empty() {
+                    return Err("missing value for --add-writable-root".into());
                 }
                 sandbox_args
-                    .writable_roots
-                    .push(parse_writable_root(value)?);
+                    .plan
+                    .operations
+                    .push(SandboxCliOperation::AddWritableRoot(parse_writable_root(
+                        value,
+                    )?));
+            }
+            "--add-allowed-domain" => {
+                let value = parser.next_value("--add-allowed-domain")?;
+                let value = value.trim();
+                if value.is_empty() {
+                    return Err("missing value for --add-allowed-domain".into());
+                }
+                sandbox_args
+                    .plan
+                    .operations
+                    .push(SandboxCliOperation::AddAllowedDomain(value.to_string()));
+            }
+            _ if arg.starts_with("--add-allowed-domain=") => {
+                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
+                if value.trim().is_empty() {
+                    return Err("missing value for --add-allowed-domain".into());
+                }
+                sandbox_args
+                    .plan
+                    .operations
+                    .push(SandboxCliOperation::AddAllowedDomain(
+                        value.trim().to_string(),
+                    ));
+            }
+            "--config" => {
+                let value = parser.next_value("--config")?;
+                let parsed =
+                    parse_sandbox_config_override(&value).map_err(|err| err.to_string())?;
+                sandbox_args
+                    .plan
+                    .operations
+                    .push(SandboxCliOperation::Config(parsed));
+            }
+            _ if arg.starts_with("--config=") => {
+                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
+                if value.trim().is_empty() {
+                    return Err("missing value for --config".into());
+                }
+                let parsed = parse_sandbox_config_override(value).map_err(|err| err.to_string())?;
+                sandbox_args
+                    .plan
+                    .operations
+                    .push(SandboxCliOperation::Config(parsed));
             }
             "--debug-repl" => {
                 debug_repl = true;
@@ -247,10 +235,8 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
         }
     }
 
-    let sandbox_state_env = sandbox_state_from_cli_args(sandbox_args)?;
-
     Ok(CliCommand::RunServer(CliOptions {
-        sandbox_state_env,
+        sandbox_plan: sandbox_args.plan,
         debug_repl,
         backend: backend.unwrap_or(Backend::R),
         debug_events_dir,
@@ -458,143 +444,27 @@ fn parse_install_targets_value(
     Ok(())
 }
 
-fn sandbox_state_arg(raw: String) -> Result<String, Box<dyn std::error::Error>> {
-    let trimmed = raw.trim();
-    if trimmed == SANDBOX_STATE_INHERIT {
-        return Ok(SANDBOX_STATE_INHERIT.to_string());
-    }
-    if trimmed.starts_with('{') {
-        let parsed: SandboxStateUpdate = serde_json::from_str(trimmed)?;
-        let payload = serde_json::to_string(&parsed)?;
-        return Ok(payload);
-    }
-
-    let policy = match trimmed {
-        "read-only" => SandboxPolicy::ReadOnly,
-        "workspace-write" => SandboxPolicy::WorkspaceWrite {
-            writable_roots: Vec::new(),
-            network_access: false,
-            exclude_tmpdir_env_var: false,
-            exclude_slash_tmp: false,
-        },
-        "danger-full-access" => SandboxPolicy::DangerFullAccess,
-        _ => {
-            return Err(format!(
-                "invalid --sandbox-state value: {trimmed} (expected inherit, JSON, or read-only|workspace-write|danger-full-access)"
-            )
-            .into());
-        }
-    };
-
-    let update = SandboxStateUpdate {
-        sandbox_policy: policy,
-        sandbox_cwd: None,
-        codex_linux_sandbox_exe: None,
-    };
-    let payload = serde_json::to_string(&update)?;
-    Ok(payload)
-}
-
-fn parse_sandbox_network_access(raw: &str) -> Result<bool, String> {
-    match raw {
-        "enabled" => Ok(true),
-        "restricted" => Ok(false),
-        _ => Err(format!(
-            "invalid --sandbox-network-access value: {raw} (expected enabled|restricted)"
-        )),
-    }
-}
-
 fn parse_writable_root(raw: &str) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let path = PathBuf::from(raw);
     if !path.is_absolute() {
-        return Err(
-            format!("invalid --writable-root value: {raw} (expected absolute path)").into(),
-        );
+        return Err(format!("invalid writable root value: {raw} (expected absolute path)").into());
     }
     Ok(path)
-}
-
-fn sandbox_state_from_cli_args(
-    args: SandboxCliArgs,
-) -> Result<InitialSandboxStateEnv, Box<dyn std::error::Error>> {
-    if args.sandbox_state.is_some()
-        && (args.mode.is_some() || args.network_access.is_some() || !args.writable_roots.is_empty())
-    {
-        return Err(
-            "cannot combine --sandbox-state with --sandbox-mode/--sandbox-network-access/--writable-root"
-                .into(),
-        );
-    }
-    if let Some(state) = args.sandbox_state {
-        if state == SANDBOX_STATE_INHERIT {
-            return Ok(InitialSandboxStateEnv::Clear);
-        }
-        return Ok(InitialSandboxStateEnv::Set(state));
-    }
-    if args.mode.is_none() && args.network_access.is_none() && args.writable_roots.is_empty() {
-        return Ok(InitialSandboxStateEnv::Keep);
-    }
-
-    let mode = args.mode.unwrap_or(SandboxModeArg::WorkspaceWrite);
-    let policy = match mode {
-        SandboxModeArg::ReadOnly => {
-            if args.network_access.is_some() {
-                return Err(
-                    "--sandbox-network-access is only valid with --sandbox-mode workspace-write"
-                        .into(),
-                );
-            }
-            if !args.writable_roots.is_empty() {
-                return Err(
-                    "--writable-root is only valid with --sandbox-mode workspace-write".into(),
-                );
-            }
-            SandboxPolicy::ReadOnly
-        }
-        SandboxModeArg::DangerFullAccess => {
-            if args.network_access.is_some() {
-                return Err(
-                    "--sandbox-network-access is only valid with --sandbox-mode workspace-write"
-                        .into(),
-                );
-            }
-            if !args.writable_roots.is_empty() {
-                return Err(
-                    "--writable-root is only valid with --sandbox-mode workspace-write".into(),
-                );
-            }
-            SandboxPolicy::DangerFullAccess
-        }
-        SandboxModeArg::WorkspaceWrite => SandboxPolicy::WorkspaceWrite {
-            writable_roots: args.writable_roots,
-            network_access: args.network_access.unwrap_or(false),
-            exclude_tmpdir_env_var: false,
-            exclude_slash_tmp: false,
-        },
-    };
-
-    let update = SandboxStateUpdate {
-        sandbox_policy: policy,
-        sandbox_cwd: None,
-        codex_linux_sandbox_exe: None,
-    };
-    Ok(InitialSandboxStateEnv::Set(serde_json::to_string(&update)?))
 }
 
 fn print_usage() {
     println!(
         "Usage:\n\
-mcp-repl [--debug-repl] [--interpreter <r|python>] [--sandbox-mode <mode>] [--sandbox-network-access <restricted|enabled>] [--writable-root <abs-path>]...\n\
+mcp-repl [--debug-repl] [--interpreter <r|python>] [--sandbox <inherit|read-only|workspace-write|danger-full-access>] [--add-writable-root <abs-path>] [--add-allowed-domain <domain>] [--config <key=value>]...\n\
 mcp-repl install [codex] [claude] [--client <codex|claude>]... [--interpreter <r|python>[,r|python]...]... [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
 --debug-repl: run an interactive debug REPL over stdio\n\
 --debug-events-dir: optional directory for per-startup JSONL debug event logs (env: MCP_REPL_DEBUG_EVENTS_DIR)\n\
 --interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER, compatibility env MCP_REPL_BACKEND)\n\
 --backend: compatibility alias for --interpreter\n\
---sandbox-state: inherit | JSON | read-only | workspace-write | danger-full-access\n\
---sandbox-mode: read-only | workspace-write | danger-full-access (default: workspace-write when sandbox flags are provided)\n\
---sandbox-network-access: restricted | enabled (workspace-write only; default: restricted)\n\
---writable-root: additional absolute writable path (repeatable; workspace-write only)\n\
+--sandbox: base sandbox mode (inherit requires client sandbox update)\n\
+--add-writable-root / --add-writeable-root: append absolute writable root in argument order\n\
+--add-allowed-domain: append allowed domain pattern in argument order\n\
+--config: apply advanced ordered sandbox/network override (Codex-compatible keys)\n\
 install: update MCP config for existing agent homes only (does not create ~/.codex or ~/.claude)\n\
 install defaults to the full interpreter grid for each selected client (currently r_repl + py_repl)"
     );
@@ -615,6 +485,8 @@ If no --interpreter is specified, install uses the full interpreter grid for eac
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox::{SandboxPolicy, SandboxState};
+    use crate::sandbox_cli::{SandboxConfigOperation, resolve_effective_sandbox_state};
 
     #[test]
     fn parse_backend_arg_accepts_interpreter_flag_forms() {
@@ -648,12 +520,6 @@ mod tests {
         };
         let parsed = parse_backend_arg("--backend=python", &mut parser).expect("parse flag");
         assert_eq!(parsed, Some(Backend::Python));
-    }
-
-    #[test]
-    fn parse_sandbox_network_access_accepts_expected_values() {
-        assert_eq!(parse_sandbox_network_access("enabled"), Ok(true));
-        assert_eq!(parse_sandbox_network_access("restricted"), Ok(false));
     }
 
     #[test]
@@ -742,82 +608,98 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_state_arg_accepts_inherit() {
-        let parsed = sandbox_state_arg("inherit".to_string()).expect("sandbox state");
-        assert_eq!(parsed, "inherit");
+    fn parse_sandbox_mode_accepts_inherit() {
+        let mode = SandboxModeArg::parse("inherit").expect("sandbox mode");
+        assert!(matches!(mode, SandboxModeArg::Inherit));
     }
 
     #[test]
-    fn sandbox_state_from_cli_args_workspace_write_defaults_restricted() {
-        let state = sandbox_state_from_cli_args(SandboxCliArgs {
-            mode: Some(SandboxModeArg::WorkspaceWrite),
-            network_access: None,
-            writable_roots: vec![PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")],
-            ..Default::default()
-        })
-        .expect("sandbox state");
-        let InitialSandboxStateEnv::Set(state) = state else {
-            panic!("expected sandbox payload from workspace-write args");
+    fn parse_config_override_supports_codex_bwrap_alias() {
+        let op =
+            parse_sandbox_config_override("use_linux_sandbox_bwrap=true").expect("config override");
+        assert!(matches!(
+            op,
+            SandboxConfigOperation::SetUseLinuxSandboxBwrap(true)
+        ));
+    }
+
+    #[test]
+    fn parse_config_override_supports_allowed_domains() {
+        let op = parse_sandbox_config_override(
+            "permissions.network.allowed_domains=[\"pypi.org\",\"files.pythonhosted.org\"]",
+        )
+        .expect("config override");
+        assert!(matches!(
+            op,
+            SandboxConfigOperation::SetAllowedDomains(values)
+                if values == vec!["pypi.org".to_string(), "files.pythonhosted.org".to_string()]
+        ));
+    }
+
+    #[test]
+    fn ordered_layering_last_argument_wins() {
+        let plan = SandboxCliPlan {
+            operations: vec![
+                SandboxCliOperation::SetMode(SandboxModeArg::WorkspaceWrite),
+                SandboxCliOperation::Config(
+                    parse_sandbox_config_override("sandbox_workspace_write.network_access=false")
+                        .expect("config override"),
+                ),
+                SandboxCliOperation::Config(
+                    parse_sandbox_config_override("sandbox_workspace_write.network_access=true")
+                        .expect("config override"),
+                ),
+            ],
         };
 
-        let parsed: SandboxStateUpdate = serde_json::from_str(&state).expect("parse payload");
-        match parsed.sandbox_policy {
-            SandboxPolicy::WorkspaceWrite {
-                writable_roots,
-                network_access,
-                ..
-            } => {
-                assert_eq!(
-                    writable_roots,
-                    vec![PathBuf::from("/tmp/one"), PathBuf::from("/tmp/two")]
-                );
-                assert!(!network_access);
-            }
+        let inherited = SandboxState::default();
+        let resolved = resolve_effective_sandbox_state(&plan, Some(&inherited))
+            .expect("effective sandbox state");
+        match resolved.sandbox_policy {
+            SandboxPolicy::WorkspaceWrite { network_access, .. } => assert!(network_access),
             other => panic!("expected workspace-write policy, got {other:?}"),
         }
     }
 
     #[test]
-    fn sandbox_state_from_cli_args_inherit_clears_existing_env() {
-        let parsed = sandbox_state_from_cli_args(SandboxCliArgs {
-            sandbox_state: Some("inherit".to_string()),
-            ..Default::default()
-        })
-        .expect("sandbox state");
-        assert!(matches!(parsed, InitialSandboxStateEnv::Clear));
+    fn empty_plan_uses_inherited_state_when_available() {
+        let plan = SandboxCliPlan::default();
+        let mut inherited = SandboxState::default();
+        inherited.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        let resolved = resolve_effective_sandbox_state(&plan, Some(&inherited))
+            .expect("effective sandbox state");
+        assert_eq!(resolved.sandbox_policy, SandboxPolicy::DangerFullAccess);
     }
 
     #[test]
-    fn sandbox_state_from_cli_args_without_sandbox_flags_keeps_existing_env() {
-        let parsed = sandbox_state_from_cli_args(SandboxCliArgs::default()).expect("sandbox state");
-        assert!(matches!(parsed, InitialSandboxStateEnv::Keep));
-    }
-
-    #[test]
-    fn sandbox_state_from_cli_args_rejects_mixed_sandbox_state_flags() {
-        let err = sandbox_state_from_cli_args(SandboxCliArgs {
-            sandbox_state: Some("read-only".to_string()),
-            mode: Some(SandboxModeArg::ReadOnly),
-            ..Default::default()
-        })
-        .expect_err("expected conflict");
+    fn inherit_without_client_update_errors() {
+        let plan = SandboxCliPlan {
+            operations: vec![SandboxCliOperation::SetMode(SandboxModeArg::Inherit)],
+        };
+        let err = resolve_effective_sandbox_state(&plan, None).expect_err("missing inherit update");
         assert!(
-            err.to_string().contains("cannot combine --sandbox-state"),
+            err.contains("--sandbox inherit requested but no client sandbox state was provided"),
             "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn sandbox_state_from_cli_args_rejects_writable_roots_without_workspace_write() {
-        let err = sandbox_state_from_cli_args(SandboxCliArgs {
-            mode: Some(SandboxModeArg::ReadOnly),
-            writable_roots: vec![PathBuf::from("/tmp/one")],
-            ..Default::default()
-        })
-        .expect_err("expected root rejection");
-        assert!(
-            err.to_string().contains("--writable-root is only valid"),
-            "unexpected error: {err}"
+    fn inherit_mode_copies_managed_network_policy() {
+        let plan = SandboxCliPlan {
+            operations: vec![SandboxCliOperation::SetMode(SandboxModeArg::Inherit)],
+        };
+        let mut inherited = SandboxState::default();
+        inherited.managed_network_policy.allowed_domains =
+            vec!["example.com".to_string(), "*.example.org".to_string()];
+        inherited.managed_network_policy.denied_domains = vec!["blocked.example".to_string()];
+        inherited.managed_network_policy.allow_local_binding = true;
+
+        let resolved = resolve_effective_sandbox_state(&plan, Some(&inherited))
+            .expect("effective sandbox state");
+
+        assert_eq!(
+            resolved.managed_network_policy, inherited.managed_network_policy,
+            "inherit mode should copy managed network policy from client state"
         );
     }
 }
