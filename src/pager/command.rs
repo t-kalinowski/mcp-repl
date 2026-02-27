@@ -393,8 +393,12 @@ fn parse_range_spec(raw: &str) -> Option<(usize, usize)> {
     let mut parts = trimmed.split_whitespace();
     let first = parts.next()?;
     let second = parts.next();
+    let third = parts.next();
 
     if let Some(second) = second {
+        if third.is_some() {
+            return None;
+        }
         let start = first.parse::<usize>().ok()?;
         let end = second.parse::<usize>().ok()?;
         if start == 0 || end == 0 {
@@ -507,5 +511,10 @@ mod tests {
         assert_eq!(spec.context, MAX_MATCH_CONTEXT);
         assert_eq!(spec.count, MAX_MATCH_LIMIT as u64);
         assert_eq!(spec.pattern.pattern, "bar");
+    }
+
+    #[test]
+    fn range_spec_rejects_extra_tokens() {
+        assert!(parse_range_spec("1 2 3").is_none());
     }
 }
