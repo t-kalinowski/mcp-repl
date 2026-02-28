@@ -1,7 +1,7 @@
 # Sandbox
 
 `mcp-repl` applies an OS sandbox to worker processes unless the sandbox policy is
-`danger-full-access` (or `external-sandbox`).
+`danger-full-access`.
 
 For a full configuration model (ordering semantics, preset install behavior, domain restrictions,
 and OS/platform intersections), see `docs/sandbox-config.md`.
@@ -95,5 +95,5 @@ Managed-network behavior on Linux:
 - R backend is supported with the same policy surface (`read-only`, `workspace-write`, `danger-full-access`).
 - Python backend is currently unavailable on Windows (it requires a Unix PTY).
 - `read-only` and `workspace-write` are enforced by the Windows sandbox runner.
-- `danger-full-access` and `external-sandbox` run without built-in sandbox enforcement.
+- `danger-full-access` runs without built-in sandbox enforcement.
 - Some Windows environments may not support the restricted-token setup required by sandboxed modes.

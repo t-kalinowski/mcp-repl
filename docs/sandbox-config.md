@@ -7,7 +7,7 @@ This document describes how `mcp-repl` builds effective sandbox behavior from CL
 
 `mcp-repl` tracks sandbox state in three parts:
 
-- `sandbox_policy`: filesystem + base network mode (`read-only`, `workspace-write`, `danger-full-access`, or `external-sandbox` via client update)
+- `sandbox_policy`: filesystem + base network mode (`read-only`, `workspace-write`, or `danger-full-access`)
 - `managed_network_policy`: managed network flags and domain lists (`allowed_domains`, `denied_domains`, `allow_local_binding`, `enabled`)
 - feature flags such as `use_linux_sandbox_bwrap`
 
@@ -121,7 +121,7 @@ Network behavior:
 Enforcement:
 
 - `read-only` and `workspace-write` use the Windows sandbox runner.
-- `danger-full-access` and `external-sandbox` bypass built-in sandbox enforcement.
+- `danger-full-access` bypasses built-in sandbox enforcement.
 - Python backend is currently unavailable on Windows in this project.
 
 Managed network and domains:

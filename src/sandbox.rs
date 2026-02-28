@@ -63,20 +63,6 @@ impl std::fmt::Display for SandboxError {
 
 impl std::error::Error for SandboxError {}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "kebab-case")]
-pub enum NetworkAccess {
-    #[default]
-    Restricted,
-    Enabled,
-}
-
-impl NetworkAccess {
-    pub fn is_enabled(self) -> bool {
-        matches!(self, NetworkAccess::Enabled)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ManagedNetworkPolicy {
     pub enabled: bool,
@@ -102,11 +88,6 @@ pub enum SandboxPolicy {
     DangerFullAccess,
     #[serde(rename = "read-only")]
     ReadOnly,
-    #[serde(rename = "external-sandbox")]
-    ExternalSandbox {
-        #[serde(default)]
-        network_access: NetworkAccess,
-    },
     #[serde(rename = "workspace-write")]
     WorkspaceWrite {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -132,7 +113,6 @@ impl SandboxPolicy {
     pub fn has_full_disk_write_access(&self) -> bool {
         match self {
             SandboxPolicy::DangerFullAccess => true,
-            SandboxPolicy::ExternalSandbox { .. } => true,
             SandboxPolicy::ReadOnly => false,
             SandboxPolicy::WorkspaceWrite { .. } => false,
         }
@@ -142,7 +122,6 @@ impl SandboxPolicy {
     pub fn has_full_disk_read_access(&self) -> bool {
         match self {
             SandboxPolicy::DangerFullAccess => true,
-            SandboxPolicy::ExternalSandbox { .. } => true,
             SandboxPolicy::ReadOnly => true,
             SandboxPolicy::WorkspaceWrite { .. } => true,
         }
@@ -151,17 +130,13 @@ impl SandboxPolicy {
     pub fn has_full_network_access(&self) -> bool {
         match self {
             SandboxPolicy::DangerFullAccess => true,
-            SandboxPolicy::ExternalSandbox { network_access } => network_access.is_enabled(),
             SandboxPolicy::ReadOnly => false,
             SandboxPolicy::WorkspaceWrite { network_access, .. } => *network_access,
         }
     }
 
     pub fn requires_sandbox(&self) -> bool {
-        !matches!(
-            self,
-            SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. }
-        )
+        !matches!(self, SandboxPolicy::DangerFullAccess)
     }
 
     #[cfg(target_os = "macos")]
@@ -763,9 +738,6 @@ fn sanitize_linux_sandbox_policy(policy: &SandboxPolicy) -> SandboxPolicy {
                 exclude_slash_tmp: *exclude_slash_tmp,
             }
         }
-        SandboxPolicy::ExternalSandbox { network_access } => SandboxPolicy::ExternalSandbox {
-            network_access: *network_access,
-        },
         SandboxPolicy::DangerFullAccess => SandboxPolicy::DangerFullAccess,
         SandboxPolicy::ReadOnly => SandboxPolicy::ReadOnly,
     }
