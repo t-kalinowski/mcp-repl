@@ -639,6 +639,15 @@ mod tests {
     }
 
     #[test]
+    fn parse_config_override_supports_managed_network_enabled() {
+        let op = parse_sandbox_config_override("permissions.network.enabled=true").expect("config");
+        assert!(matches!(
+            op,
+            SandboxConfigOperation::SetManagedNetworkEnabled(true)
+        ));
+    }
+
+    #[test]
     fn ordered_layering_last_argument_wins() {
         let plan = SandboxCliPlan {
             operations: vec![

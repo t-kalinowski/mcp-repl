@@ -443,6 +443,7 @@ fn worker_context_event_payload(
             .map(|path| path.to_string_lossy().to_string()),
         "use_linux_sandbox_bwrap": sandbox_state.use_linux_sandbox_bwrap,
         "managed_network_policy": {
+            "enabled": sandbox_state.managed_network_policy.enabled,
             "allowed_domains": sandbox_state.managed_network_policy.allowed_domains.clone(),
             "denied_domains": sandbox_state.managed_network_policy.denied_domains.clone(),
             "allow_local_binding": sandbox_state.managed_network_policy.allow_local_binding,

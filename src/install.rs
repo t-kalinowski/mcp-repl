@@ -296,6 +296,7 @@ fn is_sandbox_config_override(raw: &str) -> bool {
             | "permissions.network.allowed_domains"
             | "permissions.network.denied_domains"
             | "permissions.network.allow_local_binding"
+            | "permissions.network.enabled"
             | "features.use_linux_sandbox_bwrap"
             | "use_linux_sandbox_bwrap"
     )

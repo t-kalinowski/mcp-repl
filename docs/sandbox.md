@@ -78,7 +78,7 @@ Optional `bwrap` stage:
 
 Managed-network behavior on Linux:
 
-- when network is enabled and domain restrictions are present, Linux sandbox runs in proxy-routed mode,
+- when network is enabled and managed-network mode is enabled, Linux sandbox runs in proxy-routed mode,
 - proxy-routed mode requires loopback proxy env vars (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, etc.),
 - in bwrap mode, sandbox networking is isolated and proxy traffic is bridged into the namespace,
 - if managed proxy routing is requested but no usable loopback proxy is configured, startup fails fast.

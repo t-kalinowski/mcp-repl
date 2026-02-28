@@ -79,6 +79,7 @@ impl NetworkAccess {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ManagedNetworkPolicy {
+    pub enabled: bool,
     pub allowed_domains: Vec<String>,
     pub denied_domains: Vec<String>,
     pub allow_local_binding: bool,
@@ -87,6 +88,10 @@ pub struct ManagedNetworkPolicy {
 impl ManagedNetworkPolicy {
     pub fn has_domain_restrictions(&self) -> bool {
         !self.allowed_domains.is_empty() || !self.denied_domains.is_empty()
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled || self.has_domain_restrictions()
     }
 }
 
@@ -515,7 +520,7 @@ pub fn prepare_worker_command(
     );
     env.insert(
         MANAGED_NETWORK_ENV_KEY.to_string(),
-        if state.managed_network_policy.has_domain_restrictions() {
+        if state.managed_network_policy.is_enabled() {
             "1".to_string()
         } else {
             "0".to_string()
@@ -627,8 +632,8 @@ pub fn prepare_worker_command(
         }
         let policy = sanitize_linux_sandbox_policy(&policy);
         let command = build_command_vec(program, &args);
-        let allow_network_for_proxy = policy.has_full_network_access()
-            && state.managed_network_policy.has_domain_restrictions();
+        let allow_network_for_proxy =
+            policy.has_full_network_access() && state.managed_network_policy.is_enabled();
         let sandbox_args = create_linux_sandbox_command_args(
             command,
             &policy,
@@ -834,6 +839,7 @@ const ALLOW_LOCAL_BINDING_ENV_KEY: &str = "ALLOW_LOCAL_BINDING";
 
 pub fn sandbox_state_defaults_with_environment() -> SandboxState {
     let mut defaults = SandboxState::default();
+    defaults.managed_network_policy.enabled = env_var_truthy(MANAGED_NETWORK_ENV_KEY);
     defaults.managed_network_policy.allow_local_binding =
         env_var_truthy(ALLOW_LOCAL_BINDING_ENV_KEY);
     #[cfg(target_os = "linux")]
@@ -1141,6 +1147,7 @@ struct LinuxSandboxArgs {
 #[cfg(target_os = "linux")]
 fn linux_sandbox_main_impl() -> Result<(), String> {
     let args = linux_sandbox_parse_args()?;
+    linux_validate_inner_stage_mode(args.apply_seccomp_then_exec, args.use_bwrap_sandbox)?;
     if args.apply_seccomp_then_exec {
         if args.allow_network_for_proxy {
             let spec = args
@@ -1170,6 +1177,17 @@ fn linux_sandbox_main_impl() -> Result<(), String> {
         false,
     )?;
     linux_execvp(args.command)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn linux_validate_inner_stage_mode(
+    apply_seccomp_then_exec: bool,
+    use_bwrap_sandbox: bool,
+) -> Result<(), String> {
+    if apply_seccomp_then_exec && !use_bwrap_sandbox {
+        return Err("--apply-seccomp-then-exec requires --use-bwrap-sandbox".to_string());
+    }
     Ok(())
 }
 
@@ -1293,8 +1311,8 @@ fn linux_build_inner_seccomp_command(
     ];
     if args.allow_network_for_proxy {
         inner.push("--allow-network-for-proxy".to_string());
-    }
-    if let Some(proxy_route_spec) = proxy_route_spec {
+        let proxy_route_spec = proxy_route_spec
+            .ok_or_else(|| "managed proxy mode requires --proxy-route-spec".to_string())?;
         inner.push("--proxy-route-spec".to_string());
         inner.push(proxy_route_spec);
     }
@@ -2480,6 +2498,7 @@ mod tests {
     fn prepare_worker_command_clears_managed_domain_env_when_lists_are_empty() {
         let mut state = SandboxState::default();
         state.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        state.managed_network_policy.enabled = false;
         state.managed_network_policy.allowed_domains = Vec::new();
         state.managed_network_policy.denied_domains = Vec::new();
 
@@ -2510,6 +2529,53 @@ mod tests {
                 .map(String::as_str),
             Some("0"),
             "managed network marker must be explicitly disabled when no domain restrictions exist"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_worker_command_enables_proxy_mode_when_managed_network_env_is_true() {
+        let previous_env = std::env::var_os(MANAGED_NETWORK_ENV_KEY);
+        unsafe {
+            std::env::set_var(MANAGED_NETWORK_ENV_KEY, "1");
+        }
+
+        let mut state = sandbox_state_defaults_with_environment();
+        state.sandbox_policy = SandboxPolicy::WorkspaceWrite {
+            writable_roots: Vec::new(),
+            network_access: true,
+            exclude_tmpdir_env_var: false,
+            exclude_slash_tmp: false,
+        };
+        state.managed_network_policy.allowed_domains.clear();
+        state.managed_network_policy.denied_domains.clear();
+
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("prepare_worker_command should succeed");
+
+        match previous_env {
+            Some(value) => unsafe {
+                std::env::set_var(MANAGED_NETWORK_ENV_KEY, value);
+            },
+            None => unsafe {
+                std::env::remove_var(MANAGED_NETWORK_ENV_KEY);
+            },
+        }
+
+        assert_eq!(
+            prepared
+                .env
+                .get(MANAGED_NETWORK_ENV_KEY)
+                .map(String::as_str),
+            Some("1"),
+            "managed-network marker should honor explicit environment enablement"
+        );
+        assert!(
+            prepared
+                .args
+                .contains(&"--allow-network-for-proxy".to_string()),
+            "managed-network mode should enable proxy-routed Linux networking even without domain lists"
         );
     }
 
@@ -2602,5 +2668,66 @@ mod tests {
         };
         let mode = linux_network_seccomp_mode(&policy, true, true);
         assert_eq!(mode, Some(LinuxNetworkSeccompMode::ProxyRouted));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_validate_inner_stage_mode_rejects_apply_seccomp_without_bwrap() {
+        let err =
+            linux_validate_inner_stage_mode(true, false).expect_err("expected validation err");
+        assert_eq!(
+            err,
+            "--apply-seccomp-then-exec requires --use-bwrap-sandbox"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_build_inner_seccomp_command_requires_proxy_route_spec_in_proxy_mode() {
+        let args = LinuxSandboxArgs {
+            sandbox_policy_cwd: PathBuf::from("/tmp"),
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: true,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            command: vec![std::ffi::OsString::from("/bin/true")],
+            use_bwrap_sandbox: true,
+            apply_seccomp_then_exec: false,
+            allow_network_for_proxy: true,
+            proxy_route_spec: None,
+            no_proc: false,
+        };
+
+        let err =
+            linux_build_inner_seccomp_command(&args, None).expect_err("expected missing spec");
+        assert_eq!(err, "managed proxy mode requires --proxy-route-spec");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_build_inner_seccomp_command_includes_proxy_route_spec_when_present() {
+        let args = LinuxSandboxArgs {
+            sandbox_policy_cwd: PathBuf::from("/tmp"),
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: true,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            command: vec![std::ffi::OsString::from("/bin/true")],
+            use_bwrap_sandbox: true,
+            apply_seccomp_then_exec: false,
+            allow_network_for_proxy: true,
+            proxy_route_spec: None,
+            no_proc: false,
+        };
+
+        let inner = linux_build_inner_seccomp_command(&args, Some("spec-json".to_string()))
+            .expect("inner command should build");
+        assert!(inner.contains(&"--allow-network-for-proxy".to_string()));
+        assert!(inner.contains(&"--proxy-route-spec".to_string()));
+        assert!(inner.contains(&"spec-json".to_string()));
     }
 }

@@ -35,6 +35,7 @@ pub enum SandboxConfigOperation {
     SetAllowedDomains(Vec<String>),
     SetDeniedDomains(Vec<String>),
     SetAllowLocalBinding(bool),
+    SetManagedNetworkEnabled(bool),
     SetUseLinuxSandboxBwrap(bool),
 }
 
@@ -99,6 +100,9 @@ pub fn parse_sandbox_config_override(raw: &str) -> Result<SandboxConfigOperation
         "permissions.network.allow_local_binding" => Ok(
             SandboxConfigOperation::SetAllowLocalBinding(parse_bool_value(value)?),
         ),
+        "permissions.network.enabled" => Ok(SandboxConfigOperation::SetManagedNetworkEnabled(
+            parse_bool_value(value)?,
+        )),
         "features.use_linux_sandbox_bwrap" => Ok(SandboxConfigOperation::SetUseLinuxSandboxBwrap(
             parse_bool_value(value)?,
         )),
@@ -313,6 +317,10 @@ fn apply_config_op(
         }
         SandboxConfigOperation::SetAllowLocalBinding(value) => {
             state.managed_network_policy.allow_local_binding = *value;
+            Ok(())
+        }
+        SandboxConfigOperation::SetManagedNetworkEnabled(value) => {
+            state.managed_network_policy.enabled = *value;
             Ok(())
         }
         SandboxConfigOperation::SetUseLinuxSandboxBwrap(value) => {
