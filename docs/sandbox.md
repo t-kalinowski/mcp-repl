@@ -76,6 +76,13 @@ Optional `bwrap` stage:
 - `MCP_CONSOLE_LINUX_BWRAP_NO_PROC=1` skips `/proc` mounting.
 - if `bwrap` is requested but unavailable, worker startup fails fast.
 
+Managed-network behavior on Linux:
+
+- when network is enabled and managed-network mode is enabled, Linux sandbox runs in proxy-routed mode,
+- proxy-routed mode requires loopback proxy env vars (`HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`, etc.),
+- in bwrap mode, sandbox networking is isolated and proxy traffic is bridged into the namespace,
+- if managed proxy routing is requested but no usable loopback proxy is configured, startup fails fast.
+
 ## Windows behavior (experimental)
 
 - R backend is supported with the same policy surface (`read-only`, `workspace-write`, `danger-full-access`).

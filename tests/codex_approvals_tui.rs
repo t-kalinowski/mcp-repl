@@ -363,6 +363,13 @@ tryCatch({
             trimmed.chars().all(|ch| ch == '─')
         }
 
+        fn is_context_footer_line(line: &str) -> bool {
+            let trimmed = line.trim();
+            !trimmed.is_empty()
+                && trimmed.contains('·')
+                && (trimmed.contains("context left") || trimmed.contains("% left"))
+        }
+
         let mut lines: Vec<String> = Vec::new();
         let mut skipping_underdev_warning = false;
         let mut skipping_wrapped_tool_args = false;
@@ -480,15 +487,12 @@ tryCatch({
             lines.pop();
         }
 
-        if lines.len() >= 2 {
-            let last_line = lines[lines.len() - 1].trim_start();
-            if last_line.contains("context left") {
+        if matches!(lines.last(), Some(line) if is_context_footer_line(line)) {
+            lines.pop();
+            if let Some(prev) = lines.last()
+                && is_prompt_line(prev)
+            {
                 lines.pop();
-                if let Some(prev) = lines.last()
-                    && is_prompt_line(prev)
-                {
-                    lines.pop();
-                }
             }
         }
 

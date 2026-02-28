@@ -6,6 +6,8 @@ mod html_to_markdown;
 mod input_protocol;
 mod install;
 mod ipc;
+#[cfg(target_os = "linux")]
+mod linux_proxy_routing;
 mod output_capture;
 mod output_stream;
 mod pager;
@@ -633,6 +635,15 @@ mod tests {
             op,
             SandboxConfigOperation::SetAllowedDomains(values)
                 if values == vec!["pypi.org".to_string(), "files.pythonhosted.org".to_string()]
+        ));
+    }
+
+    #[test]
+    fn parse_config_override_supports_managed_network_enabled() {
+        let op = parse_sandbox_config_override("permissions.network.enabled=true").expect("config");
+        assert!(matches!(
+            op,
+            SandboxConfigOperation::SetManagedNetworkEnabled(true)
         ));
     }
 

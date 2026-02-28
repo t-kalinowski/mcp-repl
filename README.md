@@ -2,45 +2,58 @@
 
 `mcp-repl` is an MCP server that exposes a long-lived interactive REPL runtime over stdio.
 
-It is backend-agnostic in design. The default interpreter is R, with an opt-in Python interpreter (`--interpreter python`).
+It is designed to accelerate LLMs at tasks like EDA (Exploratory data analysis) and debugging of interperted code (like R or Python). The REPL gives the LLM a tight feed-back loop for exploration and development, just like it does for a human.
 
-Session state persists across calls, so agents can iterate in place, inspect intermediate values, debug, and read docs in-band.
+Unlike a regular REPL, `mcp-repl` presents an interface that is tailored to the
+strengths and weaknesses of an LLM. It is chock-full of affordances designed for agents, giving them access to the same affordances as a repl does a human, but with much more token efficient way, and with the safety of a process sandbox.
 
-## Why use it
 
-- Stateful REPL execution in one long-lived process.
-- LLM-oriented output handling: prompt/echo cleanup and built-in pager mode.
-- In-band docs for common help flows (`?`, `help()`, `vignette()`, `RShowDoc()`).
-- Plot images returned as MCP image content.
-- OS-level sandboxing by default, plus a memory resource guardrail.
+It is backend-agnostic in design. It comes with built in support for R and Python.
+
+
+## Highlights:
 
 ### Safe by default
 
-Like a shell, R and Python are powerful. Without guardrails, an LLM can do real damage on the host (both accidental and prompt-induced). To reduce this risk, `mcp-repl` runs the backend process in a sandboxed environment. By default, network is disabled and writes are constrained to workspace roots and temp paths required by the worker. Sandbox policy is enforced with OS primitives at the process level, not command-specific runtime rules. On Unix backends, `mcp-repl` also enforces a memory resource guardrail on the child process tree and kills the worker if it exceeds the configured threshold.
+The interperter runs in a sandbox. These are restrictions on the process built with OS primitives, not command-specific runtime rules.
+By default, the process only has permissions to write to the current in the current directory, and network is disabled (many system calls generally are disabled).
 
-### Token efficient
+It is also possible to configure the sandbox policy, with extra affordances for adding additional writeable directories, or allowing a specific set of network domains that can be accessed. On Unix backends, `mcp-repl` also enforces a memory resource guardrail on the child process tree and kills the worker if it exceeds the configured threshold.
 
-`mcp-repl` can be substantially more token efficient for an LLM than a standard persistent shell call. It includes affordances tailored to common LLM workflow strengths and weaknesses. For example:
-- There is rarely a need to repeatedly poll, since the console is embedded in the backend and normally returns as soon as evaluation is complete.
-- Echoed inputs are automatically pruned or elided so output is easy to attribute.
-- A rich pager, purpose-built for an LLM, prevents context floods while supporting search and controlled navigation.
-- Documentation receives special handling. Built-in entry points like `?`, `help`, `vignette()`, and `RShowDoc()` are customized to present plain text or converted Markdown in-band, replacing the usual HTML browser flow.
-
-### Pager
-
-The pager activates only when output exceeds roughly one page, and scales from small multi-page outputs to hundreds of pages (for example, navigating the R manuals). It is designed to keep context focused for the model while still allowing deterministic navigation.
-
-Internally, the pager is backed by a bounded ring buffer with an event timeline, not a naive "dump and slice" stream. That gives it predictable memory usage while still supporting strong navigation semantics:
-- Output is tracked with stable offsets, so commands like `:seek` (offset/percent/line) and `:range` can jump deterministically.
-- Text and image events are merged into one timeline, so pagination decisions can account for both without duplicating content.
-- Already-shown ranges and images are tracked explicitly; when overlap occurs, the pager emits offset-based elision markers instead of replaying content.
-- UTF-8-aware indexing keeps search and cursor movement aligned to characters while preserving exact byte offsets internally.
-
-These affordances are all driven by observed LLM workflows and aim to reduce token waste while improving access to reference material.
 
 ### Plots
 
 `mcp-repl` provides a private space for the LLM to easily visualize plots of data. This allows it to iterate safely and privately, without demanding your attention until it can return with a grounded, verified result.
+
+
+### Token efficient
+
+`mcp-repl` can be substantially more token efficient for an LLM than a standard persistent shell call. It includes affordances tailored to common LLM workflow strengths and weaknesses. For example:
+- There is rarely a need for the LLM to poll the pty, since the console is embedded in the backend and returns normally only when evaluation is complete.
+- Echoed inputs are automatically pruned or elided to save context, but in a way where output is always easy to attribute to individual commands.
+
+- Documentation receives special handling. Built-in entry points like `?`, `help()`, `vignette()`, and `RShowDoc()` are customized to present plain text or converted Markdown in-band.
+- A rich pager, purpose-built for an LLM, prevents context floods while supporting search and controlled navigation.
+
+
+
+
+#### Pager
+
+The pager activates only when output exceeds roughly one page, and scales from small multi-page outputs to hundreds of pages (for example, navigating the R manuals). It is designed to keep context focused for the model while still allowing deterministic navigation.
+
+Internally, the pager is backed by a bounded ring buffer with an event timeline That gives it predictable memory usage and strong navigation semantics.
+
+
+The llm can use the pager to `:seek` or jump to a `:range` with (offset/percent/line) values. If the llm jumps around, the pager _never_ shows duplicated content - instead inserts a reference back to the earlier shown content. This enalbes the llm to efficiently browse large documents without wasting context on repeated content.
+
+Already-shown ranges and images are tracked explicitly; when overlap occurs, the pager emits offset-based elision markers instead of replaying content.
+
+Text and image events are merged into one timeline, so pagination decisions can account for both without duplicating content.
+
+These affordances are all driven by observed LLM workflows and aim to reduce token waste while improving access to reference material.
+
+
 
 ## Quickstart
 
@@ -67,25 +80,21 @@ This installs `mcp-repl` into Cargo’s bin directory (typically `~/.cargo/bin`)
 
 Point your MCP client at the binary (either via `PATH` or by using an explicit path like `~/.cargo/bin/mcp-repl` or `target/release/mcp-repl`).
 
-You can auto-install into existing agent config files:
+You can auto-install into existing agent config files both `R` and `python` tools:
 
 ```sh
 # install to all existing agent homes (does not create ~/.codex or ~/.claude)
 mcp-repl install
+```
 
-# install only codex MCP config
-mcp-repl install --client codex
+If you only want to install one interperter tool, or only for a specific client, you can specify it:
 
-# install only claude MCP config
-# Note: there may be some rough edges with Claude.
-# This has been primarily developed and tested with Codex.
-mcp-repl install --client claude
-
-# install only one interpreter for a specific client
+```sh
 mcp-repl install --client codex --interpreter r
 ```
 
-`install --client codex` writes `--sandbox-state inherit` by default. That sentinel means `mcp-repl` should
+
+`install --client codex` writes `--sandbox inherit` by default. That sentinel means `mcp-repl` should
 inherit sandbox policy updates from Codex for the session.
 
 Example `R` REPL Codex config (paths vary by OS/user):
@@ -95,13 +104,15 @@ Example `R` REPL Codex config (paths vary by OS/user):
 command = "/Users/alice/.cargo/bin/mcp-repl"
 # mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.
 tool_timeout_sec = 1800
-# --sandbox-state inherit: use sandbox policy updates sent by Codex for this session.
-# If no update is sent, mcp-repl falls back to its internal default policy.
+# --sandbox inherit: use sandbox policy updates sent by Codex for this session.
+# If no update is sent, mcp-repl exits with an error.
 args = [
-  "--sandbox-state", "inherit",
+  "--sandbox", "inherit",
   "--interpreter", "r",
 ]
 ```
+
+### TODO: bring back writeable root discovery for common R cache dirs
 
 Example `Python` REPL Codex config:
 
@@ -110,10 +121,10 @@ Example `Python` REPL Codex config:
 command = "/Users/alice/.cargo/bin/mcp-repl"
 # mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.
 tool_timeout_sec = 1800
-# --sandbox-state inherit: use sandbox policy updates sent by Codex for this session.
-# If no update is sent, mcp-repl falls back to its internal default policy.
+# --sandbox inherit: use sandbox policy updates sent by Codex for this session.
+# If no update is sent, mcp-repl exits with an error.
 args = [
-  "--sandbox-state", "inherit",
+  "--sandbox", "inherit",
   "--interpreter", "python",
 ]
 ```
@@ -126,11 +137,11 @@ propagate sandbox state updates to MCP servers:
   "mcpServers": {
     "r_repl": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
-      "args": ["--sandbox-state", "workspace-write", "--interpreter", "r"]
+      "args": ["--sandbox", "workspace-write", "--interpreter", "r"]
     },
     "py_repl": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
-      "args": ["--sandbox-state", "workspace-write", "--interpreter", "python"]
+      "args": ["--sandbox", "workspace-write", "--interpreter", "python"]
     }
   }
 }
@@ -140,33 +151,9 @@ By default install creates one entry per supported interpreter:
 - `r_repl`
 - `py_repl`
 
-Use `--interpreter r`, `--interpreter python`, or comma-separated/repeatable forms
-to limit which interpreters are installed.
-
-Optional: enable rich JSONL debug logs for each `mcp-repl` startup:
-
-- CLI arg: `--debug-events-dir /path/to/log-dir`
-- Environment: `MCP_REPL_DEBUG_EVENTS_DIR=/path/to/log-dir`
-
-When enabled, each startup writes a new `mcp-repl-*.jsonl` file containing startup
-metadata (cwd, argv, Codex session hints) plus tool calls and sandbox state updates.
-
-### 3) Pick interpreter (optional)
-
-- Default interpreter: R
-- CLI: `mcp-repl --interpreter r|python`
-- Environment: `MCP_REPL_INTERPRETER=r|python` (compatibility alias: `MCP_REPL_BACKEND`)
-
 ## Runtime discovery
 
 ### Interpreter selection order
-
-`mcp-repl` chooses interpreter in this order:
-- `--interpreter <r|python>` (if provided)
-- compatibility CLI alias: `--backend <r|python>`
-- `MCP_REPL_INTERPRETER`
-- compatibility env alias: `MCP_REPL_BACKEND`
-- default: `r`
 
 ### R interpreter: which R installation is used
 
@@ -181,16 +168,10 @@ Interpreter resolution order:
 - nearest `.venv/bin/python3` from current working directory upward
 - first executable `python3` on `PATH`
 - first executable `python` on `PATH`
-- fallback literal `python3`
 
 Notes:
 - Upward `.venv` search stops at `$HOME` (inclusive) when applicable, otherwise at filesystem root.
-- Python backend starts in basic REPL mode (`PYTHON_BASIC_REPL=1`) and loads `python/driver.py`.
 
-## Platform support
-
-- **macOS / Linux**: supported.
-- **Windows**: experimental for the R backend. The Python backend currently requires a Unix PTY and is not available on Windows.
 
 ## Sandbox
 
@@ -220,9 +201,12 @@ Tool guides:
 
 ## Docs
 
-- Tool behavior and usage guidance:
+Tool behavior and usage guidance:
 - `docs/tool-descriptions/repl_tool_r.md`
 - `docs/tool-descriptions/repl_tool_python.md`
+- `docs/tool-descriptions/repl_reset_tool.md`
+
+Additional references:
 - Sandbox behavior and configuration: `docs/sandbox.md`
 - Worker sideband protocol: `docs/worker_sideband_protocol.md`
 
