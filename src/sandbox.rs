@@ -1307,8 +1307,11 @@ fn linux_build_inner_seccomp_command(
         args.sandbox_policy_cwd.to_string_lossy().to_string(),
         "--sandbox-policy".to_string(),
         policy_json,
-        "--apply-seccomp-then-exec".to_string(),
     ];
+    if args.use_bwrap_sandbox {
+        inner.push("--use-bwrap-sandbox".to_string());
+        inner.push("--apply-seccomp-then-exec".to_string());
+    }
     if args.allow_network_for_proxy {
         inner.push("--allow-network-for-proxy".to_string());
         let proxy_route_spec = proxy_route_spec
@@ -1561,7 +1564,11 @@ fn find_first_non_existent_component(target_path: &Path) -> Option<PathBuf> {
 
 #[cfg(target_os = "linux")]
 fn is_proc_mount_failure(stderr: &str) -> bool {
-    stderr.contains("Can't mount proc") || stderr.contains("mount proc")
+    stderr.contains("Can't mount proc")
+        && stderr.contains("/newroot/proc")
+        && (stderr.contains("Invalid argument")
+            || stderr.contains("Operation not permitted")
+            || stderr.contains("Permission denied"))
 }
 
 #[cfg(target_os = "linux")]
@@ -2337,6 +2344,16 @@ mod tests {
     use std::collections::HashMap;
     use std::path::Path;
     use std::path::PathBuf;
+    #[cfg(target_os = "linux")]
+    use std::sync::{Mutex, OnceLock};
+
+    #[cfg(target_os = "linux")]
+    fn linux_env_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("linux env test lock poisoned")
+    }
 
     #[test]
     fn session_temp_dir_rejects_outside_system_tmp() {
@@ -2453,6 +2470,15 @@ mod tests {
         assert!(is_proc_mount_failure(
             "bwrap: Can't mount proc on /newroot/proc: Invalid argument"
         ));
+        assert!(is_proc_mount_failure(
+            "bwrap: Can't mount proc on /newroot/proc: Operation not permitted"
+        ));
+        assert!(is_proc_mount_failure(
+            "bwrap: Can't mount proc on /newroot/proc: Permission denied"
+        ));
+        assert!(!is_proc_mount_failure(
+            "bwrap: Can't bind mount /dev/null: Operation not permitted"
+        ));
         assert!(!is_proc_mount_failure("bwrap: unrelated failure"));
     }
 
@@ -2535,6 +2561,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn prepare_worker_command_enables_proxy_mode_when_managed_network_env_is_true() {
+        let _guard = linux_env_test_lock();
         let previous_env = std::env::var_os(MANAGED_NETWORK_ENV_KEY);
         unsafe {
             std::env::set_var(MANAGED_NETWORK_ENV_KEY, "1");
@@ -2582,6 +2609,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn prepare_worker_command_bwrap_env_does_not_override_explicit_false() {
+        let _guard = linux_env_test_lock();
         let previous_env = std::env::var_os(LINUX_BWRAP_ENABLED_ENV);
         unsafe {
             std::env::set_var(LINUX_BWRAP_ENABLED_ENV, "1");
@@ -2638,6 +2666,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sandbox_state_defaults_with_environment_respects_linux_bwrap_env() {
+        let _guard = linux_env_test_lock();
         let previous_env = std::env::var_os(LINUX_BWRAP_ENABLED_ENV);
         unsafe {
             std::env::set_var(LINUX_BWRAP_ENABLED_ENV, "1");
@@ -2726,6 +2755,8 @@ mod tests {
 
         let inner = linux_build_inner_seccomp_command(&args, Some("spec-json".to_string()))
             .expect("inner command should build");
+        assert!(inner.contains(&"--use-bwrap-sandbox".to_string()));
+        assert!(inner.contains(&"--apply-seccomp-then-exec".to_string()));
         assert!(inner.contains(&"--allow-network-for-proxy".to_string()));
         assert!(inner.contains(&"--proxy-route-spec".to_string()));
         assert!(inner.contains(&"spec-json".to_string()));
