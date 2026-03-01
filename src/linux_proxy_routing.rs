@@ -27,6 +27,8 @@ const PROXY_ENV_KEYS: &[&str] = &[
     "HTTP_PROXY",
     "HTTPS_PROXY",
     "ALL_PROXY",
+    "WS_PROXY",
+    "WSS_PROXY",
     "FTP_PROXY",
     "YARN_HTTP_PROXY",
     "YARN_HTTPS_PROXY",
@@ -693,6 +695,10 @@ mod tests {
     fn recognizes_proxy_env_keys_case_insensitively() {
         assert!(is_proxy_env_key("HTTP_PROXY"));
         assert!(is_proxy_env_key("http_proxy"));
+        assert!(is_proxy_env_key("WS_PROXY"));
+        assert!(is_proxy_env_key("ws_proxy"));
+        assert!(is_proxy_env_key("WSS_PROXY"));
+        assert!(is_proxy_env_key("wss_proxy"));
         assert!(!is_proxy_env_key("PATH"));
     }
 
@@ -728,15 +734,26 @@ mod tests {
             "HTTPS_PROXY".to_string(),
             "http://example.com:3128".to_string(),
         );
+        env.insert(
+            "WSS_PROXY".to_string(),
+            "http://127.0.0.1:43129".to_string(),
+        );
         env.insert("PATH".to_string(), "/usr/bin".to_string());
 
         let plan = plan_proxy_routes(&env);
         assert!(plan.has_proxy_config);
-        assert_eq!(plan.routes.len(), 1);
+        assert_eq!(plan.routes.len(), 2);
         assert_eq!(plan.routes[0].env_key, "HTTP_PROXY");
         assert_eq!(
             plan.routes[0].endpoint,
             "127.0.0.1:43128"
+                .parse::<SocketAddr>()
+                .expect("valid socket")
+        );
+        assert_eq!(plan.routes[1].env_key, "WSS_PROXY");
+        assert_eq!(
+            plan.routes[1].endpoint,
+            "127.0.0.1:43129"
                 .parse::<SocketAddr>()
                 .expect("valid socket")
         );

@@ -479,7 +479,8 @@ pub fn prepare_worker_command(
     state: &SandboxState,
 ) -> Result<PreparedCommand, SandboxError> {
     #[cfg(target_os = "linux")]
-    if state.sandbox_policy.has_full_network_access()
+    if state.sandbox_policy.requires_sandbox()
+        && state.sandbox_policy.has_full_network_access()
         && state.managed_network_policy.is_enabled()
         && !state.use_linux_sandbox_bwrap
     {
@@ -2658,6 +2659,21 @@ mod tests {
                 .contains("managed network requires --use-bwrap-sandbox on Linux"),
             "unexpected error message: {err}"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepare_worker_command_allows_managed_network_without_bwrap_in_danger_full_access() {
+        let mut state = SandboxState::default();
+        state.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        state.managed_network_policy.enabled = true;
+        state.use_linux_sandbox_bwrap = false;
+
+        let prepared =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
+                .expect("danger-full-access should not require Linux bwrap");
+
+        assert_eq!(prepared.program, PathBuf::from("/bin/echo"));
     }
 
     #[cfg(target_os = "linux")]
