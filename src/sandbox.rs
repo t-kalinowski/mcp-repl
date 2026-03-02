@@ -2606,12 +2606,12 @@ mod tests {
             exclude_tmpdir_env_var: false,
             exclude_slash_tmp: false,
         };
+        state.use_linux_sandbox_bwrap = true;
         state.managed_network_policy.allowed_domains.clear();
         state.managed_network_policy.denied_domains.clear();
 
-        let prepared =
-            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
-                .expect("prepare_worker_command should succeed");
+        let prepared_result =
+            prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state);
 
         match previous_env {
             Some(value) => unsafe {
@@ -2621,6 +2621,8 @@ mod tests {
                 std::env::remove_var(MANAGED_NETWORK_ENV_KEY);
             },
         }
+
+        let prepared = prepared_result.expect("prepare_worker_command should succeed");
 
         assert_eq!(
             prepared
@@ -2651,8 +2653,11 @@ mod tests {
         state.managed_network_policy.enabled = true;
         state.use_linux_sandbox_bwrap = false;
 
-        let err = prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
-            .expect_err("managed network without bwrap should fail");
+        let err =
+            match prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state) {
+                Ok(_) => panic!("managed network without bwrap should fail"),
+                Err(err) => err,
+            };
 
         assert!(
             err.to_string()
