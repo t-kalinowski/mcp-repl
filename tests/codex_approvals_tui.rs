@@ -10,12 +10,12 @@ mod unix_impl {
     use std::io::{ErrorKind, Read, Write};
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
+    use std::process::Stdio;
     use std::sync::mpsc::{Receiver, RecvTimeoutError};
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{TcpListener, TcpStream};
-    use toml_edit::DocumentMut;
     use vt100::Parser;
 
     const WORKSPACE_WRITE_MARKER: &str = "SANDBOX_TEST_1";
@@ -27,10 +27,6 @@ mod unix_impl {
         _temp_dir: tempfile::TempDir,
         workspace: PathBuf,
         codex_home: PathBuf,
-        home: PathBuf,
-        xdg_config_home: PathBuf,
-        xdg_data_home: PathBuf,
-        xdg_cache_home: PathBuf,
         sandbox_log: PathBuf,
     }
 
@@ -38,12 +34,6 @@ mod unix_impl {
     enum ExecSnapshotMode {
         Json,
         Plain,
-    }
-
-    #[derive(Default)]
-    struct HostCodexSettings {
-        model_provider: Option<String>,
-        model: Option<String>,
     }
 
     pub(super) async fn run_codex_exec_initial_sandbox_state() -> TestResult<String> {
@@ -84,28 +74,21 @@ mod unix_impl {
             sh_single_quote(&prompt),
         );
 
-        let mut cmd = std::process::Command::new("env");
-        cmd.arg("-i");
-        cmd.arg(format!("PATH={}", path_for_subprocess()?));
-        cmd.arg(format!("HOME={}", env.home.display()));
-        cmd.arg(format!("XDG_CONFIG_HOME={}", env.xdg_config_home.display()));
-        cmd.arg(format!("XDG_DATA_HOME={}", env.xdg_data_home.display()));
-        cmd.arg(format!("XDG_CACHE_HOME={}", env.xdg_cache_home.display()));
-        cmd.arg(format!("CODEX_HOME={}", env.codex_home.display()));
-        cmd.arg(format!("CODEX_OSS_BASE_URL={}", mock_server.base_url()));
-        cmd.arg(format!("OPENAI_BASE_URL={}", mock_server.base_url()));
-        cmd.arg(format!(
-            "MCP_CONSOLE_SANDBOX_STATE_LOG={}",
-            env.sandbox_log.display()
-        ));
-        cmd.arg("TERM=xterm-256color");
-        cmd.arg("LANG=C");
-        cmd.arg("sh");
+        let mut cmd = std::process::Command::new("sh");
+        cmd.env("CODEX_HOME", env.codex_home.display().to_string());
+        cmd.env("CODEX_OSS_BASE_URL", mock_server.base_url());
+        cmd.env("OPENAI_BASE_URL", mock_server.base_url());
+        cmd.env(
+            "MCP_CONSOLE_SANDBOX_STATE_LOG",
+            env.sandbox_log.display().to_string(),
+        );
+        cmd.env("TERM", "xterm-256color");
+        cmd.env("LANG", "C");
         cmd.arg("-c");
         cmd.arg(shell_script);
         cmd.current_dir(&env.workspace);
 
-        let output = cmd.output()?;
+        let output = run_command_with_timeout(cmd, Duration::from_secs(60))?;
         let stdout = String::from_utf8(output.stdout)
             .map_err(|err| format!("codex exec stdout was not valid UTF-8: {err}"))?;
         let stderr = String::from_utf8(output.stderr)
@@ -173,10 +156,6 @@ mod unix_impl {
         let mut driver = CodexPtyDriver::spawn(
             &env.codex_home,
             &env.workspace,
-            &env.home,
-            &env.xdg_config_home,
-            &env.xdg_data_home,
-            &env.xdg_cache_home,
             &mock_server.base_url(),
             &env.sandbox_log,
         )?;
@@ -261,15 +240,6 @@ mod unix_impl {
 
         let codex_home = temp_dir.path().join("codex-home");
         std::fs::create_dir_all(codex_home.join("shell_snapshots"))?;
-        copy_host_auth_json_if_present(&codex_home)?;
-
-        let home = temp_dir.path().join("home");
-        let xdg_config_home = temp_dir.path().join("xdg-config");
-        let xdg_data_home = temp_dir.path().join("xdg-data");
-        let xdg_cache_home = temp_dir.path().join("xdg-cache");
-        for dir in [&home, &xdg_config_home, &xdg_data_home, &xdg_cache_home] {
-            std::fs::create_dir_all(dir)?;
-        }
 
         let sandbox_log_dir = temp_dir.path().join("sandbox-log");
         std::fs::create_dir_all(&sandbox_log_dir)?;
@@ -282,95 +252,67 @@ mod unix_impl {
             _temp_dir: temp_dir,
             workspace,
             codex_home,
-            home,
-            xdg_config_home,
-            xdg_data_home,
-            xdg_cache_home,
             sandbox_log,
         })
     }
 
-    fn path_for_subprocess() -> TestResult<String> {
-        std::env::var("PATH").map_err(|_| "PATH is required for codex test subprocesses".into())
-    }
+    fn run_command_with_timeout(
+        mut cmd: std::process::Command,
+        timeout: Duration,
+    ) -> TestResult<std::process::Output> {
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        let mut child = cmd.spawn()?;
+        let mut stdout_reader = child
+            .stdout
+            .take()
+            .ok_or_else(|| "failed to capture codex exec stdout".to_string())?;
+        let mut stderr_reader = child
+            .stderr
+            .take()
+            .ok_or_else(|| "failed to capture codex exec stderr".to_string())?;
 
-    fn copy_host_auth_json_if_present(codex_home: &Path) -> TestResult<()> {
-        let Some(source) = host_auth_json_path() else {
-            return Ok(());
+        let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stdout_reader.read_to_end(&mut buf);
+            let _ = stdout_tx.send(buf);
+        });
+        let (stderr_tx, stderr_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = stderr_reader.read_to_end(&mut buf);
+            let _ = stderr_tx.send(buf);
+        });
+
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "timed out waiting for codex exec to finish after {}s",
+                    timeout.as_secs()
+                )
+                .into());
+            }
+            std::thread::sleep(Duration::from_millis(20));
         };
-        if !source.exists() {
-            return Ok(());
-        }
-        std::fs::copy(&source, codex_home.join("auth.json"))
-            .map_err(|err| format!("failed to copy auth token from {}: {err}", source.display()))?;
-        Ok(())
-    }
 
-    fn host_auth_json_path() -> Option<PathBuf> {
-        if let Some(codex_home) = std::env::var_os("CODEX_HOME")
-            && !codex_home.is_empty()
-        {
-            return Some(PathBuf::from(codex_home).join("auth.json"));
-        }
-        let home = std::env::var_os("HOME")?;
-        Some(PathBuf::from(home).join(".codex").join("auth.json"))
-    }
-
-    fn host_config_toml_path() -> Option<PathBuf> {
-        if let Some(codex_home) = std::env::var_os("CODEX_HOME")
-            && !codex_home.is_empty()
-        {
-            return Some(PathBuf::from(codex_home).join("config.toml"));
-        }
-        let home = std::env::var_os("HOME")?;
-        Some(PathBuf::from(home).join(".codex").join("config.toml"))
-    }
-
-    fn host_codex_settings() -> HostCodexSettings {
-        let Some(path) = host_config_toml_path() else {
-            return HostCodexSettings::default();
-        };
-        let Ok(raw) = std::fs::read_to_string(path) else {
-            return HostCodexSettings::default();
-        };
-        let Ok(doc) = raw.parse::<DocumentMut>() else {
-            return HostCodexSettings::default();
-        };
-
-        let active_profile = doc.get("profile").and_then(|item| item.as_str());
-
-        let profile_provider = active_profile
-            .and_then(|profile| {
-                doc.get("profiles")
-                    .and_then(|profiles| profiles.get(profile))
-                    .and_then(|profile_item| profile_item.get("model_provider"))
-                    .and_then(|value| value.as_str())
-            })
-            .map(ToString::to_string);
-        let profile_model = active_profile
-            .and_then(|profile| {
-                doc.get("profiles")
-                    .and_then(|profiles| profiles.get(profile))
-                    .and_then(|profile_item| profile_item.get("model"))
-                    .and_then(|value| value.as_str())
-            })
-            .map(ToString::to_string);
-
-        let model_provider = doc
-            .get("model_provider")
-            .and_then(|value| value.as_str())
-            .map(ToString::to_string)
-            .or(profile_provider);
-        let model = doc
-            .get("model")
-            .and_then(|value| value.as_str())
-            .map(ToString::to_string)
-            .or(profile_model);
-
-        HostCodexSettings {
-            model_provider,
-            model,
-        }
+        let stdout = stdout_rx
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| "timed out collecting codex exec stdout".to_string())?;
+        let stderr = stderr_rx
+            .recv_timeout(Duration::from_secs(1))
+            .map_err(|_| "timed out collecting codex exec stderr".to_string())?;
+        Ok(std::process::Output {
+            status,
+            stdout,
+            stderr,
+        })
     }
 
     fn render_exec_snapshot(
@@ -395,7 +337,11 @@ mod unix_impl {
             if trimmed.is_empty() {
                 continue;
             }
-            out.push_str(&normalize_exec_text(trimmed, workspace, codex_home));
+            let normalized = normalize_exec_text(trimmed, workspace, codex_home);
+            if normalized.is_empty() {
+                continue;
+            }
+            out.push_str(&normalized);
             out.push('\n');
         }
 
@@ -404,7 +350,11 @@ mod unix_impl {
             if trimmed.is_empty() {
                 continue;
             }
-            out.push_str(&normalize_exec_text(trimmed, workspace, codex_home));
+            let normalized = normalize_exec_text(trimmed, workspace, codex_home);
+            if normalized.is_empty() {
+                continue;
+            }
+            out.push_str(&normalized);
             out.push('\n');
         }
 
@@ -412,6 +362,9 @@ mod unix_impl {
     }
 
     fn normalize_exec_text(text: &str, workspace: &Path, codex_home: &Path) -> String {
+        if text.contains("WARN codex_core::shell_snapshot: Failed to delete shell snapshot") {
+            return String::new();
+        }
         let workspace_display = workspace.display().to_string();
         let codex_home_display = codex_home.display().to_string();
         let workspace_private = format!("/private{workspace_display}");
@@ -562,19 +515,9 @@ mod unix_impl {
     fn codex_config(mcp_console: &Path, repo_root: &Path) -> String {
         let mcp_console = toml_escape(&mcp_console.display().to_string());
         let repo_root = toml_escape(&repo_root.display().to_string());
-        let settings = host_codex_settings();
-        let model_provider_line = settings
-            .model_provider
-            .as_ref()
-            .map(|value| format!("model_provider = \"{}\"\n", toml_escape(value)))
-            .unwrap_or_default();
-        let model_line = settings
-            .model
-            .as_ref()
-            .map(|value| format!("model = \"{}\"\n", toml_escape(value)))
-            .unwrap_or_default();
         format!(
-            r#"{model_provider_line}{model_line}disable_paste_burst = true
+            r#"model_provider = "openai"
+disable_paste_burst = true
 project_doc_max_bytes = 0
 
 [notice]
@@ -595,8 +538,6 @@ env_vars = ["MCP_CONSOLE_SANDBOX_STATE_LOG"]
 [projects."{repo_root}"]
 trust_level = "trusted"
 "#,
-            model_provider_line = model_provider_line,
-            model_line = model_line,
         )
     }
 
@@ -957,10 +898,6 @@ tryCatch({
         fn spawn(
             codex_home: &Path,
             workspace: &Path,
-            home: &Path,
-            xdg_config_home: &Path,
-            xdg_data_home: &Path,
-            xdg_cache_home: &Path,
             base_url: &str,
             sandbox_log: &Path,
         ) -> TestResult<Self> {
@@ -974,30 +911,18 @@ tryCatch({
                 })
                 .map_err(|err| format!("openpty failed: {err}"))?;
 
-            let mut cmd = CommandBuilder::new("env");
-            cmd.arg("-i");
-            cmd.arg(format!("PATH={}", path_for_subprocess()?));
-            cmd.arg(format!("HOME={}", home.display()));
-            cmd.arg(format!("XDG_CONFIG_HOME={}", xdg_config_home.display()));
-            cmd.arg(format!("XDG_DATA_HOME={}", xdg_data_home.display()));
-            cmd.arg(format!("XDG_CACHE_HOME={}", xdg_cache_home.display()));
-            cmd.arg(format!("CODEX_HOME={}", codex_home.display()));
-            cmd.arg(format!("CODEX_OSS_BASE_URL={base_url}"));
-            cmd.arg(format!("OPENAI_BASE_URL={base_url}"));
-            cmd.arg(format!(
-                "MCP_CONSOLE_SANDBOX_STATE_LOG={}",
-                sandbox_log.display()
-            ));
-            cmd.arg("TERM=xterm-256color");
-            cmd.arg("LANG=C");
-            cmd.arg("codex");
-            cmd.arg("--sandbox");
-            cmd.arg("workspace-write");
-            cmd.arg("--ask-for-approval");
-            cmd.arg("on-request");
-            cmd.arg("--cd");
-            cmd.arg(workspace);
-            cmd.arg(WARMUP_MARKER);
+            let mut cmd = CommandBuilder::new("sh");
+            let shell_script = format!(
+                "CODEX_HOME={} CODEX_OSS_BASE_URL={} OPENAI_BASE_URL={} MCP_CONSOLE_SANDBOX_STATE_LOG={} TERM=xterm-256color LANG=C codex --sandbox workspace-write --ask-for-approval on-request --cd {} {}",
+                sh_single_quote(&codex_home.display().to_string()),
+                sh_single_quote(base_url),
+                sh_single_quote(base_url),
+                sh_single_quote(&sandbox_log.display().to_string()),
+                sh_single_quote(&workspace.display().to_string()),
+                sh_single_quote(WARMUP_MARKER),
+            );
+            cmd.arg("-c");
+            cmd.arg(shell_script);
 
             let child = pair
                 .slave
