@@ -247,12 +247,12 @@ where
         &self,
         context: rmcp::handler::server::tool::ToolCallContext<'_, S>,
     ) -> Result<CallToolResult, McpError> {
-        let tool = context.name().to_string();
-        let arguments = context.arguments.clone().unwrap_or_default();
-        let task = context.task.clone();
+        let tool = context.name.clone();
         crate::event_log::log_lazy("tool_call_begin", || {
+            let arguments = context.arguments.clone().unwrap_or_default();
+            let task = context.task.clone();
             json!({
-                "tool": tool,
+                "tool": tool.as_ref(),
                 "arguments": arguments,
                 "task": task,
             })
@@ -264,7 +264,7 @@ where
                     let serialized = serde_json::to_value(result)
                         .unwrap_or_else(|err| json!({"serialize_error": err.to_string()}));
                     json!({
-                        "tool": tool,
+                        "tool": tool.as_ref(),
                         "result": serialized,
                     })
                 });
@@ -272,7 +272,7 @@ where
             Err(err) => {
                 crate::event_log::log_lazy("tool_call_error", || {
                     json!({
-                        "tool": tool,
+                        "tool": tool.as_ref(),
                         "error": err.to_string(),
                     })
                 });
