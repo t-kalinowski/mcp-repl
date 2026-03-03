@@ -235,7 +235,7 @@ fn make_random_cap_sid_string() -> String {
 fn validate_windows_policy(policy: &SandboxPolicy) -> Result<(), String> {
     match policy {
         SandboxPolicy::ReadOnly | SandboxPolicy::WorkspaceWrite { .. } => Ok(()),
-        SandboxPolicy::DangerFullAccess | SandboxPolicy::ExternalSandbox { .. } => {
+        SandboxPolicy::DangerFullAccess => {
             Err("windows sandbox runner only supports read-only/workspace-write".to_string())
         }
     }
@@ -1275,15 +1275,6 @@ mod tests {
     fn rejects_danger_full_access_policy() {
         let err = validate_windows_policy(&SandboxPolicy::DangerFullAccess)
             .expect_err("danger-full-access should be rejected");
-        assert!(err.contains("read-only/workspace-write"));
-    }
-
-    #[test]
-    fn rejects_external_sandbox_policy() {
-        let err = validate_windows_policy(&SandboxPolicy::ExternalSandbox {
-            network_access: crate::sandbox::NetworkAccess::Enabled,
-        })
-        .expect_err("external-sandbox should be rejected");
         assert!(err.contains("read-only/workspace-write"));
     }
 

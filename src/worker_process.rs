@@ -25,6 +25,7 @@ use crate::ipc::{
 };
 #[cfg(any(target_family = "unix", target_family = "windows"))]
 use crate::ipc::{IpcHandlers, IpcPlotImage};
+use crate::managed_network_proxy::ManagedNetworkProxy;
 use crate::output_capture::{
     OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEventKind, OutputRange, OutputTimeline,
     ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
@@ -443,6 +444,7 @@ fn worker_context_event_payload(
             .map(|path| path.to_string_lossy().to_string()),
         "use_linux_sandbox_bwrap": sandbox_state.use_linux_sandbox_bwrap,
         "managed_network_policy": {
+            "enabled": sandbox_state.managed_network_policy.enabled,
             "allowed_domains": sandbox_state.managed_network_policy.allowed_domains.clone(),
             "denied_domains": sandbox_state.managed_network_policy.denied_domains.clone(),
             "allow_local_binding": sandbox_state.managed_network_policy.allow_local_binding,
@@ -1493,9 +1495,11 @@ impl WorkerManager {
 
         if let Some(process) = self.process.take() {
             let _ = process.shutdown_graceful(timeout);
+            self.guardrail.busy.store(false, Ordering::Relaxed);
+            self.process = Some(self.spawn_process()?);
+        } else {
+            self.guardrail.busy.store(false, Ordering::Relaxed);
         }
-        self.guardrail.busy.store(false, Ordering::Relaxed);
-        self.process = Some(self.spawn_process()?);
         Ok(true)
     }
 
@@ -2464,6 +2468,7 @@ struct WorkerProcess {
     child: Child,
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
+    _managed_network_proxy: Option<ManagedNetworkProxy>,
     ipc: IpcHandle,
     expected_exit: bool,
     exit_status: Option<std::process::ExitStatus>,
@@ -2491,6 +2496,7 @@ struct SpawnedWorker {
     child: Child,
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
+    _managed_network_proxy: Option<ManagedNetworkProxy>,
     #[cfg(target_os = "macos")]
     denial_logger: Option<crate::sandbox::DenialLogger>,
 }
@@ -2594,6 +2600,7 @@ impl WorkerProcess {
             child,
             stdin_tx,
             session_tmpdir,
+            _managed_network_proxy,
             #[cfg(target_os = "macos")]
             denial_logger,
         } = match backend {
@@ -2648,6 +2655,7 @@ impl WorkerProcess {
             child,
             stdin_tx,
             session_tmpdir,
+            _managed_network_proxy,
             ipc,
             expected_exit: false,
             exit_status: None,
@@ -2668,9 +2676,10 @@ impl WorkerProcess {
         output_timeline: OutputTimeline,
         ipc_server: &mut IpcServer,
     ) -> Result<SpawnedWorker, WorkerError> {
-        let prepared =
+        let mut prepared =
             prepare_worker_command(exe_path, vec![WORKER_MODE_ARG.to_string()], sandbox_state)
                 .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+        let managed_network_proxy = prepared.managed_network_proxy.take();
         let session_tmpdir = prepared
             .env
             .get(R_SESSION_TMPDIR_ENV)
@@ -2747,6 +2756,7 @@ impl WorkerProcess {
             child,
             stdin_tx,
             session_tmpdir,
+            _managed_network_proxy: managed_network_proxy,
             #[cfg(target_os = "macos")]
             denial_logger,
         })
@@ -2780,9 +2790,10 @@ impl WorkerProcess {
         #[cfg(target_family = "unix")]
         {
             let python_program = Self::resolve_python_program();
-            let prepared =
+            let mut prepared =
                 prepare_worker_command(&python_program, Self::python_command_args(), sandbox_state)
                     .map_err(|err| WorkerError::Sandbox(err.to_string()))?;
+            let managed_network_proxy = prepared.managed_network_proxy.take();
             let session_tmpdir = prepared
                 .env
                 .get(R_SESSION_TMPDIR_ENV)
@@ -2855,6 +2866,7 @@ impl WorkerProcess {
                 child,
                 stdin_tx,
                 session_tmpdir,
+                _managed_network_proxy: managed_network_proxy,
                 #[cfg(target_os = "macos")]
                 denial_logger,
             })
@@ -3647,7 +3659,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_sandbox_update_does_not_commit_inherited_state() {
+    fn workspace_write_overrides_are_noop_for_non_workspace_inherited_state() {
         let _guard = cwd_test_mutex().lock().expect("cwd mutex");
         let original_initial = std::env::var_os(crate::sandbox::INITIAL_SANDBOX_STATE_ENV);
         let initial = serde_json::json!({
@@ -3680,7 +3692,7 @@ mod tests {
             .clone()
             .expect("inherited state should be present");
 
-        let err = manager
+        let changed = manager
             .update_sandbox_state(
                 SandboxStateUpdate {
                     sandbox_policy: SandboxPolicy::DangerFullAccess,
@@ -3690,15 +3702,23 @@ mod tests {
                 },
                 Duration::from_millis(1),
             )
-            .expect_err("danger-full-access should fail workspace-write-only config");
+            .expect("danger-full-access should succeed; workspace-write-only override is no-op");
         assert!(
-            matches!(err, WorkerError::Sandbox(ref msg) if msg.contains("requires workspace-write mode")),
-            "unexpected error: {err}"
+            changed,
+            "sandbox state should change after inherited update"
         );
         assert_eq!(
             manager.inherited_sandbox_state,
-            Some(inherited_before),
-            "failed updates must not mutate inherited sandbox baseline"
+            Some(SandboxState {
+                sandbox_policy: SandboxPolicy::DangerFullAccess,
+                ..inherited_before.clone()
+            }),
+            "inherited sandbox baseline should commit successful updates"
+        );
+        assert_eq!(
+            manager.sandbox_state.sandbox_policy,
+            SandboxPolicy::DangerFullAccess,
+            "workspace-write-only override should be ignored for non-workspace policy"
         );
 
         match original_initial {

@@ -4,6 +4,7 @@ use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use toml_edit::{Array, DocumentMut, Item, Table, value};
@@ -91,6 +92,7 @@ pub fn run(options: InstallOptions) -> Result<(), Box<dyn std::error::Error>> {
     let targets = resolve_target_roots(&options.targets)?;
     let codex_args = codex_install_args(&options.args);
     let claude_args = claude_install_args(&options.args);
+    let user_supplied_sandbox_config = has_sandbox_config_arg(&options.args);
     let interpreters = effective_interpreters(&options.interpreters);
     let mut server_specs = Vec::new();
     let mut used_server_names = std::collections::BTreeSet::new();
@@ -112,13 +114,27 @@ pub fn run(options: InstallOptions) -> Result<(), Box<dyn std::error::Error>> {
         }
         server_specs.push((server_name, *interpreter));
     }
+    let install_time_r_cache_root = if user_supplied_sandbox_config
+        || !server_specs
+            .iter()
+            .any(|(_, interpreter)| *interpreter == InstallInterpreter::R)
+    {
+        None
+    } else {
+        install_time_r_cache_root()
+    };
 
     for (target, root) in targets {
         match target {
             InstallTarget::Codex => {
                 let path = root.join("config.toml");
                 for (server_name, interpreter) in &server_specs {
-                    let server_args = with_interpreter_arg(&codex_args, *interpreter);
+                    let server_args = apply_install_time_r_writable_root(
+                        &codex_args,
+                        *interpreter,
+                        user_supplied_sandbox_config,
+                        install_time_r_cache_root.as_deref(),
+                    );
                     upsert_codex_mcp_server(&path, server_name, &command, &server_args)?;
                 }
                 println!("Updated codex MCP config: {}", path.display());
@@ -126,7 +142,12 @@ pub fn run(options: InstallOptions) -> Result<(), Box<dyn std::error::Error>> {
             InstallTarget::Claude => {
                 let path = resolve_claude_config_path(&root);
                 for (server_name, interpreter) in &server_specs {
-                    let server_args = with_interpreter_arg(&claude_args, *interpreter);
+                    let server_args = apply_install_time_r_writable_root(
+                        &claude_args,
+                        *interpreter,
+                        user_supplied_sandbox_config,
+                        install_time_r_cache_root.as_deref(),
+                    );
                     upsert_claude_mcp_server(&path, server_name, &command, &server_args)?;
                 }
                 println!("Updated claude MCP config: {}", path.display());
@@ -256,8 +277,15 @@ fn has_sandbox_config_arg(args: &[String]) -> bool {
     while let Some(arg) = iter.next() {
         if matches!(
             arg.as_str(),
-            "--sandbox" | "--add-writable-root" | "--add-writeable-root" | "--add-allowed-domain"
+            "--sandbox"
+                | "--network-mode"
+                | "--network"
+                | "--add-writable-root"
+                | "--add-writeable-root"
+                | "--add-allowed-domain"
         ) || arg.starts_with("--sandbox=")
+            || arg.starts_with("--network-mode=")
+            || arg.starts_with("--network=")
             || arg.starts_with("--add-writable-root=")
             || arg.starts_with("--add-writeable-root=")
             || arg.starts_with("--add-allowed-domain=")
@@ -289,6 +317,8 @@ fn is_sandbox_config_override(raw: &str) -> bool {
     matches!(
         key.trim(),
         "sandbox_mode"
+            | "network.mode"
+            | "network_mode"
             | "sandbox_workspace_write.network_access"
             | "sandbox_workspace_write.writable_roots"
             | "sandbox_workspace_write.exclude_tmpdir_env_var"
@@ -296,6 +326,7 @@ fn is_sandbox_config_override(raw: &str) -> bool {
             | "permissions.network.allowed_domains"
             | "permissions.network.denied_domains"
             | "permissions.network.allow_local_binding"
+            | "permissions.network.enabled"
             | "features.use_linux_sandbox_bwrap"
             | "use_linux_sandbox_bwrap"
     )
@@ -340,6 +371,89 @@ fn with_interpreter_arg(base_args: &[String], interpreter: InstallInterpreter) -
     args.push("--interpreter".to_string());
     args.push(interpreter.cli_value().to_string());
     args
+}
+
+fn apply_install_time_r_writable_root(
+    base_args: &[String],
+    interpreter: InstallInterpreter,
+    user_supplied_sandbox_config: bool,
+    r_cache_root: Option<&Path>,
+) -> Vec<String> {
+    let mut args = with_interpreter_arg(base_args, interpreter);
+    if interpreter != InstallInterpreter::R || user_supplied_sandbox_config {
+        return args;
+    }
+    let Some(root) = r_cache_root else {
+        return args;
+    };
+    if !root.is_absolute() || !root.is_dir() {
+        return args;
+    }
+    let root = root.to_string_lossy().to_string();
+    if contains_writable_root_value(&args, root.as_str()) {
+        return args;
+    }
+    args.push("--add-writable-root".to_string());
+    args.push(root);
+    args
+}
+
+fn contains_writable_root_value(args: &[String], target: &str) -> bool {
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--add-writable-root" || arg == "--add-writeable-root" {
+            if iter.next().is_some_and(|value| value == target) {
+                return true;
+            }
+            continue;
+        }
+        if arg
+            .strip_prefix("--add-writable-root=")
+            .is_some_and(|value| value == target)
+        {
+            return true;
+        }
+        if arg
+            .strip_prefix("--add-writeable-root=")
+            .is_some_and(|value| value == target)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn install_time_r_cache_root() -> Option<PathBuf> {
+    let output = Command::new("R")
+        .stdin(Stdio::null())
+        .arg("-s")
+        .arg("-e")
+        .arg(
+            r#"cat("MCP_REPL_INSTALL_R_CACHE_ROOT=", dirname(tools::R_user_dir("mcp_repl_install_probe", which = "cache")), "\n", sep = "")"#,
+        )
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    parse_r_cache_root_probe_output(&stdout)
+}
+
+fn parse_r_cache_root_probe_output(stdout: &str) -> Option<PathBuf> {
+    for line in stdout.lines() {
+        let Some((key, value)) = line.trim_start().split_once('=') else {
+            continue;
+        };
+        if key != "MCP_REPL_INSTALL_R_CACHE_ROOT" {
+            continue;
+        }
+        let path = PathBuf::from(value.trim());
+        if path.is_absolute() {
+            return Some(path);
+        }
+    }
+    None
 }
 
 fn effective_interpreters(configured: &[InstallInterpreter]) -> Vec<InstallInterpreter> {
@@ -911,6 +1025,29 @@ name="demo"
     }
 
     #[test]
+    fn install_args_preserve_explicit_sandbox_config_via_network_mode_flag() {
+        let base = vec![
+            "--network-mode".to_string(),
+            "managed".to_string(),
+            "--interpreter".to_string(),
+            "python".to_string(),
+        ];
+        assert_eq!(codex_install_args(&base), base);
+        assert_eq!(claude_install_args(&base), base);
+    }
+
+    #[test]
+    fn install_args_preserve_explicit_sandbox_config_via_network_mode_key() {
+        let base = vec![
+            "--config=network.mode=managed".to_string(),
+            "--interpreter".to_string(),
+            "python".to_string(),
+        ];
+        assert_eq!(codex_install_args(&base), base);
+        assert_eq!(claude_install_args(&base), base);
+    }
+
+    #[test]
     fn with_interpreter_arg_adds_python_interpreter_when_missing() {
         let args = with_interpreter_arg(
             &["--sandbox".to_string(), "workspace-write".to_string()],
@@ -1026,6 +1163,100 @@ name="demo"
         assert!(
             server.get("_comment_sandbox_state").is_none(),
             "did not expect sandbox comment field in claude config"
+        );
+    }
+
+    #[test]
+    fn parse_r_cache_root_probe_output_extracts_absolute_path() {
+        let expected = std::env::temp_dir().join("mcp-repl-r-cache");
+        let probe_output = format!(
+            "noise\nMCP_REPL_INSTALL_R_CACHE_ROOT=relative/path\nMCP_REPL_INSTALL_R_CACHE_ROOT={}\n",
+            expected.display()
+        );
+        let root = parse_r_cache_root_probe_output(&probe_output);
+        assert_eq!(root, Some(expected));
+    }
+
+    #[test]
+    fn apply_install_time_r_writable_root_adds_root_for_r() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let cache_root = temp.path().join("r-cache");
+        std::fs::create_dir_all(&cache_root).expect("cache root should create");
+        let args = apply_install_time_r_writable_root(
+            &["--sandbox".to_string(), "inherit".to_string()],
+            InstallInterpreter::R,
+            false,
+            Some(cache_root.as_path()),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--sandbox".to_string(),
+                "inherit".to_string(),
+                "--interpreter".to_string(),
+                "r".to_string(),
+                "--add-writable-root".to_string(),
+                cache_root.to_string_lossy().to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_install_time_r_writable_root_skips_missing_root_path() {
+        let temp = tempfile::tempdir().expect("tempdir should create");
+        let missing_root = temp.path().join("missing-r-cache");
+        let args = apply_install_time_r_writable_root(
+            &["--sandbox".to_string(), "inherit".to_string()],
+            InstallInterpreter::R,
+            false,
+            Some(missing_root.as_path()),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--sandbox".to_string(),
+                "inherit".to_string(),
+                "--interpreter".to_string(),
+                "r".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_install_time_r_writable_root_skips_python() {
+        let args = apply_install_time_r_writable_root(
+            &["--sandbox".to_string(), "inherit".to_string()],
+            InstallInterpreter::Python,
+            false,
+            Some(Path::new("/tmp/r-cache")),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--sandbox".to_string(),
+                "inherit".to_string(),
+                "--interpreter".to_string(),
+                "python".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_install_time_r_writable_root_skips_when_user_supplies_sandbox() {
+        let args = apply_install_time_r_writable_root(
+            &["--sandbox".to_string(), "inherit".to_string()],
+            InstallInterpreter::R,
+            true,
+            Some(Path::new("/tmp/r-cache")),
+        );
+        assert_eq!(
+            args,
+            vec![
+                "--sandbox".to_string(),
+                "inherit".to_string(),
+                "--interpreter".to_string(),
+                "r".to_string(),
+            ]
         );
     }
 
