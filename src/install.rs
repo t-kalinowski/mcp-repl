@@ -187,11 +187,7 @@ fn resolve_target_roots(
                 // For Claude, we just need the home directory to exist
                 let home = home_dir()?;
                 if !home.is_dir() {
-                    return Err(format!(
-                        "home directory does not exist: {}",
-                        home.display()
-                    )
-                    .into());
+                    return Err(format!("home directory does not exist: {}", home.display()).into());
                 }
                 home
             }
