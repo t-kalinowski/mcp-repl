@@ -466,7 +466,7 @@ mcp-repl install [codex] [claude] [--client <codex|claude>]... [--interpreter <r
 --add-allowed-domain: append allowed domain pattern in argument order\n\
 --config: apply advanced ordered sandbox/network override (Codex-compatible keys)\n\
 install: update MCP config for codex (~/.codex/config.toml) and claude (~/.claude.json)\n\
-install defaults to the full interpreter grid for each selected client (currently r_repl + py_repl)"
+install defaults to the full interpreter grid for each selected client (currently r + python)"
     );
 }
 
@@ -523,13 +523,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_install_args_defaults_server_name_to_r_repl() {
+    fn parse_install_args_defaults_server_name_to_r() {
         let mut parser = ArgParser {
             args: Vec::new(),
             index: 0,
         };
         let parsed = parse_install_args(&mut parser, Vec::new()).expect("parse install args");
-        assert_eq!(parsed.server_name, install::DEFAULT_R_SERVER_NAME);
+        assert_eq!(parsed.server_name, "r");
         assert!(!parsed.server_name_explicit);
         assert!(parsed.interpreters.is_empty());
     }

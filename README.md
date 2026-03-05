@@ -89,7 +89,7 @@ inherit sandbox policy updates from Codex for the session.
 Example `R` REPL Codex config (paths vary by OS/user):
 
 ```toml
-[mcp_servers.r_repl]
+[mcp_servers.r]
 command = "/Users/alice/.cargo/bin/mcp-repl"
 # mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.
 tool_timeout_sec = 1800
@@ -104,7 +104,7 @@ args = [
 Example `Python` REPL Codex config:
 
 ```toml
-[mcp_servers.py_repl]
+[mcp_servers.python]
 command = "/Users/alice/.cargo/bin/mcp-repl"
 # mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.
 tool_timeout_sec = 1800
@@ -123,11 +123,11 @@ because Claude does not propagate sandbox state updates to MCP servers:
 // ~/.claude.json
 {
   "mcpServers": {
-    "r_repl": {
+    "r": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
       "args": ["--sandbox", "workspace-write", "--interpreter", "r"]
     },
-    "py_repl": {
+    "python": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
       "args": ["--sandbox", "workspace-write", "--interpreter", "python"]
     }
@@ -136,8 +136,8 @@ because Claude does not propagate sandbox state updates to MCP servers:
 ```
 
 By default install creates one entry per supported interpreter:
-- `r_repl`
-- `py_repl`
+- `r`
+- `python`
 
 Use `--interpreter r`, `--interpreter python`, or comma-separated/repeatable forms
 to limit which interpreters are installed.

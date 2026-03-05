@@ -56,36 +56,36 @@ fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     let doc = text.parse::<DocumentMut>()?;
 
     assert!(
-        doc["mcp_servers"]["r_repl"].is_table(),
-        "expected mcp_servers.r_repl table"
+        doc["mcp_servers"]["r"].is_table(),
+        "expected mcp_servers.r table"
     );
     assert!(
-        doc["mcp_servers"]["py_repl"].is_table(),
-        "expected mcp_servers.py_repl table"
+        doc["mcp_servers"]["python"].is_table(),
+        "expected mcp_servers.python table"
     );
 
-    let r_args = doc["mcp_servers"]["r_repl"]["args"]
+    let r_args = doc["mcp_servers"]["r"]["args"]
         .as_array()
-        .expect("expected r_repl args array");
+        .expect("expected r args array");
     let has_sandbox_inherit = r_args
         .iter()
         .zip(r_args.iter().skip(1))
         .any(|(a, b)| a.as_str() == Some("--sandbox") && b.as_str() == Some("inherit"));
     assert!(
         has_sandbox_inherit,
-        "expected r_repl args to include `--sandbox inherit`"
+        "expected r args to include `--sandbox inherit`"
     );
 
-    let py_args = doc["mcp_servers"]["py_repl"]["args"]
+    let py_args = doc["mcp_servers"]["python"]["args"]
         .as_array()
-        .expect("expected py_repl args array");
+        .expect("expected python args array");
     let has_interpreter_python = py_args.iter().zip(py_args.iter().skip(1)).any(|(a, b)| {
         (a.as_str() == Some("--interpreter") || a.as_str() == Some("--backend"))
             && b.as_str() == Some("python")
     });
     assert!(
         has_interpreter_python,
-        "expected py_repl args to include python interpreter selection"
+        "expected python args to include python interpreter selection"
     );
     let py_has_sandbox_inherit = py_args
         .iter()
@@ -93,7 +93,7 @@ fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
         .any(|(a, b)| a.as_str() == Some("--sandbox") && b.as_str() == Some("inherit"));
     assert!(
         py_has_sandbox_inherit,
-        "expected py_repl args to include `--sandbox inherit`"
+        "expected python args to include `--sandbox inherit`"
     );
 
     Ok(())
@@ -124,31 +124,31 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     let servers = root["mcpServers"]
         .as_object()
         .expect("expected mcpServers object");
-    assert!(servers.contains_key("r_repl"), "expected r_repl server");
-    assert!(servers.contains_key("py_repl"), "expected py_repl server");
+    assert!(servers.contains_key("r"), "expected r server");
+    assert!(servers.contains_key("python"), "expected python server");
 
-    let r_args = root["mcpServers"]["r_repl"]["args"]
+    let r_args = root["mcpServers"]["r"]["args"]
         .as_array()
-        .expect("expected r_repl args array");
+        .expect("expected r args array");
     let r_has_workspace_write = r_args
         .iter()
         .zip(r_args.iter().skip(1))
         .any(|(a, b)| a.as_str() == Some("--sandbox") && b.as_str() == Some("workspace-write"));
     assert!(
         r_has_workspace_write,
-        "expected r_repl args to include `--sandbox workspace-write`"
+        "expected r args to include `--sandbox workspace-write`"
     );
 
-    let py_args = root["mcpServers"]["py_repl"]["args"]
+    let py_args = root["mcpServers"]["python"]["args"]
         .as_array()
-        .expect("expected py_repl args array");
+        .expect("expected python args array");
     let py_has_workspace_write = py_args
         .iter()
         .zip(py_args.iter().skip(1))
         .any(|(a, b)| a.as_str() == Some("--sandbox") && b.as_str() == Some("workspace-write"));
     assert!(
         py_has_workspace_write,
-        "expected py_repl args to include `--sandbox workspace-write`"
+        "expected python args to include `--sandbox workspace-write`"
     );
     let py_has_interpreter_python = py_args.iter().zip(py_args.iter().skip(1)).any(|(a, b)| {
         (a.as_str() == Some("--interpreter") || a.as_str() == Some("--backend"))
@@ -156,7 +156,7 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     });
     assert!(
         py_has_interpreter_python,
-        "expected py_repl args to include python interpreter selection"
+        "expected python args to include python interpreter selection"
     );
 
     Ok(())

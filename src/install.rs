@@ -12,8 +12,8 @@ const CODEX_TOOL_TIMEOUT_SECS: i64 = 1_800;
 const CODEX_TOOL_TIMEOUT_COMMENT: &str =
     "\n# mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.\n";
 const CODEX_SANDBOX_INHERIT_COMMENT: &str = "\n# --sandbox inherit: use sandbox policy updates sent by Codex for this session.\n# If no update is sent, mcp-repl exits with an error.\n";
-pub const DEFAULT_R_SERVER_NAME: &str = "r_repl";
-pub const DEFAULT_PYTHON_SERVER_NAME: &str = "py_repl";
+pub const DEFAULT_R_SERVER_NAME: &str = "r";
+pub const DEFAULT_PYTHON_SERVER_NAME: &str = "python";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallInterpreter {
@@ -528,6 +528,25 @@ fn upsert_claude_mcp_server(
         ])),
     );
 
+    // Add tool permission to auto-approve all tools from this MCP server
+    let tool_pattern = format!("mcp__{server_name}__*");
+    let permissions = root_obj
+        .entry("permissions".to_string())
+        .or_insert_with(|| JsonValue::Object(JsonMap::new()));
+    let Some(perm_obj) = permissions.as_object_mut() else {
+        return Err("claude config `permissions` must be a JSON object".into());
+    };
+    let allow_list = perm_obj
+        .entry("allow".to_string())
+        .or_insert_with(|| JsonValue::Array(Vec::new()));
+    let Some(allow_arr) = allow_list.as_array_mut() else {
+        return Err("claude config `permissions.allow` must be an array".into());
+    };
+    // Add the pattern if not already present
+    if !allow_arr.iter().any(|v| v.as_str() == Some(&tool_pattern)) {
+        allow_arr.push(JsonValue::String(tool_pattern));
+    }
+
     let serialized = serialize_json_pretty_with_paired_args(&root)?;
     atomic_write(config_path, &serialized)?;
     Ok(())
@@ -734,7 +753,7 @@ repl = { command = "/usr/local/bin/old-mcp-repl", args = ["--backend", "r"] }
 [mcp_servers]
   # keep this note
 repl={command="/usr/local/bin/old-mcp-repl",args=["--backend","r"]}
-r_repl = { command = "/usr/local/bin/legacy-repl" }
+r = { command = "/usr/local/bin/legacy-repl" }
 
 [workspace]
 name="demo"
@@ -762,7 +781,7 @@ name="demo"
             "non-mcp sections should be preserved"
         );
         assert_eq!(
-            doc["mcp_servers"]["r_repl"]["command"].as_str(),
+            doc["mcp_servers"]["r"]["command"].as_str(),
             Some("/usr/local/bin/legacy-repl"),
             "other MCP servers should be preserved"
         );
@@ -1021,6 +1040,113 @@ name="demo"
         assert!(
             server.get("_comment_sandbox_state").is_none(),
             "did not expect sandbox comment field in claude config"
+        );
+    }
+
+    #[test]
+    fn upsert_claude_mcp_server_adds_tool_permission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("settings.json");
+        upsert_claude_mcp_server(
+            &config,
+            "r",
+            "/path/to/mcp-repl",
+            &["--interpreter".to_string(), "r".to_string()],
+        )
+        .expect("upsert claude");
+
+        let text = fs::read_to_string(&config).expect("read config");
+        let root: JsonValue = serde_json::from_str(&text).expect("parse json");
+        let allow = root["permissions"]["allow"]
+            .as_array()
+            .expect("permissions.allow array");
+        assert!(
+            allow.iter().any(|v| v.as_str() == Some("mcp__r__*")),
+            "expected mcp__r__* in permissions.allow"
+        );
+    }
+
+    #[test]
+    fn upsert_claude_mcp_server_does_not_duplicate_permission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("settings.json");
+        // First upsert
+        upsert_claude_mcp_server(
+            &config,
+            "r",
+            "/path/to/mcp-repl",
+            &["--interpreter".to_string(), "r".to_string()],
+        )
+        .expect("first upsert");
+        // Second upsert (update)
+        upsert_claude_mcp_server(
+            &config,
+            "r",
+            "/path/to/new-mcp-repl",
+            &["--interpreter".to_string(), "r".to_string()],
+        )
+        .expect("second upsert");
+
+        let text = fs::read_to_string(&config).expect("read config");
+        let root: JsonValue = serde_json::from_str(&text).expect("parse json");
+        let allow = root["permissions"]["allow"]
+            .as_array()
+            .expect("permissions.allow array");
+        let count = allow
+            .iter()
+            .filter(|v| v.as_str() == Some("mcp__r__*"))
+            .count();
+        assert_eq!(
+            count, 1,
+            "expected exactly one mcp__r__* entry, not duplicated"
+        );
+    }
+
+    #[test]
+    fn upsert_claude_mcp_server_preserves_existing_permissions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = dir.path().join("settings.json");
+        // Seed with existing permissions
+        fs::write(
+            &config,
+            r#"{
+  "permissions": {
+    "allow": ["Bash(cargo test:*)"],
+    "deny": ["Bash(rm -rf *)"]
+  }
+}"#,
+        )
+        .expect("seed config");
+
+        upsert_claude_mcp_server(
+            &config,
+            "r",
+            "/path/to/mcp-repl",
+            &["--interpreter".to_string(), "r".to_string()],
+        )
+        .expect("upsert claude");
+
+        let text = fs::read_to_string(&config).expect("read config");
+        let root: JsonValue = serde_json::from_str(&text).expect("parse json");
+        let allow = root["permissions"]["allow"]
+            .as_array()
+            .expect("permissions.allow array");
+        assert!(
+            allow
+                .iter()
+                .any(|v| v.as_str() == Some("Bash(cargo test:*)")),
+            "expected existing permission preserved"
+        );
+        assert!(
+            allow.iter().any(|v| v.as_str() == Some("mcp__r__*")),
+            "expected new permission added"
+        );
+        let deny = root["permissions"]["deny"]
+            .as_array()
+            .expect("permissions.deny array");
+        assert!(
+            deny.iter().any(|v| v.as_str() == Some("Bash(rm -rf *)")),
+            "expected deny list preserved"
         );
     }
 
