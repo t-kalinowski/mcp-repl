@@ -1408,6 +1408,11 @@ impl WorkerManager {
                 "timeout_ms": timeout.as_millis(),
             }),
         );
+        if self.awaiting_initial_sandbox_state_update {
+            return Err(WorkerError::Sandbox(
+                MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
+            ));
+        }
         if let Some(process) = self.process.take() {
             let _ = process.shutdown_graceful(timeout);
         }
