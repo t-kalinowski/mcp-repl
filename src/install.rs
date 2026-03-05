@@ -12,8 +12,8 @@ const CODEX_TOOL_TIMEOUT_SECS: i64 = 1_800;
 const CODEX_TOOL_TIMEOUT_COMMENT: &str =
     "\n# mcp-repl handles the primary timeout; this higher Codex timeout is only an outer guard.\n";
 const CODEX_SANDBOX_INHERIT_COMMENT: &str = "\n# --sandbox inherit: use sandbox policy updates sent by Codex for this session.\n# If no update is sent, mcp-repl exits with an error.\n";
-pub const DEFAULT_R_SERVER_NAME: &str = "r_repl";
-pub const DEFAULT_PYTHON_SERVER_NAME: &str = "py_repl";
+pub const DEFAULT_R_SERVER_NAME: &str = "r";
+pub const DEFAULT_PYTHON_SERVER_NAME: &str = "python";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallInterpreter {
@@ -124,12 +124,20 @@ pub fn run(options: InstallOptions) -> Result<(), Box<dyn std::error::Error>> {
                 println!("Updated codex MCP config: {}", path.display());
             }
             InstallTarget::Claude => {
-                let path = resolve_claude_config_path(&root);
+                let config_path = root.join(".claude.json");
+                let settings_dir = root.join(".claude");
+                let settings_path = settings_dir.join("settings.json");
                 for (server_name, interpreter) in &server_specs {
                     let server_args = with_interpreter_arg(&claude_args, *interpreter);
-                    upsert_claude_mcp_server(&path, server_name, &command, &server_args)?;
+                    upsert_claude_mcp_server(&config_path, server_name, &command, &server_args)?;
+                    // Ensure ~/.claude directory exists for settings.json
+                    if !settings_dir.is_dir() {
+                        fs::create_dir_all(&settings_dir)?;
+                    }
+                    upsert_claude_settings_permission(&settings_path, server_name)?;
                 }
-                println!("Updated claude MCP config: {}", path.display());
+                println!("Updated claude MCP config: {}", config_path.display());
+                println!("Updated claude permissions: {}", settings_path.display());
             }
         }
     }
@@ -153,13 +161,14 @@ fn resolve_target_roots(
         if codex_root.is_dir() {
             targets.insert(InstallTarget::Codex);
         }
-        let claude_root = default_claude_home()?;
-        if claude_root.is_dir() {
+        // For Claude, check if home directory exists (we write directly to ~/.claude.json)
+        let home = home_dir()?;
+        if home.is_dir() {
             targets.insert(InstallTarget::Claude);
         }
         if targets.is_empty() {
             return Err(
-                "no existing agent home found (expected ~/.codex and/or ~/.claude; not creating new directories)"
+                "no existing agent home found (expected ~/.codex and/or home directory for ~/.claude.json)"
                     .into(),
             );
         }
@@ -170,17 +179,27 @@ fn resolve_target_roots(
     let mut resolved = Vec::with_capacity(targets.len());
     for target in targets {
         let root = match target {
-            InstallTarget::Codex => default_codex_home()?,
-            InstallTarget::Claude => default_claude_home()?,
+            InstallTarget::Codex => {
+                let root = default_codex_home()?;
+                if !root.is_dir() {
+                    return Err(format!(
+                        "{} home does not exist: {} (not creating new directories)",
+                        target.label(),
+                        root.display()
+                    )
+                    .into());
+                }
+                root
+            }
+            InstallTarget::Claude => {
+                // For Claude, we just need the home directory to exist
+                let home = home_dir()?;
+                if !home.is_dir() {
+                    return Err(format!("home directory does not exist: {}", home.display()).into());
+                }
+                home
+            }
         };
-        if !root.is_dir() {
-            return Err(format!(
-                "{} home does not exist: {} (not creating new directories)",
-                target.label(),
-                root.display()
-            )
-            .into());
-        }
         resolved.push((target, root));
     }
 
@@ -192,10 +211,6 @@ fn default_codex_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
         return Ok(PathBuf::from(path));
     }
     Ok(home_dir()?.join(".codex"))
-}
-
-fn default_claude_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    Ok(home_dir()?.join(".claude"))
 }
 
 fn home_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -237,18 +252,6 @@ fn resolve_home_dir_from_env(
     }
     combined.push(homepath);
     Some(PathBuf::from(combined))
-}
-
-fn resolve_claude_config_path(root: &Path) -> PathBuf {
-    let settings = root.join("settings.json");
-    if settings.is_file() {
-        return settings;
-    }
-    let config = root.join("config.json");
-    if config.is_file() {
-        return config;
-    }
-    settings
 }
 
 fn has_sandbox_config_arg(args: &[String]) -> bool {
@@ -538,6 +541,50 @@ fn upsert_claude_mcp_server(
     Ok(())
 }
 
+fn upsert_claude_settings_permission(
+    settings_path: &Path,
+    server_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut root = if settings_path.is_file() {
+        let raw = fs::read_to_string(settings_path)?;
+        serde_json::from_str::<JsonValue>(&raw).map_err(|err| {
+            format!(
+                "failed to parse JSON claude settings {}: {err}",
+                settings_path.display()
+            )
+        })?
+    } else {
+        JsonValue::Object(JsonMap::new())
+    };
+
+    let Some(root_obj) = root.as_object_mut() else {
+        return Err("claude settings root must be a JSON object".into());
+    };
+
+    // Add tool permission to auto-approve all tools from this MCP server
+    let tool_pattern = format!("mcp__{server_name}__*");
+    let permissions = root_obj
+        .entry("permissions".to_string())
+        .or_insert_with(|| JsonValue::Object(JsonMap::new()));
+    let Some(perm_obj) = permissions.as_object_mut() else {
+        return Err("claude settings `permissions` must be a JSON object".into());
+    };
+    let allow_list = perm_obj
+        .entry("allow".to_string())
+        .or_insert_with(|| JsonValue::Array(Vec::new()));
+    let Some(allow_arr) = allow_list.as_array_mut() else {
+        return Err("claude settings `permissions.allow` must be an array".into());
+    };
+    // Add the pattern if not already present
+    if !allow_arr.iter().any(|v| v.as_str() == Some(&tool_pattern)) {
+        allow_arr.push(JsonValue::String(tool_pattern));
+    }
+
+    let serialized = serde_json::to_string_pretty(&root)?;
+    atomic_write(settings_path, &format!("{serialized}\n"))?;
+    Ok(())
+}
+
 fn serialize_json_pretty_with_paired_args(
     value: &JsonValue,
 ) -> Result<String, Box<dyn std::error::Error>> {
@@ -739,7 +786,7 @@ repl = { command = "/usr/local/bin/old-mcp-repl", args = ["--backend", "r"] }
 [mcp_servers]
   # keep this note
 repl={command="/usr/local/bin/old-mcp-repl",args=["--backend","r"]}
-r_repl = { command = "/usr/local/bin/legacy-repl" }
+r = { command = "/usr/local/bin/legacy-repl" }
 
 [workspace]
 name="demo"
@@ -767,7 +814,7 @@ name="demo"
             "non-mcp sections should be preserved"
         );
         assert_eq!(
-            doc["mcp_servers"]["r_repl"]["command"].as_str(),
+            doc["mcp_servers"]["r"]["command"].as_str(),
             Some("/usr/local/bin/legacy-repl"),
             "other MCP servers should be preserved"
         );
@@ -1026,6 +1073,89 @@ name="demo"
         assert!(
             server.get("_comment_sandbox_state").is_none(),
             "did not expect sandbox comment field in claude config"
+        );
+    }
+
+    #[test]
+    fn upsert_claude_settings_permission_adds_tool_permission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = dir.path().join("settings.json");
+        upsert_claude_settings_permission(&settings, "r").expect("upsert permission");
+
+        let text = fs::read_to_string(&settings).expect("read settings");
+        let root: JsonValue = serde_json::from_str(&text).expect("parse json");
+        let allow = root["permissions"]["allow"]
+            .as_array()
+            .expect("permissions.allow array");
+        assert!(
+            allow.iter().any(|v| v.as_str() == Some("mcp__r__*")),
+            "expected mcp__r__* in permissions.allow"
+        );
+    }
+
+    #[test]
+    fn upsert_claude_settings_permission_does_not_duplicate_permission() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = dir.path().join("settings.json");
+        // First upsert
+        upsert_claude_settings_permission(&settings, "r").expect("first upsert");
+        // Second upsert
+        upsert_claude_settings_permission(&settings, "r").expect("second upsert");
+
+        let text = fs::read_to_string(&settings).expect("read settings");
+        let root: JsonValue = serde_json::from_str(&text).expect("parse json");
+        let allow = root["permissions"]["allow"]
+            .as_array()
+            .expect("permissions.allow array");
+        let count = allow
+            .iter()
+            .filter(|v| v.as_str() == Some("mcp__r__*"))
+            .count();
+        assert_eq!(
+            count, 1,
+            "expected exactly one mcp__r__* entry, not duplicated"
+        );
+    }
+
+    #[test]
+    fn upsert_claude_settings_permission_preserves_existing_permissions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = dir.path().join("settings.json");
+        // Seed with existing permissions
+        fs::write(
+            &settings,
+            r#"{
+  "permissions": {
+    "allow": ["Bash(cargo test:*)"],
+    "deny": ["Bash(rm -rf *)"]
+  }
+}"#,
+        )
+        .expect("seed settings");
+
+        upsert_claude_settings_permission(&settings, "r").expect("upsert permission");
+
+        let text = fs::read_to_string(&settings).expect("read settings");
+        let root: JsonValue = serde_json::from_str(&text).expect("parse json");
+        let allow = root["permissions"]["allow"]
+            .as_array()
+            .expect("permissions.allow array");
+        assert!(
+            allow
+                .iter()
+                .any(|v| v.as_str() == Some("Bash(cargo test:*)")),
+            "expected existing permission preserved"
+        );
+        assert!(
+            allow.iter().any(|v| v.as_str() == Some("mcp__r__*")),
+            "expected new permission added"
+        );
+        let deny = root["permissions"]["deny"]
+            .as_array()
+            .expect("permissions.deny array");
+        assert!(
+            deny.iter().any(|v| v.as_str() == Some("Bash(rm -rf *)")),
+            "expected deny list preserved"
         );
     }
 

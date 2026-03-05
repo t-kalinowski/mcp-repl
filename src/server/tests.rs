@@ -117,7 +117,7 @@ fn repl_tool_descriptions_are_backend_specific() {
     let python = super::repl_tool_description_for_backend(crate::backend::Backend::Python);
 
     assert_ne!(r, python, "expected backend-specific repl descriptions");
-    assert!(r.contains("R REPL"));
+    assert!(r.contains("R code"));
     assert!(python.contains("Python REPL"));
 }
 

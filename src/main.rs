@@ -465,8 +465,8 @@ mcp-repl install [codex] [claude] [--client <codex|claude>]... [--interpreter <r
 --add-writable-root / --add-writeable-root: append absolute writable root in argument order\n\
 --add-allowed-domain: append allowed domain pattern in argument order\n\
 --config: apply advanced ordered sandbox/network override (Codex-compatible keys)\n\
-install: update MCP config for existing agent homes only (does not create ~/.codex or ~/.claude)\n\
-install defaults to the full interpreter grid for each selected client (currently r_repl + py_repl)"
+install: update MCP config for codex (~/.codex/config.toml) and claude (~/.claude.json)\n\
+install defaults to the full interpreter grid for each selected client (currently r + python)"
     );
 }
 
@@ -474,10 +474,10 @@ fn print_install_usage() {
     println!(
         "Usage:\n\
 mcp-repl install [codex] [claude] [--client <codex|claude>]... [--interpreter <r|python>[,r|python]...]... [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
-If no target is specified for `install`, all existing agent homes are used:\n\
-- codex: $CODEX_HOME or ~/.codex\n\
-- claude: ~/.claude\n\
-Missing homes are not created.\n\
+If no target is specified for `install`, available targets are used:\n\
+- codex: $CODEX_HOME or ~/.codex (must exist)\n\
+- claude: ~/.claude.json (created if needed)\n\
+Missing ~/.codex directory is not created.\n\
 If no --interpreter is specified, install uses the full interpreter grid for each selected client."
     );
 }
@@ -523,13 +523,13 @@ mod tests {
     }
 
     #[test]
-    fn parse_install_args_defaults_server_name_to_r_repl() {
+    fn parse_install_args_defaults_server_name_to_r() {
         let mut parser = ArgParser {
             args: Vec::new(),
             index: 0,
         };
         let parsed = parse_install_args(&mut parser, Vec::new()).expect("parse install args");
-        assert_eq!(parsed.server_name, install::DEFAULT_R_SERVER_NAME);
+        assert_eq!(parsed.server_name, "r");
         assert!(!parsed.server_name_explicit);
         assert!(parsed.interpreters.is_empty());
     }

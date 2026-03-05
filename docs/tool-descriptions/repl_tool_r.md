@@ -1,15 +1,15 @@
-`repl` runs source text in a persistent R REPL session and returns emitted stdout/stderr and images.
+The r repl tool executes R code in a persistent session. Returns stdout, stderr, and rendered plots.
 
 Arguments:
-- `input` (string): bytes to write to backend stdin.
-- `timeout_ms` (number, optional): maximum milliseconds to wait before returning.
-  Timeout bounds only this response window; it does not cancel backend work.
+- `input` (string): R code to execute. Send empty string to poll for output from long-running work.
+- `timeout_ms` (number, optional): Max milliseconds to wait (bounds this call only; doesn't cancel backend work).
 
-R REPL affordances:
-- Session state persists across calls; treat persistence as an iteration aid, not a correctness guarantee.
-- While work is still running, concurrent non-empty input is discarded; use empty `input` to poll.
-- Pager mode activates on large output. While active, backend input is blocked; use pager commands (for example `:q`, `:/pattern`, `:n`, empty input for next page).
-- Plot images are returned as image content. You can tune sizing via `options(console.plot.width, console.plot.height, console.plot.units, console.plot.dpi)`.
-- Help/manual flows are in-band (`?topic`, `help()`, `help.search()`, `vignette()`, `RShowDoc()`).
-- Debugging workflows are supported (`browser()`, `debug()`, `debugonce()`, `trace()`).
-- Control prefixes in `input`: `\u0003` (interrupt) and `\u0004` (reset then run remaining input).
+Behavior:
+- Session state (variables, loaded packages) persists across calls. Errors don't crash the session.
+- Uses the user's R installation and library paths.
+
+- Plots (ggplot2 and base R) are captured and returned as images. Adjust sizing with `options(console.plot.width, console.plot.height, console.plot.units, console.plot.dpi)`.
+- Pager mode activates on large output. Use pager commands (for example `:q`, `:/pattern`, `:n`, to navigate, search, or dismiss).
+- Help via `?topic` or `help()` opens a pager. Use `:q` to exit, `:n` for next page, `:/pattern` to search.
+- Debugging: `browser()`, `debug()`, `trace()`.
+- Control: `\u0003` in input interrupts; `\u0004` resets session then runs remaining input.
