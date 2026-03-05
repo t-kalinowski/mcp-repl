@@ -1,6 +1,6 @@
 ---
 source: tests/write_stdin_batch.rs
-expression: snapshot.render()
+expression: rendered
 ---
 == session: pager_search_queue ==
 -- step 1 --
@@ -47,11 +47,15 @@ response:
     },
     {
       "type": "text",
-      "text": "line0050 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      "text": "[pager] search #1/1 for `line0050` @10290"
     },
     {
       "type": "text",
-      "text": "--More-- (105p, 25.0%, @10290..10500/42000)"
+      "text": "> line0050 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..."
+    },
+    {
+      "type": "text",
+      "text": "--More-- (140p, 0.5%, @0..210/42000)"
     }
   ]
 }
@@ -71,11 +75,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] pattern not found (search is forward-only over unseen output; use `:matches -n all line0050` to locate offsets, then `:seek @OFFSET` to jump)"
+      "text": "[pager] already at the last search hit #1/1 for `line0050`"
     },
     {
       "type": "text",
-      "text": "--More-- (105p, 25.0%, @10500/42000)"
+      "text": "--More-- (140p, 0.5%, @0..210/42000)"
     }
   ]
 }
@@ -95,7 +99,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "(END, 25.0%, @10500/42000)"
+      "text": "(END, 0.5%, @0..210/42000)"
     },
     {
       "type": "text",

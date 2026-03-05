@@ -17,10 +17,13 @@ pub(super) fn pager_help_text() -> String {
 [pager] core:
   :q                           quit pager
   :help                        show this help
-  :/PATTERN                    set search pattern and jump to next match
-  :n [N]                       jump to next page with last `:/...` pattern (N times)
+  :/PATTERN                    start compact search mode for the full buffer
+  :n [N]                       jump to next search hit (or next page if no search is active)
+  :p [N]                       jump to previous search hit
+  :goto N                      jump to the Nth search hit
 
 [pager] navigation:
+  :next [N]                    next page (alias for empty input)
   :skip N                      skip N pages, then show next page
   :seek OFFSET | PCT% | line N jump to location
                                OFFSET is UTF-8 char offset; suffixes: k=1024, m=1024^2, b=bytes
@@ -30,7 +33,7 @@ pub(super) fn pager_help_text() -> String {
 
 [pager] search tools:
   :where [-i] PATTERN          show distance to next match (no cursor move)
-  :matches [-i] [-n N|all] [-C N] PATTERN
+  :matches [-i] [-n N|all] [-C N] [PATTERN]
   :hits [-i] [-C N] [--count N] PATTERN
 "#
     .to_string()

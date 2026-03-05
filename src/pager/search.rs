@@ -6,9 +6,19 @@ use super::{
 };
 
 #[derive(Debug, Clone)]
-pub(super) enum SearchMode {
-    None,
-    Page(SearchPattern),
+pub(super) struct SearchSession {
+    pub(super) pattern: SearchPattern,
+    pub(super) hits: Vec<SearchHit>,
+    pub(super) current_index: usize,
+    pub(super) buffer_len: u64,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct SearchHit {
+    pub(super) line_idx: usize,
+    pub(super) line_start: u64,
+    pub(super) line_end: u64,
+    pub(super) breadcrumb: String,
 }
 
 #[derive(Debug, Clone)]
@@ -78,6 +88,12 @@ enum MatchSearchResult {
     Found(MatchLine),
     NotFound,
     SeenOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SearchStepOutcome {
+    Moved,
+    Boundary,
 }
 
 fn all_matches_shown_message(pattern: &str) -> String {
@@ -198,13 +214,6 @@ pub(super) fn where_in_buffer(
     }
 }
 
-#[derive(Debug, Clone)]
-struct MatchEntry {
-    line_idx: usize,
-    line_start: u64,
-    headings: Vec<Heading>,
-}
-
 fn line_index_for_offset(buffer: &PagerBuffer, offset: u64) -> usize {
     buffer
         .line_ends
@@ -245,10 +254,10 @@ fn read_line_text(buffer: &PagerBuffer, idx: usize) -> String {
 
 fn strip_trailing_anchor_link(text: &str) -> &str {
     let trimmed = text.trim_end();
-    let Some(idx) = trimmed.rfind(" [") else {
+    let Some(open_idx) = trimmed.rfind('[') else {
         return trimmed;
     };
-    let link = &trimmed[idx + 1..];
+    let link = &trimmed[open_idx..];
     if !link.ends_with(')') {
         return trimmed;
     }
@@ -263,7 +272,7 @@ fn strip_trailing_anchor_link(text: &str) -> &str {
     if label.chars().any(|ch| ch.is_alphanumeric()) {
         return trimmed;
     }
-    trimmed[..idx].trim_end()
+    trimmed[..open_idx].trim_end()
 }
 
 fn parse_atx_heading(line: &str) -> Option<(usize, String)> {
@@ -362,9 +371,9 @@ fn heading_breadcrumb(headings: &[Heading]) -> String {
 
 fn match_limit_hint(limit: usize) -> &'static str {
     if limit < MAX_MATCH_LIMIT {
-        "use `:matches -n all` or `:seek @OFFSET` to jump"
+        "use `:matches -n all`, `:goto N`, or `:n`/`:p`"
     } else {
-        "use `:seek @OFFSET` to jump"
+        "use `:goto N` or `:n`/`:p`"
     }
 }
 
@@ -383,227 +392,221 @@ fn match_header(matches: usize, limit: usize, more_available: bool) -> String {
 pub(super) fn take_matches(
     buffer: &PagerBuffer,
     spec: &MatchSpec,
-    seen: &mut RangeSet,
-) -> (Vec<WorkerContent>, bool) {
-    let start_offset = buffer.current_offset();
-    let end_offset = buffer.len();
-    let total_lines = line_count(buffer);
-    if start_offset >= end_offset || total_lines == 0 {
+    session: &SearchSession,
+) -> (Vec<WorkerContent>, Option<(u64, u64)>) {
+    if session.hits.is_empty() {
         return (
             vec![WorkerContent::stderr(pattern_not_found_message(
-                &spec.pattern.pattern,
-                start_offset,
+                &session.pattern.pattern,
+                buffer.current_offset(),
             ))],
-            false,
+            None,
         );
     }
 
-    let pattern_bytes = spec.pattern.pattern.as_bytes();
-    let mut search_offset = start_offset;
-    let mut entries: Vec<MatchEntry> = Vec::new();
-    let mut heading_state = HeadingState::new();
-    let mut more_available = false;
-    let mut saw_match = false;
-
-    while entries.len() < spec.limit {
-        let Some(match_offset) = buffer.find_next_bytes_with_options(
-            search_offset,
-            end_offset,
-            pattern_bytes,
-            spec.pattern.case_insensitive_ascii,
-        ) else {
-            break;
-        };
-        saw_match = true;
-
-        let line_idx = line_index_for_offset(buffer, match_offset);
-        if line_idx >= total_lines {
-            break;
-        }
-
-        heading_state.scan_to(buffer, line_idx);
-
-        let (line_start, line_end) = line_bounds_for_index(buffer, line_idx);
-        if seen.covers(line_start, line_end) {
-            search_offset = if line_end > search_offset {
-                line_end
-            } else {
-                match_offset.saturating_add(1)
-            };
-            continue;
-        }
-
-        entries.push(MatchEntry {
-            line_idx,
-            line_start,
-            headings: heading_state.headings.clone(),
-        });
-        search_offset = if line_end > search_offset {
-            line_end
-        } else {
-            match_offset.saturating_add(1)
-        };
-    }
-
-    if entries.is_empty() {
-        let message = if saw_match {
-            all_matches_shown_message(&spec.pattern.pattern)
-        } else {
-            pattern_not_found_message(&spec.pattern.pattern, start_offset)
-        };
-        return (vec![WorkerContent::stderr(message)], false);
-    }
-
-    if entries.len() == spec.limit {
-        let mut probe_offset = search_offset;
-        loop {
-            let Some(match_offset) = buffer.find_next_bytes_with_options(
-                probe_offset,
-                end_offset,
-                pattern_bytes,
-                spec.pattern.case_insensitive_ascii,
-            ) else {
-                break;
-            };
-            let line_idx = line_index_for_offset(buffer, match_offset);
-            if line_idx >= total_lines {
-                break;
-            }
-            let (line_start, line_end) = line_bounds_for_index(buffer, line_idx);
-            if !seen.covers(line_start, line_end) {
-                more_available = true;
-                break;
-            }
-            probe_offset = line_end.max(match_offset.saturating_add(1));
-            if probe_offset >= end_offset {
-                break;
-            }
-        }
-    }
-
+    let more_available = session.hits.len() > spec.limit;
+    let entries = session.hits.iter().take(spec.limit);
+    let total_lines = line_count(buffer);
     let mut output = String::new();
-    for (idx, entry) in entries.iter().enumerate() {
-        let breadcrumb = heading_breadcrumb(&entry.headings);
+    let mut last_range = None;
+
+    for (idx, entry) in entries.enumerate() {
         let label = idx + 1;
         if spec.context == 0 {
             let line = read_line_text(buffer, entry.line_idx);
             let snippet = truncate_with_ellipsis(line.trim_end(), MATCH_LINE_MAX_BYTES);
             output.push_str(&format!(
-                "#{label} @{} {breadcrumb} | {snippet}\n",
-                entry.line_start
+                "#{label} @{} {} | {snippet}\n",
+                entry.line_start, entry.breadcrumb
             ));
+            last_range = Some((entry.line_start, entry.line_end));
             continue;
         }
 
-        output.push_str(&format!("#{label} @{} {breadcrumb}\n", entry.line_start));
+        output.push_str(&format!(
+            "#{label} @{} {}\n",
+            entry.line_start, entry.breadcrumb
+        ));
 
         let start_idx = entry.line_idx.saturating_sub(spec.context);
         let end_idx = (entry.line_idx + spec.context).min(total_lines.saturating_sub(1));
         for line_idx in start_idx..=end_idx {
             let (line_start, line_end) = line_bounds_for_index(buffer, line_idx);
-            if seen.covers(line_start, line_end) {
-                continue;
-            }
             let line = read_line_text(buffer, line_idx);
             let snippet = truncate_with_ellipsis(line.trim_end(), MATCH_LINE_MAX_BYTES);
             let marker = if line_idx == entry.line_idx { ">" } else { " " };
             output.push_str(&format!("  {marker} {snippet}\n"));
+            last_range = Some((line_start, line_end));
         }
-    }
-
-    if more_available {
-        return (
-            vec![
-                WorkerContent::stderr(match_header(entries.len(), spec.limit, true)),
-                WorkerContent::stdout(output),
-            ],
-            false,
-        );
     }
 
     (
         vec![
-            WorkerContent::stderr(match_header(entries.len(), spec.limit, false)),
+            WorkerContent::stderr(match_header(
+                session.hits.len().min(spec.limit),
+                spec.limit,
+                more_available,
+            )),
             WorkerContent::stdout(output),
         ],
-        false,
+        last_range,
     )
 }
 
-pub(super) fn take_search(
-    buffer: &mut PagerBuffer,
-    target_bytes: u64,
+fn clean_breadcrumb(breadcrumb: &str) -> String {
+    breadcrumb
+        .replace("[¶]", "")
+        .replace("[¶]()", "")
+        .trim()
+        .to_string()
+}
+
+fn first_hit_index_for_offset(hits: &[SearchHit], offset: u64) -> usize {
+    hits.iter()
+        .position(|hit| hit.line_start >= offset)
+        .unwrap_or(0)
+}
+
+pub(super) fn build_search_session(
+    buffer: &PagerBuffer,
     pattern: &SearchPattern,
-    seen: &mut RangeSet,
-) -> (Vec<WorkerContent>, u64, RangeSpan) {
-    let pages_left_now = pages_left_for_buffer(buffer, target_bytes);
-    match seek_to_next_match_line_start(buffer, pattern, seen) {
-        MatchSearchResult::Found(_) => super::take_next_page(buffer, target_bytes, seen),
-        MatchSearchResult::SeenOnly => (
-            vec![WorkerContent::stderr(all_matches_shown_message(
-                &pattern.pattern,
-            ))],
-            pages_left_now,
-            RangeSpan::default(),
-        ),
-        MatchSearchResult::NotFound => {
-            let start_offset = buffer.current_offset();
-            (
-                vec![WorkerContent::stderr(pattern_not_found_message(
-                    &pattern.pattern,
-                    start_offset,
-                ))],
-                pages_left_now,
-                RangeSpan::default(),
-            )
+    start_offset: u64,
+) -> Option<SearchSession> {
+    let end_offset = buffer.len();
+    let total_lines = line_count(buffer);
+    if end_offset == 0 || total_lines == 0 {
+        return None;
+    }
+
+    let pattern_bytes = pattern.pattern.as_bytes();
+    let mut search_offset = 0u64;
+    let mut heading_state = HeadingState::new();
+    let mut hits = Vec::new();
+
+    loop {
+        let Some(match_offset) = buffer.find_next_bytes_with_options(
+            search_offset,
+            end_offset,
+            pattern_bytes,
+            pattern.case_insensitive_ascii,
+        ) else {
+            break;
+        };
+
+        let line_idx = line_index_for_offset(buffer, match_offset);
+        if line_idx >= total_lines {
+            break;
         }
+        heading_state.scan_to(buffer, line_idx);
+        let (line_start, line_end) = line_bounds_for_index(buffer, line_idx);
+        hits.push(SearchHit {
+            line_idx,
+            line_start,
+            line_end,
+            breadcrumb: clean_breadcrumb(&heading_breadcrumb(&heading_state.headings)),
+        });
+        search_offset = line_end.max(match_offset.saturating_add(1));
+        if search_offset >= end_offset {
+            break;
+        }
+    }
+
+    if hits.is_empty() {
+        return None;
+    }
+
+    Some(SearchSession {
+        pattern: pattern.clone(),
+        current_index: first_hit_index_for_offset(&hits, start_offset),
+        hits,
+        buffer_len: buffer.len(),
+    })
+}
+
+fn prior_view_message(view_history: &[(u64, u64)], line_start: u64) -> Option<String> {
+    view_history
+        .iter()
+        .rev()
+        .find(|(start, end)| *start <= line_start && line_start < *end)
+        .map(|(start, end)| format!("[pager] shown earlier @{start}..{end}"))
+}
+
+pub(super) fn render_search_card(
+    buffer: &PagerBuffer,
+    session: &SearchSession,
+    view_history: &[(u64, u64)],
+) -> (Vec<WorkerContent>, Option<(u64, u64)>) {
+    let Some(hit) = session.hits.get(session.current_index) else {
+        return (
+            vec![WorkerContent::stderr(pattern_not_found_message(
+                &session.pattern.pattern,
+                buffer.current_offset(),
+            ))],
+            None,
+        );
+    };
+
+    let mut contents = vec![WorkerContent::stderr(format!(
+        "[pager] search #{}/{} for `{}` @{}",
+        session.current_index + 1,
+        session.hits.len(),
+        session.pattern.pattern,
+        hit.line_start
+    ))];
+    if let Some(message) = prior_view_message(view_history, hit.line_start) {
+        contents.push(WorkerContent::stderr(message));
+    }
+
+    let line = read_line_text(buffer, hit.line_idx);
+    let snippet = truncate_with_ellipsis(line.trim_end(), MATCH_LINE_MAX_BYTES);
+    let body = if hit.breadcrumb == "root" {
+        format!("> {snippet}\n")
+    } else {
+        format!("{}\n> {snippet}\n", hit.breadcrumb)
+    };
+    contents.push(WorkerContent::stdout(body));
+    (contents, Some((hit.line_start, hit.line_end)))
+}
+
+pub(super) fn move_search_session(
+    session: &mut SearchSession,
+    count: u64,
+    forward: bool,
+) -> SearchStepOutcome {
+    if session.hits.is_empty() {
+        return SearchStepOutcome::Boundary;
+    }
+    let count = count.max(1) as usize;
+    let last = session.hits.len().saturating_sub(1);
+    let old = session.current_index;
+    session.current_index = if forward {
+        session.current_index.saturating_add(count).min(last)
+    } else {
+        session.current_index.saturating_sub(count)
+    };
+    if session.current_index == old {
+        SearchStepOutcome::Boundary
+    } else {
+        SearchStepOutcome::Moved
     }
 }
 
-pub(super) fn take_search_next(
-    buffer: &mut PagerBuffer,
-    target_bytes: u64,
-    pattern: &SearchPattern,
-    count: u64,
-    seen: &mut RangeSet,
-) -> (Vec<WorkerContent>, u64, RangeSpan) {
-    let count = count.clamp(1, 500);
-    for remaining in (1..=count).rev() {
-        let pages_left_now = pages_left_for_buffer(buffer, target_bytes);
-        match seek_to_next_match_line_start(buffer, pattern, seen) {
-            MatchSearchResult::Found(_) => {}
-            MatchSearchResult::SeenOnly => {
-                return (
-                    vec![WorkerContent::stderr(all_matches_shown_message(
-                        &pattern.pattern,
-                    ))],
-                    pages_left_now,
-                    RangeSpan::default(),
-                );
-            }
-            MatchSearchResult::NotFound => {
-                let start_offset = buffer.current_offset();
-                return (
-                    vec![WorkerContent::stderr(pattern_not_found_message(
-                        &pattern.pattern,
-                        start_offset,
-                    ))],
-                    pages_left_now,
-                    RangeSpan::default(),
-                );
-            }
-        }
-
-        let (contents, pages_left, span) = super::take_next_page(buffer, target_bytes, seen);
-        if remaining == 1 {
-            return (contents, pages_left, span);
-        }
-        if pages_left == 0 {
-            return (Vec::new(), 0, RangeSpan::default());
-        }
+pub(super) fn goto_search_hit(session: &mut SearchSession, index: usize) -> bool {
+    if index == 0 || index > session.hits.len() {
+        return false;
     }
+    session.current_index = index - 1;
+    true
+}
 
-    (Vec::new(), 0, RangeSpan::default())
+pub(super) fn search_boundary_message(session: &SearchSession, forward: bool) -> String {
+    let edge = if forward { "last" } else { "first" };
+    format!(
+        "[pager] already at the {edge} search hit #{}/{} for `{}`",
+        session.current_index + 1,
+        session.hits.len(),
+        session.pattern.pattern
+    )
 }
 
 pub(super) fn take_hits_next(
@@ -760,19 +763,4 @@ fn take_next_hit(
         text: output,
         last_range,
     })
-}
-
-fn seek_to_next_match_line_start(
-    buffer: &mut PagerBuffer,
-    pattern: &SearchPattern,
-    seen: &RangeSet,
-) -> MatchSearchResult {
-    let start_offset = buffer.current_offset();
-    match find_next_unseen_match_line(buffer, start_offset, pattern, seen) {
-        MatchSearchResult::Found(matched) => {
-            buffer.advance_offset_to(matched.line_start);
-            MatchSearchResult::Found(matched)
-        }
-        other => other,
-    }
 }

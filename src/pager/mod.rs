@@ -19,7 +19,8 @@ use presentation::{
 };
 use ranges::{RangeSet, RangeSpan};
 use search::{
-    HitState, SearchMode, take_hits_next, take_matches, take_search, take_search_next,
+    HitState, SearchSession, SearchStepOutcome, build_search_session, goto_search_hit,
+    move_search_session, render_search_card, search_boundary_message, take_hits_next, take_matches,
     where_in_buffer,
 };
 
@@ -627,7 +628,8 @@ struct PagerState {
     seen_images: HashSet<String>,
     image_numbers: HashMap<String, u64>,
     next_image_number: u64,
-    search_mode: SearchMode,
+    search_session: Option<SearchSession>,
+    view_history: Vec<(u64, u64)>,
 }
 
 struct CommandOutcome {
@@ -760,6 +762,9 @@ impl Pager {
         let range = output.read_range(start_offset, end_offset);
         output.advance_offset_to(end_offset);
         state.buffer.append_range(range);
+        if let Some(session) = state.search_session.as_mut() {
+            session.buffer_len = 0;
+        }
     }
 
     pub(crate) fn activate(&mut self, buffer: PagerBuffer, is_error: bool) {
@@ -772,7 +777,8 @@ impl Pager {
             seen_images: HashSet::new(),
             image_numbers: HashMap::new(),
             next_image_number: 1,
-            search_mode: SearchMode::None,
+            search_session: None,
+            view_history: Vec::new(),
         });
     }
 
@@ -841,6 +847,28 @@ impl Pager {
         )
     }
 
+    fn ensure_search_session_from_pattern(state: &mut PagerState, pattern: &SearchPattern) -> bool {
+        let start_offset = state.buffer.current_offset();
+        state.search_session = build_search_session(&state.buffer, pattern, start_offset);
+        state.search_session.is_some()
+    }
+
+    fn ensure_search_session_fresh(state: &mut PagerState) -> bool {
+        let Some(existing) = state.search_session.clone() else {
+            return false;
+        };
+        if existing.buffer_len == state.buffer.len() {
+            return true;
+        }
+        let anchor = existing
+            .hits
+            .get(existing.current_index)
+            .map(|hit| hit.line_start)
+            .unwrap_or_else(|| state.buffer.current_offset());
+        state.search_session = build_search_session(&state.buffer, &existing.pattern, anchor);
+        state.search_session.is_some()
+    }
+
     pub(crate) fn handle_command(&mut self, input: &str) -> WorkerReply {
         if self.state.is_none() {
             return pager_reply(
@@ -879,6 +907,8 @@ impl Pager {
                 | PagerCommand::Matches { .. }
                 | PagerCommand::Hits { .. }
                 | PagerCommand::SearchNext { .. }
+                | PagerCommand::SearchPrev { .. }
+                | PagerCommand::Goto { .. }
                 | PagerCommand::Seek { .. }
                 | PagerCommand::Help
         );
@@ -894,31 +924,40 @@ impl Pager {
         } = {
             let state = self.state.as_mut().expect("pager state disappeared");
             let is_error = state.is_error;
-            let buffer = &mut state.buffer;
             let outcome = match command {
                 PagerCommand::Next { count } => {
-                    let (contents, pages_left, span) =
-                        take_next_pages(buffer, page_bytes, count, &mut state.seen_ranges);
+                    let (contents, pages_left, span) = take_next_pages(
+                        &mut state.buffer,
+                        page_bytes,
+                        count,
+                        &mut state.seen_ranges,
+                    );
                     CommandOutcome::page(contents, pages_left, is_error, span.first, span.last)
                 }
                 PagerCommand::Skip { count } => {
-                    let (contents, pages_left, span) =
-                        skip_pages_and_take_next(buffer, page_bytes, count, &mut state.seen_ranges);
+                    let (contents, pages_left, span) = skip_pages_and_take_next(
+                        &mut state.buffer,
+                        page_bytes,
+                        count,
+                        &mut state.seen_ranges,
+                    );
                     CommandOutcome::page(contents, pages_left, is_error, span.first, span.last)
                 }
                 PagerCommand::All => {
                     let (contents, pages_left, span) =
-                        take_all(buffer, page_bytes, &mut state.seen_ranges);
+                        take_all(&mut state.buffer, page_bytes, &mut state.seen_ranges);
                     CommandOutcome::page(contents, pages_left, is_error, span.first, span.last)
                 }
                 PagerCommand::Tail { spec } => {
                     let (contents, pages_left, span) = match spec {
-                        TailSpec::Default => take_tail(buffer, page_bytes, &mut state.seen_ranges),
+                        TailSpec::Default => {
+                            take_tail(&mut state.buffer, page_bytes, &mut state.seen_ranges)
+                        }
                         TailSpec::Bytes(bytes) => {
-                            take_tail(buffer, bytes.max(1), &mut state.seen_ranges)
+                            take_tail(&mut state.buffer, bytes.max(1), &mut state.seen_ranges)
                         }
                         TailSpec::Lines(lines) => {
-                            take_tail_lines(buffer, lines, &mut state.seen_ranges)
+                            take_tail_lines(&mut state.buffer, lines, &mut state.seen_ranges)
                         }
                     };
                     CommandOutcome::page_dismiss(
@@ -926,15 +965,36 @@ impl Pager {
                     )
                 }
                 PagerCommand::Search { pattern } => {
-                    state.search_mode = SearchMode::Page(pattern.clone());
-                    let (contents, pages_left, span) =
-                        take_search(buffer, page_bytes, &pattern, &mut state.seen_ranges);
-                    CommandOutcome::page_keep(contents, pages_left, is_error, span.first, span.last)
+                    let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
+                    if Self::ensure_search_session_from_pattern(state, &pattern) {
+                        let session = state
+                            .search_session
+                            .as_ref()
+                            .expect("search session missing after build");
+                        let (contents, range) =
+                            render_search_card(&state.buffer, session, &state.view_history);
+                        CommandOutcome::new(
+                            contents,
+                            pages_left,
+                            is_error,
+                            false,
+                            range,
+                            range,
+                            Some(false),
+                        )
+                    } else {
+                        let contents = vec![WorkerContent::stderr(format!(
+                            "[pager] pattern not found: {}",
+                            pattern.pattern
+                        ))];
+                        state.search_session = None;
+                        CommandOutcome::no_range(contents, pages_left, is_error)
+                    }
                 }
                 PagerCommand::Where { pattern } => {
-                    let pages_left = pages_left_for_buffer(buffer, page_bytes);
+                    let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                     let contents = vec![WorkerContent::stderr(where_in_buffer(
-                        buffer,
+                        &state.buffer,
                         page_bytes,
                         &pattern,
                         &state.seen_ranges,
@@ -942,14 +1002,65 @@ impl Pager {
                     CommandOutcome::new(contents, pages_left, is_error, true, None, None, None)
                 }
                 PagerCommand::Matches { spec } => {
-                    let pages_left = pages_left_for_buffer(buffer, page_bytes);
-                    let (contents, is_error) = take_matches(buffer, &spec, &mut state.seen_ranges);
-                    CommandOutcome::no_range(contents, pages_left, is_error)
+                    let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
+                    if let Some(pattern) = spec.pattern.as_ref() {
+                        if !Self::ensure_search_session_from_pattern(state, pattern) {
+                            let contents = vec![WorkerContent::stderr(format!(
+                                "[pager] pattern not found: {}",
+                                pattern.pattern
+                            ))];
+                            state.search_session = None;
+                            CommandOutcome::no_range(contents, pages_left, is_error)
+                        } else {
+                            let session = state.search_session.as_ref();
+                            let session = session.expect("search session missing");
+                            let (contents, last_range) =
+                                take_matches(&state.buffer, &spec, session);
+                            let first_range = session
+                                .hits
+                                .first()
+                                .map(|hit| (hit.line_start, hit.line_end));
+                            CommandOutcome::new(
+                                contents,
+                                pages_left,
+                                is_error,
+                                false,
+                                first_range,
+                                last_range,
+                                Some(false),
+                            )
+                        }
+                    } else if Self::ensure_search_session_fresh(state) {
+                        let session = state
+                            .search_session
+                            .as_ref()
+                            .expect("search session missing");
+                        let (contents, last_range) = take_matches(&state.buffer, &spec, session);
+                        let first_range = session
+                            .hits
+                            .first()
+                            .map(|hit| (hit.line_start, hit.line_end));
+                        CommandOutcome::new(
+                            contents,
+                            pages_left,
+                            is_error,
+                            false,
+                            first_range,
+                            last_range,
+                            Some(false),
+                        )
+                    } else {
+                        let contents = vec![WorkerContent::stderr(
+                            "[pager] no active search; use `:/PATTERN` or `:matches PATTERN`"
+                                .to_string(),
+                        )];
+                        CommandOutcome::no_range(contents, pages_left, is_error)
+                    }
                 }
                 PagerCommand::Hits { spec } => {
                     let mut hit_state = HitState::new(spec.pattern.clone(), spec.context);
                     let (contents, pages_left, span) = take_hits_next(
-                        buffer,
+                        &mut state.buffer,
                         &mut hit_state,
                         page_bytes,
                         spec.count,
@@ -958,24 +1069,112 @@ impl Pager {
                     CommandOutcome::page_keep(contents, pages_left, is_error, span.first, span.last)
                 }
                 PagerCommand::SearchNext { count } => {
-                    let (contents, pages_left, span) = match &mut state.search_mode {
-                        SearchMode::Page(pattern) => take_search_next(
-                            buffer,
+                    if Self::ensure_search_session_fresh(state) {
+                        let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
+                        let session = state
+                            .search_session
+                            .as_mut()
+                            .expect("search session missing after refresh");
+                        let moved = move_search_session(session, count, true);
+                        if moved == SearchStepOutcome::Boundary {
+                            let contents = vec![WorkerContent::stderr(search_boundary_message(
+                                session, true,
+                            ))];
+                            CommandOutcome::no_range(contents, pages_left, is_error)
+                        } else {
+                            let (contents, range) =
+                                render_search_card(&state.buffer, session, &state.view_history);
+                            CommandOutcome::new(
+                                contents,
+                                pages_left,
+                                is_error,
+                                false,
+                                range,
+                                range,
+                                Some(false),
+                            )
+                        }
+                    } else {
+                        let (contents, pages_left, span) = take_next_pages(
+                            &mut state.buffer,
                             page_bytes,
-                            pattern,
                             count,
                             &mut state.seen_ranges,
-                        ),
-                        SearchMode::None => {
-                            take_next_pages(buffer, page_bytes, count, &mut state.seen_ranges)
+                        );
+                        CommandOutcome::page_keep(
+                            contents, pages_left, is_error, span.first, span.last,
+                        )
+                    }
+                }
+                PagerCommand::SearchPrev { count } => {
+                    let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
+                    if Self::ensure_search_session_fresh(state) {
+                        let session = state
+                            .search_session
+                            .as_mut()
+                            .expect("search session missing after refresh");
+                        let moved = move_search_session(session, count, false);
+                        if moved == SearchStepOutcome::Boundary {
+                            let contents = vec![WorkerContent::stderr(search_boundary_message(
+                                session, false,
+                            ))];
+                            CommandOutcome::no_range(contents, pages_left, is_error)
+                        } else {
+                            let (contents, range) =
+                                render_search_card(&state.buffer, session, &state.view_history);
+                            CommandOutcome::new(
+                                contents,
+                                pages_left,
+                                is_error,
+                                false,
+                                range,
+                                range,
+                                Some(false),
+                            )
                         }
-                    };
-                    CommandOutcome::page_keep(contents, pages_left, is_error, span.first, span.last)
+                    } else {
+                        let contents = vec![WorkerContent::stderr(
+                            "[pager] no active search; use `:/PATTERN` first".to_string(),
+                        )];
+                        CommandOutcome::no_range(contents, pages_left, is_error)
+                    }
+                }
+                PagerCommand::Goto { index } => {
+                    let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
+                    if Self::ensure_search_session_fresh(state) {
+                        let session = state
+                            .search_session
+                            .as_mut()
+                            .expect("search session missing after refresh");
+                        if goto_search_hit(session, index) {
+                            let (contents, range) =
+                                render_search_card(&state.buffer, session, &state.view_history);
+                            CommandOutcome::new(
+                                contents,
+                                pages_left,
+                                is_error,
+                                false,
+                                range,
+                                range,
+                                Some(false),
+                            )
+                        } else {
+                            let contents = vec![WorkerContent::stderr(format!(
+                                "[pager] search hit out of range: {index}"
+                            ))];
+                            CommandOutcome::no_range(contents, pages_left, is_error)
+                        }
+                    } else {
+                        let contents = vec![WorkerContent::stderr(
+                            "[pager] no active search; use `:/PATTERN` first".to_string(),
+                        )];
+                        CommandOutcome::no_range(contents, pages_left, is_error)
+                    }
                 }
                 PagerCommand::Range { start, end } => {
-                    let pages_left = pages_left_for_buffer(buffer, page_bytes);
+                    let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                     let (mut contents, span) =
-                        take_line_range(buffer, start, end, &mut state.seen_ranges);
+                        take_line_range(&state.buffer, start, end, &mut state.seen_ranges);
                     if contents.is_empty() {
                         contents.push(WorkerContent::stderr(
                             "[pager] no remaining output in range".to_string(),
@@ -986,15 +1185,15 @@ impl Pager {
                     )
                 }
                 PagerCommand::Seek { spec } => {
-                    let end_offset = buffer.len();
-                    let pages_left = pages_left_for_buffer(buffer, page_bytes);
+                    let end_offset = state.buffer.len();
+                    let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                     let (desired_offset, error_message) = match spec {
                         SeekSpec::Offset(offset) => (Some(offset.min(end_offset)), None),
                         SeekSpec::Percent(percent) => (
                             Some(end_offset.saturating_mul(percent).saturating_div(100)),
                             None,
                         ),
-                        SeekSpec::Line(line) => match buffer.line_start_offset(line) {
+                        SeekSpec::Line(line) => match state.buffer.line_start_offset(line) {
                             Some(offset) => (Some(offset), None),
                             None => (None, Some(format!("[pager] line out of range: {line}"))),
                         },
@@ -1005,14 +1204,14 @@ impl Pager {
                         CommandOutcome::no_range(contents, pages_left, is_error)
                     } else {
                         let desired_offset = desired_offset.expect("seek offset missing");
-                        buffer.advance_offset_to(desired_offset);
+                        state.buffer.advance_offset_to(desired_offset);
                         let (contents, pages_left, span) =
-                            take_next_page(buffer, page_bytes, &mut state.seen_ranges);
+                            take_next_page(&mut state.buffer, page_bytes, &mut state.seen_ranges);
                         CommandOutcome::page(contents, pages_left, is_error, span.first, span.last)
                     }
                 }
                 PagerCommand::Help => {
-                    let pages_left = pages_left_for_buffer(buffer, page_bytes);
+                    let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                     let contents = vec![WorkerContent::stderr(pager_help_text())];
                     CommandOutcome::no_range(contents, pages_left, is_error)
                 }
@@ -1031,6 +1230,9 @@ impl Pager {
         if let Some(state) = self.state.as_mut() {
             if let Some(marker) = gap_marker_if_needed(state.last_emitted, first_range) {
                 contents.insert(0, marker);
+            }
+            if let (Some((start, _)), Some((_, end))) = (first_range, last_range) {
+                state.view_history.push((start, end));
             }
             if let Some(last) = last_range {
                 state.last_emitted = Some(last);
@@ -1072,6 +1274,7 @@ pub(crate) fn maybe_activate_and_append_footer(
         state.last_emitted = range;
         if let Some((start, end)) = range {
             state.seen_ranges.insert(start, end);
+            state.view_history.push((start, end));
         }
     }
     pager.dedupe_images(contents);
@@ -1982,6 +2185,79 @@ mod tests {
         assert!(
             found.contains("manual-target-token"),
             "expected to find token after seek, got: {found}"
+        );
+    }
+
+    #[test]
+    fn slash_search_returns_compact_card_and_match_count() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\noutro\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let reply = text_from_reply(pager.handle_command(":/foo\n"));
+
+        assert!(
+            reply.contains("[pager] search #1/2"),
+            "expected compact search header, got: {reply}"
+        );
+        assert!(
+            reply.contains("alpha foo"),
+            "expected match line, got: {reply}"
+        );
+        assert!(
+            !reply.contains("middle\nbeta foo"),
+            "expected compact card instead of full page, got: {reply}"
+        );
+    }
+
+    #[test]
+    fn search_navigation_is_bidirectional_and_reuses_refs() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let first = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            first.contains("alpha foo"),
+            "expected first hit, got: {first}"
+        );
+
+        let second = text_from_reply(pager.handle_command(":n\n"));
+        assert!(
+            second.contains("beta foo"),
+            "expected second hit, got: {second}"
+        );
+
+        let back = text_from_reply(pager.handle_command(":p\n"));
+        assert!(
+            back.contains("alpha foo"),
+            "expected previous hit, got: {back}"
+        );
+        assert!(
+            back.contains("[pager] shown earlier @"),
+            "expected prior reference marker, got: {back}"
+        );
+    }
+
+    #[test]
+    fn goto_and_bare_matches_use_active_search_session() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega foo\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let _ = pager.handle_command(":/foo\n");
+
+        let listed = text_from_reply(pager.handle_command(":matches\n"));
+        assert!(
+            listed.contains("#1 @6") && listed.contains("#2 @23") && listed.contains("#3 @32"),
+            "expected active search listing, got: {listed}"
+        );
+
+        let jumped = text_from_reply(pager.handle_command(":goto 3\n"));
+        assert!(
+            jumped.contains("omega foo"),
+            "expected goto hit, got: {jumped}"
+        );
+        assert!(
+            jumped.contains("[pager] search #3/3"),
+            "expected goto to update search index, got: {jumped}"
         );
     }
 }

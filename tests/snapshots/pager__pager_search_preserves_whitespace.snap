@@ -1,6 +1,6 @@
 ---
 source: tests/pager.rs
-expression: snapshot.render()
+expression: rendered
 ---
 == session: default ==
 -- step 1 --
@@ -71,11 +71,15 @@ response:
     },
     {
       "type": "text",
-      "text": "line0025 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx r"
+      "text": "[pager] search #1/1 for ` r` @5040"
     },
     {
       "type": "text",
-      "text": "--More-- (123p, 12.5%, @5040..5252/42004)"
+      "text": "> line0025 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..."
+    },
+    {
+      "type": "text",
+      "text": "--More-- (140p, 0.4%, @210/42004)"
     }
   ]
 }
@@ -95,11 +99,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] next match is ~49 page(s) ahead: use :/r or `:skip 49`"
+      "text": "[pager] next match is ~23 page(s) ahead: use :/r or `:skip 23`"
     },
     {
       "type": "text",
-      "text": "--More-- (123p, 12.5%, @5252/42004)"
+      "text": "--More-- (140p, 0.4%, @210/42004)"
     }
   ]
 }
@@ -119,15 +123,19 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] elided output (already shown): @5252..15542"
+      "text": "[pager] search #1/2 for `r` @5040"
     },
     {
       "type": "text",
-      "text": "line0075 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxr "
+      "text": "[pager] shown earlier @5040..5252"
     },
     {
       "type": "text",
-      "text": "--More-- (88p, 37.5%, @15542..15754/42004)"
+      "text": "> line0025 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..."
+    },
+    {
+      "type": "text",
+      "text": "--More-- (140p, 0.4%, @210/42004)"
     }
   ]
 }
@@ -147,7 +155,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "(END, 37.5%, @15542..15754/42004)"
+      "text": "(END, 0.4%, @210/42004)"
     },
     {
       "type": "text",
