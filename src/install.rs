@@ -124,12 +124,20 @@ pub fn run(options: InstallOptions) -> Result<(), Box<dyn std::error::Error>> {
                 println!("Updated codex MCP config: {}", path.display());
             }
             InstallTarget::Claude => {
-                let path = root.join(".claude.json");
+                let config_path = root.join(".claude.json");
+                let settings_dir = root.join(".claude");
+                let settings_path = settings_dir.join("settings.json");
                 for (server_name, interpreter) in &server_specs {
                     let server_args = with_interpreter_arg(&claude_args, *interpreter);
-                    upsert_claude_mcp_server(&path, server_name, &command, &server_args)?;
+                    upsert_claude_mcp_server(&config_path, server_name, &command, &server_args)?;
+                    // Ensure ~/.claude directory exists for settings.json
+                    if !settings_dir.is_dir() {
+                        fs::create_dir_all(&settings_dir)?;
+                    }
+                    upsert_claude_settings_permission(&settings_path, server_name)?;
                 }
-                println!("Updated claude MCP config: {}", path.display());
+                println!("Updated claude MCP config: {}", config_path.display());
+                println!("Updated claude permissions: {}", settings_path.display());
             }
         }
     }
@@ -528,27 +536,52 @@ fn upsert_claude_mcp_server(
         ])),
     );
 
+    let serialized = serialize_json_pretty_with_paired_args(&root)?;
+    atomic_write(config_path, &serialized)?;
+    Ok(())
+}
+
+fn upsert_claude_settings_permission(
+    settings_path: &Path,
+    server_name: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut root = if settings_path.is_file() {
+        let raw = fs::read_to_string(settings_path)?;
+        serde_json::from_str::<JsonValue>(&raw).map_err(|err| {
+            format!(
+                "failed to parse JSON claude settings {}: {err}",
+                settings_path.display()
+            )
+        })?
+    } else {
+        JsonValue::Object(JsonMap::new())
+    };
+
+    let Some(root_obj) = root.as_object_mut() else {
+        return Err("claude settings root must be a JSON object".into());
+    };
+
     // Add tool permission to auto-approve all tools from this MCP server
     let tool_pattern = format!("mcp__{server_name}__*");
     let permissions = root_obj
         .entry("permissions".to_string())
         .or_insert_with(|| JsonValue::Object(JsonMap::new()));
     let Some(perm_obj) = permissions.as_object_mut() else {
-        return Err("claude config `permissions` must be a JSON object".into());
+        return Err("claude settings `permissions` must be a JSON object".into());
     };
     let allow_list = perm_obj
         .entry("allow".to_string())
         .or_insert_with(|| JsonValue::Array(Vec::new()));
     let Some(allow_arr) = allow_list.as_array_mut() else {
-        return Err("claude config `permissions.allow` must be an array".into());
+        return Err("claude settings `permissions.allow` must be an array".into());
     };
     // Add the pattern if not already present
     if !allow_arr.iter().any(|v| v.as_str() == Some(&tool_pattern)) {
         allow_arr.push(JsonValue::String(tool_pattern));
     }
 
-    let serialized = serialize_json_pretty_with_paired_args(&root)?;
-    atomic_write(config_path, &serialized)?;
+    let serialized = serde_json::to_string_pretty(&root)?;
+    atomic_write(settings_path, &format!("{serialized}\n"))?;
     Ok(())
 }
 
@@ -1044,18 +1077,12 @@ name="demo"
     }
 
     #[test]
-    fn upsert_claude_mcp_server_adds_tool_permission() {
+    fn upsert_claude_settings_permission_adds_tool_permission() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = dir.path().join("settings.json");
-        upsert_claude_mcp_server(
-            &config,
-            "r",
-            "/path/to/mcp-repl",
-            &["--interpreter".to_string(), "r".to_string()],
-        )
-        .expect("upsert claude");
+        let settings = dir.path().join("settings.json");
+        upsert_claude_settings_permission(&settings, "r").expect("upsert permission");
 
-        let text = fs::read_to_string(&config).expect("read config");
+        let text = fs::read_to_string(&settings).expect("read settings");
         let root: JsonValue = serde_json::from_str(&text).expect("parse json");
         let allow = root["permissions"]["allow"]
             .as_array()
@@ -1067,27 +1094,15 @@ name="demo"
     }
 
     #[test]
-    fn upsert_claude_mcp_server_does_not_duplicate_permission() {
+    fn upsert_claude_settings_permission_does_not_duplicate_permission() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = dir.path().join("settings.json");
+        let settings = dir.path().join("settings.json");
         // First upsert
-        upsert_claude_mcp_server(
-            &config,
-            "r",
-            "/path/to/mcp-repl",
-            &["--interpreter".to_string(), "r".to_string()],
-        )
-        .expect("first upsert");
-        // Second upsert (update)
-        upsert_claude_mcp_server(
-            &config,
-            "r",
-            "/path/to/new-mcp-repl",
-            &["--interpreter".to_string(), "r".to_string()],
-        )
-        .expect("second upsert");
+        upsert_claude_settings_permission(&settings, "r").expect("first upsert");
+        // Second upsert
+        upsert_claude_settings_permission(&settings, "r").expect("second upsert");
 
-        let text = fs::read_to_string(&config).expect("read config");
+        let text = fs::read_to_string(&settings).expect("read settings");
         let root: JsonValue = serde_json::from_str(&text).expect("parse json");
         let allow = root["permissions"]["allow"]
             .as_array()
@@ -1103,12 +1118,12 @@ name="demo"
     }
 
     #[test]
-    fn upsert_claude_mcp_server_preserves_existing_permissions() {
+    fn upsert_claude_settings_permission_preserves_existing_permissions() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let config = dir.path().join("settings.json");
+        let settings = dir.path().join("settings.json");
         // Seed with existing permissions
         fs::write(
-            &config,
+            &settings,
             r#"{
   "permissions": {
     "allow": ["Bash(cargo test:*)"],
@@ -1116,17 +1131,11 @@ name="demo"
   }
 }"#,
         )
-        .expect("seed config");
+        .expect("seed settings");
 
-        upsert_claude_mcp_server(
-            &config,
-            "r",
-            "/path/to/mcp-repl",
-            &["--interpreter".to_string(), "r".to_string()],
-        )
-        .expect("upsert claude");
+        upsert_claude_settings_permission(&settings, "r").expect("upsert permission");
 
-        let text = fs::read_to_string(&config).expect("read config");
+        let text = fs::read_to_string(&settings).expect("read settings");
         let root: JsonValue = serde_json::from_str(&text).expect("parse json");
         let allow = root["permissions"]["allow"]
             .as_array()
