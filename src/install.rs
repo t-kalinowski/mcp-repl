@@ -124,7 +124,7 @@ pub fn run(options: InstallOptions) -> Result<(), Box<dyn std::error::Error>> {
                 println!("Updated codex MCP config: {}", path.display());
             }
             InstallTarget::Claude => {
-                let path = resolve_claude_config_path(&root);
+                let path = root.join(".claude.json");
                 for (server_name, interpreter) in &server_specs {
                     let server_args = with_interpreter_arg(&claude_args, *interpreter);
                     upsert_claude_mcp_server(&path, server_name, &command, &server_args)?;
@@ -153,13 +153,14 @@ fn resolve_target_roots(
         if codex_root.is_dir() {
             targets.insert(InstallTarget::Codex);
         }
-        let claude_root = default_claude_home()?;
-        if claude_root.is_dir() {
+        // For Claude, check if home directory exists (we write directly to ~/.claude.json)
+        let home = home_dir()?;
+        if home.is_dir() {
             targets.insert(InstallTarget::Claude);
         }
         if targets.is_empty() {
             return Err(
-                "no existing agent home found (expected ~/.codex and/or ~/.claude; not creating new directories)"
+                "no existing agent home found (expected ~/.codex and/or home directory for ~/.claude.json)"
                     .into(),
             );
         }
@@ -170,17 +171,31 @@ fn resolve_target_roots(
     let mut resolved = Vec::with_capacity(targets.len());
     for target in targets {
         let root = match target {
-            InstallTarget::Codex => default_codex_home()?,
-            InstallTarget::Claude => default_claude_home()?,
+            InstallTarget::Codex => {
+                let root = default_codex_home()?;
+                if !root.is_dir() {
+                    return Err(format!(
+                        "{} home does not exist: {} (not creating new directories)",
+                        target.label(),
+                        root.display()
+                    )
+                    .into());
+                }
+                root
+            }
+            InstallTarget::Claude => {
+                // For Claude, we just need the home directory to exist
+                let home = home_dir()?;
+                if !home.is_dir() {
+                    return Err(format!(
+                        "home directory does not exist: {}",
+                        home.display()
+                    )
+                    .into());
+                }
+                home
+            }
         };
-        if !root.is_dir() {
-            return Err(format!(
-                "{} home does not exist: {} (not creating new directories)",
-                target.label(),
-                root.display()
-            )
-            .into());
-        }
         resolved.push((target, root));
     }
 
@@ -192,10 +207,6 @@ fn default_codex_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
         return Ok(PathBuf::from(path));
     }
     Ok(home_dir()?.join(".codex"))
-}
-
-fn default_claude_home() -> Result<PathBuf, Box<dyn std::error::Error>> {
-    Ok(home_dir()?.join(".claude"))
 }
 
 fn home_dir() -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -237,18 +248,6 @@ fn resolve_home_dir_from_env(
     }
     combined.push(homepath);
     Some(PathBuf::from(combined))
-}
-
-fn resolve_claude_config_path(root: &Path) -> PathBuf {
-    let settings = root.join("settings.json");
-    if settings.is_file() {
-        return settings;
-    }
-    let config = root.join("config.json");
-    if config.is_file() {
-        return config;
-    }
-    settings
 }
 
 fn has_sandbox_config_arg(args: &[String]) -> bool {

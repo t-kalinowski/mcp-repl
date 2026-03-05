@@ -102,8 +102,6 @@ fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
 #[test]
 fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
-    let claude_home = temp.path().join(".claude");
-    std::fs::create_dir_all(&claude_home)?;
     let exe = resolve_exe()?;
 
     let status = Command::new(exe)
@@ -119,7 +117,8 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
         "install --client claude failed with status {status}"
     );
 
-    let config_path = claude_home.join("settings.json");
+    // Claude Code stores MCP config in ~/.claude.json (not ~/.claude/settings.json)
+    let config_path = temp.path().join(".claude.json");
     let text = std::fs::read_to_string(config_path)?;
     let root: JsonValue = serde_json::from_str(&text)?;
     let servers = root["mcpServers"]
@@ -167,9 +166,7 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
 fn install_codex_and_install_claude_commands_are_rejected() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let codex_home = temp.path().join("codex-home");
-    let claude_home = temp.path().join(".claude");
     std::fs::create_dir_all(&codex_home)?;
-    std::fs::create_dir_all(&claude_home)?;
     let exe = resolve_exe()?;
 
     for cmd in ["install-codex", "install-claude"] {
@@ -193,9 +190,7 @@ fn install_codex_and_install_claude_commands_are_rejected() -> TestResult<()> {
 fn install_rejects_empty_client_selector() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let codex_home = temp.path().join("codex-home");
-    let claude_home = temp.path().join(".claude");
     std::fs::create_dir_all(&codex_home)?;
-    std::fs::create_dir_all(&claude_home)?;
     let exe = resolve_exe()?;
 
     let status = Command::new(&exe)
@@ -234,8 +229,6 @@ fn install_subcommands_are_rejected() -> TestResult<()> {
         "install-codex should fail after subcommand removal"
     );
 
-    let claude_home = temp.path().join(".claude");
-    std::fs::create_dir_all(&claude_home)?;
     let claude_status = Command::new(exe)
         .arg("install-claude")
         .arg("--command")

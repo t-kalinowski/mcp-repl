@@ -70,15 +70,13 @@ Point your MCP client at the binary (either via `PATH` or by using an explicit p
 You can auto-install into existing agent config files:
 
 ```sh
-# install to all existing agent homes (does not create ~/.codex or ~/.claude)
+# install to all available targets (does not create ~/.codex if missing)
 mcp-repl install
 
 # install only codex MCP config
 mcp-repl install --client codex
 
-# install only claude MCP config
-# Note: there may be some rough edges with Claude.
-# This has been primarily developed and tested with Codex.
+# install only claude MCP config (writes to ~/.claude.json)
 mcp-repl install --client claude
 
 # install only one interpreter for a specific client
@@ -118,19 +116,20 @@ args = [
 ]
 ```
 
-For Claude, `install --client claude` writes explicit sandbox mode by default because Claude does not
-propagate sandbox state updates to MCP servers:
+For Claude, `install --client claude` writes to `~/.claude.json` with explicit sandbox mode
+because Claude does not propagate sandbox state updates to MCP servers:
 
 ```json
+// ~/.claude.json
 {
   "mcpServers": {
     "r_repl": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
-      "args": ["--sandbox-state", "workspace-write", "--interpreter", "r"]
+      "args": ["--sandbox", "workspace-write", "--interpreter", "r"]
     },
     "py_repl": {
       "command": "/Users/alice/.cargo/bin/mcp-repl",
-      "args": ["--sandbox-state", "workspace-write", "--interpreter", "python"]
+      "args": ["--sandbox", "workspace-write", "--interpreter", "python"]
     }
   }
 }
