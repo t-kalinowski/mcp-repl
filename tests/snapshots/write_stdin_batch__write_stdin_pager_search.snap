@@ -47,7 +47,7 @@ response:
     },
     {
       "type": "text",
-      "text": "[pager] search #1/1 for `line0050` @10290"
+      "text": "[pager] search for `line0050` @10290"
     },
     {
       "type": "text",
@@ -75,7 +75,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] already at the last search hit #1/1 for `line0050`"
+      "text": "[pager] already at the last known search hit for `line0050`"
     },
     {
       "type": "text",

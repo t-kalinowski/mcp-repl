@@ -47,7 +47,7 @@ response:
     },
     {
       "type": "text",
-      "text": "[pager] search #1/100 for `line01` @20790"
+      "text": "[pager] search for `line01` @20790"
     },
     {
       "type": "text",
@@ -75,7 +75,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] search #2/100 for `line01` @21000"
+      "text": "[pager] search for `line01` @21000"
     },
     {
       "type": "text",

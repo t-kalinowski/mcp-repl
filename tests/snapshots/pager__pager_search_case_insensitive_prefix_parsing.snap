@@ -71,7 +71,7 @@ response:
     },
     {
       "type": "text",
-      "text": "[pager] search #1/100 for `LINE01` @20790"
+      "text": "[pager] search for `LINE01` @20790"
     },
     {
       "type": "text",

@@ -186,7 +186,7 @@ async fn r_show_doc_search_returns_compact_card() -> TestResult<()> {
     session.cancel().await?;
 
     assert!(
-        text.contains("[pager] search #") && text.contains("shebang"),
+        text.contains("[pager] search for `shebang` @"),
         "expected compact search header, got: {text:?}"
     );
     assert!(

@@ -11,6 +11,10 @@ pub(super) struct SearchSession {
     pub(super) hits: Vec<SearchHit>,
     pub(super) current_index: usize,
     pub(super) buffer_len: u64,
+    next_search_offset: u64,
+    complete: bool,
+    indexed_from_start: bool,
+    headings: HeadingState,
 }
 
 #[derive(Debug, Clone)]
@@ -394,14 +398,14 @@ pub(super) fn take_matches(
     buffer: &PagerBuffer,
     spec: &MatchSpec,
     session: &SearchSession,
-) -> (Vec<WorkerContent>, Option<(u64, u64)>) {
+) -> (Vec<WorkerContent>, RangeSpan) {
     if session.hits.is_empty() {
         return (
             vec![WorkerContent::stderr(pattern_not_found_message(
                 &session.pattern.pattern,
                 buffer.current_offset(),
             ))],
-            None,
+            RangeSpan::default(),
         );
     }
 
@@ -409,7 +413,7 @@ pub(super) fn take_matches(
     let entries = session.hits.iter().take(spec.limit);
     let total_lines = line_count(buffer);
     let mut output = String::new();
-    let mut last_range = None;
+    let mut span = RangeSpan::default();
 
     for (idx, entry) in entries.enumerate() {
         let label = idx + 1;
@@ -420,7 +424,7 @@ pub(super) fn take_matches(
                 "#{label} @{} {} | {snippet}\n",
                 entry.match_start, entry.breadcrumb
             ));
-            last_range = Some((entry.line_start, entry.line_end));
+            span.record(Some((entry.line_start, entry.line_end)));
             continue;
         }
 
@@ -437,7 +441,7 @@ pub(super) fn take_matches(
             let snippet = truncate_with_ellipsis(line.trim_end(), MATCH_LINE_MAX_BYTES);
             let marker = if line_idx == entry.line_idx { ">" } else { " " };
             output.push_str(&format!("  {marker} {snippet}\n"));
-            last_range = Some((line_start, line_end));
+            span.record(Some((line_start, line_end)));
         }
     }
 
@@ -450,7 +454,7 @@ pub(super) fn take_matches(
             )),
             WorkerContent::stdout(output),
         ],
-        last_range,
+        span,
     )
 }
 
@@ -466,7 +470,28 @@ fn first_hit_index_for_offset(hits: &[SearchHit], offset: u64) -> Option<usize> 
     hits.iter().position(|hit| hit.match_start >= offset)
 }
 
-pub(super) fn build_search_session(
+fn build_search_hit(
+    buffer: &PagerBuffer,
+    headings: &mut HeadingState,
+    match_offset: u64,
+    total_lines: usize,
+) -> Option<SearchHit> {
+    let line_idx = line_index_for_offset(buffer, match_offset);
+    if line_idx >= total_lines {
+        return None;
+    }
+    headings.scan_to(buffer, line_idx);
+    let (line_start, line_end) = line_bounds_for_index(buffer, line_idx);
+    Some(SearchHit {
+        match_start: match_offset,
+        line_idx,
+        line_start,
+        line_end,
+        breadcrumb: clean_breadcrumb(&heading_breadcrumb(&headings.headings)),
+    })
+}
+
+pub(super) fn build_full_search_session(
     buffer: &PagerBuffer,
     pattern: &SearchPattern,
     start_offset: u64,
@@ -492,19 +517,11 @@ pub(super) fn build_search_session(
             break;
         };
 
-        let line_idx = line_index_for_offset(buffer, match_offset);
-        if line_idx >= total_lines {
+        let Some(hit) = build_search_hit(buffer, &mut heading_state, match_offset, total_lines)
+        else {
             break;
-        }
-        heading_state.scan_to(buffer, line_idx);
-        let (line_start, line_end) = line_bounds_for_index(buffer, line_idx);
-        hits.push(SearchHit {
-            match_start: match_offset,
-            line_idx,
-            line_start,
-            line_end,
-            breadcrumb: clean_breadcrumb(&heading_breadcrumb(&heading_state.headings)),
-        });
+        };
+        hits.push(hit);
         search_offset = match_offset.saturating_add(1);
         if search_offset >= end_offset {
             break;
@@ -522,7 +539,99 @@ pub(super) fn build_search_session(
         current_index,
         hits,
         buffer_len: buffer.len(),
+        next_search_offset: end_offset,
+        complete: true,
+        indexed_from_start: true,
+        headings: heading_state,
     })
+}
+
+pub(super) fn build_forward_search_session(
+    buffer: &PagerBuffer,
+    pattern: &SearchPattern,
+    start_offset: u64,
+) -> Option<SearchSession> {
+    let end_offset = buffer.len();
+    let total_lines = line_count(buffer);
+    if end_offset == 0 || total_lines == 0 || start_offset >= end_offset {
+        return None;
+    }
+
+    let pattern_bytes = pattern.pattern.as_bytes();
+    let match_offset = buffer.find_next_bytes_with_options(
+        start_offset,
+        end_offset,
+        pattern_bytes,
+        pattern.case_insensitive_ascii,
+    )?;
+
+    let mut heading_state = HeadingState::new();
+    let hit = build_search_hit(buffer, &mut heading_state, match_offset, total_lines)?;
+
+    Some(SearchSession {
+        pattern: pattern.clone(),
+        hits: vec![hit],
+        current_index: 0,
+        buffer_len: buffer.len(),
+        next_search_offset: match_offset.saturating_add(1),
+        complete: false,
+        indexed_from_start: start_offset == 0,
+        headings: heading_state,
+    })
+}
+
+pub(super) fn session_is_complete(session: &SearchSession) -> bool {
+    session.complete
+}
+
+pub(super) fn session_is_indexed_from_start(session: &SearchSession) -> bool {
+    session.indexed_from_start
+}
+
+pub(super) fn current_search_anchor(session: &SearchSession) -> Option<u64> {
+    session
+        .hits
+        .get(session.current_index)
+        .map(|hit| hit.match_start)
+}
+
+pub(super) fn extend_search_session_forward(
+    buffer: &PagerBuffer,
+    session: &mut SearchSession,
+    needed_hits: usize,
+) {
+    if session.complete || session.hits.is_empty() {
+        return;
+    }
+
+    let end_offset = buffer.len();
+    let total_lines = line_count(buffer);
+    let pattern_bytes = session.pattern.pattern.as_bytes();
+    while session.hits.len() < needed_hits {
+        let Some(match_offset) = buffer.find_next_bytes_with_options(
+            session.next_search_offset,
+            end_offset,
+            pattern_bytes,
+            session.pattern.case_insensitive_ascii,
+        ) else {
+            session.complete = true;
+            session.next_search_offset = end_offset;
+            return;
+        };
+        let Some(hit) = build_search_hit(buffer, &mut session.headings, match_offset, total_lines)
+        else {
+            session.complete = true;
+            session.next_search_offset = end_offset;
+            return;
+        };
+        session.hits.push(hit);
+        session.next_search_offset = match_offset.saturating_add(1);
+        if session.next_search_offset >= end_offset {
+            session.complete = true;
+            session.next_search_offset = end_offset;
+            return;
+        }
+    }
 }
 
 fn prior_view_message(view_history: &[(u64, u64)], match_start: u64) -> Option<String> {
@@ -548,13 +657,28 @@ pub(super) fn render_search_card(
         );
     };
 
-    let mut contents = vec![WorkerContent::stderr(format!(
-        "[pager] search #{}/{} for `{}` @{}",
-        session.current_index + 1,
-        session.hits.len(),
-        session.pattern.pattern,
-        hit.match_start
-    ))];
+    let header = if session.indexed_from_start && session.complete {
+        format!(
+            "[pager] search #{}/{} for `{}` @{}",
+            session.current_index + 1,
+            session.hits.len(),
+            session.pattern.pattern,
+            hit.match_start
+        )
+    } else if session.indexed_from_start {
+        format!(
+            "[pager] search #{}/? for `{}` @{}",
+            session.current_index + 1,
+            session.pattern.pattern,
+            hit.match_start
+        )
+    } else {
+        format!(
+            "[pager] search for `{}` @{}",
+            session.pattern.pattern, hit.match_start
+        )
+    };
+    let mut contents = vec![WorkerContent::stderr(header)];
     if let Some(message) = prior_view_message(view_history, hit.match_start) {
         contents.push(WorkerContent::stderr(message));
     }
@@ -603,12 +727,25 @@ pub(super) fn goto_search_hit(session: &mut SearchSession, index: usize) -> bool
 
 pub(super) fn search_boundary_message(session: &SearchSession, forward: bool) -> String {
     let edge = if forward { "last" } else { "first" };
-    format!(
-        "[pager] already at the {edge} search hit #{}/{} for `{}`",
-        session.current_index + 1,
-        session.hits.len(),
-        session.pattern.pattern
-    )
+    if session.indexed_from_start && session.complete {
+        format!(
+            "[pager] already at the {edge} search hit #{}/{} for `{}`",
+            session.current_index + 1,
+            session.hits.len(),
+            session.pattern.pattern
+        )
+    } else if session.indexed_from_start {
+        format!(
+            "[pager] already at the {edge} known search hit #{} for `{}`",
+            session.current_index + 1,
+            session.pattern.pattern
+        )
+    } else {
+        format!(
+            "[pager] already at the {edge} known search hit for `{}`",
+            session.pattern.pattern
+        )
+    }
 }
 
 pub(super) fn take_hits_next(
