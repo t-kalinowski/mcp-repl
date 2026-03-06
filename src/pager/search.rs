@@ -480,7 +480,63 @@ fn clean_breadcrumb(breadcrumb: &str) -> String {
 }
 
 fn first_hit_index_for_offset(hits: &[SearchHit], offset: u64) -> Option<usize> {
+    if let Some(index) = hits
+        .iter()
+        .position(|hit| hit.line_start <= offset && offset < hit.line_end)
+    {
+        return Some(index);
+    }
     hits.iter().position(|hit| hit.match_start >= offset)
+}
+
+fn floor_char_boundary(text: &str, mut offset: usize) -> usize {
+    offset = offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
+}
+
+fn ceil_char_boundary(text: &str, mut offset: usize) -> usize {
+    offset = offset.min(text.len());
+    while offset < text.len() && !text.is_char_boundary(offset) {
+        offset += 1;
+    }
+    offset
+}
+
+fn snippet_around_match(line: &str, match_start_in_line: usize, pattern: &str) -> String {
+    let trimmed = line.trim_end();
+    if trimmed.len() <= MATCH_LINE_MAX_BYTES {
+        return trimmed.to_string();
+    }
+
+    let match_start = match_start_in_line.min(trimmed.len());
+    let match_end = match_start.saturating_add(pattern.len()).min(trimmed.len());
+    let mut window_start = 0usize;
+    let mut window_end = MATCH_LINE_MAX_BYTES.min(trimmed.len());
+
+    if window_end < match_end {
+        let context_before = MATCH_LINE_MAX_BYTES / 2;
+        window_start = match_start.saturating_sub(context_before);
+        window_end = window_start
+            .saturating_add(MATCH_LINE_MAX_BYTES)
+            .min(trimmed.len());
+        if window_end < match_end {
+            window_end = match_end;
+            window_start = window_end.saturating_sub(MATCH_LINE_MAX_BYTES);
+        }
+    }
+
+    window_start = floor_char_boundary(trimmed, window_start);
+    window_end = ceil_char_boundary(trimmed, window_end);
+    let prefix = if window_start > 0 { "..." } else { "" };
+    let suffix = if window_end < trimmed.len() {
+        "..."
+    } else {
+        ""
+    };
+    format!("{prefix}{}{suffix}", &trimmed[window_start..window_end])
 }
 
 fn build_search_hit(
@@ -535,7 +591,7 @@ pub(super) fn build_full_search_session(
             break;
         };
         hits.push(hit);
-        search_offset = match_offset.saturating_add(1);
+        search_offset = hits.last().map(|hit| hit.line_end).unwrap_or(end_offset);
         if search_offset >= end_offset {
             break;
         }
@@ -580,13 +636,14 @@ pub(super) fn build_forward_search_session(
 
     let mut heading_state = HeadingState::new();
     let hit = build_search_hit(buffer, &mut heading_state, match_offset, total_lines)?;
+    let next_search_offset = hit.line_end;
 
     Some(SearchSession {
         pattern: pattern.clone(),
         hits: vec![hit],
         current_index: 0,
         buffer_len: buffer.len(),
-        next_search_offset: match_offset.saturating_add(1),
+        next_search_offset,
         complete: false,
         indexed_from_start: start_offset == 0,
         headings: heading_state,
@@ -638,7 +695,11 @@ pub(super) fn extend_search_session_forward(
             return;
         };
         session.hits.push(hit);
-        session.next_search_offset = match_offset.saturating_add(1);
+        session.next_search_offset = session
+            .hits
+            .last()
+            .map(|hit| hit.line_end)
+            .unwrap_or(end_offset);
         if session.next_search_offset >= end_offset {
             session.complete = true;
             session.next_search_offset = end_offset;
@@ -697,7 +758,8 @@ pub(super) fn render_search_card(
     }
 
     let line = read_line_text(buffer, hit.line_idx);
-    let snippet = truncate_with_ellipsis(line.trim_end(), MATCH_LINE_MAX_BYTES);
+    let match_start_in_line = hit.match_start.saturating_sub(hit.line_start) as usize;
+    let snippet = snippet_around_match(&line, match_start_in_line, &session.pattern.pattern);
     let body = if hit.breadcrumb == "root" {
         format!("> {snippet}\n")
     } else {

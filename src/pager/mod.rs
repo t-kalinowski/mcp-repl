@@ -2363,6 +2363,20 @@ mod tests {
     }
 
     #[test]
+    fn compact_search_card_includes_match_from_long_line_tail() {
+        let text = format!("{} token-at-tail suffix\n", "x".repeat(260));
+        let mut pager = activate_pager_with_text(&text);
+
+        let reply = text_from_reply(pager.handle_command(":/token-at-tail\n"));
+        let body_match_count = reply.match_indices("token-at-tail").count();
+
+        assert!(
+            body_match_count >= 2,
+            "expected compact card body to include matched text in addition to the header, got: {reply}"
+        );
+    }
+
+    #[test]
     fn search_navigation_is_bidirectional_and_reuses_refs() {
         let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
         let mut pager = activate_pager_with_text(text);
@@ -2486,6 +2500,38 @@ mod tests {
         assert!(
             !found.contains("[pager] shown earlier @"),
             "expected unseen gap content not to be marked as shown, got: {found}"
+        );
+    }
+
+    #[test]
+    fn search_sessions_index_each_matching_line_once() {
+        let text = "alpha foo foo\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let first = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            first.contains("alpha foo foo"),
+            "expected first hit on first matching line, got: {first}"
+        );
+
+        let next = text_from_reply(pager.handle_command(":n\n"));
+        assert!(
+            next.contains("beta foo"),
+            "expected :n to advance to the next matching line, got: {next}"
+        );
+        assert!(
+            !next.contains("alpha foo foo"),
+            "expected duplicate same-line hit to be skipped, got: {next}"
+        );
+
+        let listed = text_from_reply(pager.handle_command(":matches foo\n"));
+        assert!(
+            listed.contains("#1 @6") && listed.contains("#2 @19"),
+            "expected two matching lines in list, got: {listed}"
+        );
+        assert!(
+            !listed.contains("#3 @"),
+            "expected no duplicate third hit from same line, got: {listed}"
         );
     }
 }
