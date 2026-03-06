@@ -15,6 +15,7 @@ pub(super) struct SearchSession {
 
 #[derive(Debug, Clone)]
 pub(super) struct SearchHit {
+    pub(super) match_start: u64,
     pub(super) line_idx: usize,
     pub(super) line_start: u64,
     pub(super) line_end: u64,
@@ -417,7 +418,7 @@ pub(super) fn take_matches(
             let snippet = truncate_with_ellipsis(line.trim_end(), MATCH_LINE_MAX_BYTES);
             output.push_str(&format!(
                 "#{label} @{} {} | {snippet}\n",
-                entry.line_start, entry.breadcrumb
+                entry.match_start, entry.breadcrumb
             ));
             last_range = Some((entry.line_start, entry.line_end));
             continue;
@@ -425,7 +426,7 @@ pub(super) fn take_matches(
 
         output.push_str(&format!(
             "#{label} @{} {}\n",
-            entry.line_start, entry.breadcrumb
+            entry.match_start, entry.breadcrumb
         ));
 
         let start_idx = entry.line_idx.saturating_sub(spec.context);
@@ -463,7 +464,7 @@ fn clean_breadcrumb(breadcrumb: &str) -> String {
 
 fn first_hit_index_for_offset(hits: &[SearchHit], offset: u64) -> usize {
     hits.iter()
-        .position(|hit| hit.line_start >= offset)
+        .position(|hit| hit.match_start >= offset)
         .unwrap_or(0)
 }
 
@@ -500,12 +501,13 @@ pub(super) fn build_search_session(
         heading_state.scan_to(buffer, line_idx);
         let (line_start, line_end) = line_bounds_for_index(buffer, line_idx);
         hits.push(SearchHit {
+            match_start: match_offset,
             line_idx,
             line_start,
             line_end,
             breadcrumb: clean_breadcrumb(&heading_breadcrumb(&heading_state.headings)),
         });
-        search_offset = line_end.max(match_offset.saturating_add(1));
+        search_offset = match_offset.saturating_add(1);
         if search_offset >= end_offset {
             break;
         }
@@ -523,11 +525,11 @@ pub(super) fn build_search_session(
     })
 }
 
-fn prior_view_message(view_history: &[(u64, u64)], line_start: u64) -> Option<String> {
+fn prior_view_message(view_history: &[(u64, u64)], match_start: u64) -> Option<String> {
     view_history
         .iter()
         .rev()
-        .find(|(start, end)| *start <= line_start && line_start < *end)
+        .find(|(start, end)| *start <= match_start && match_start < *end)
         .map(|(start, end)| format!("[pager] shown earlier @{start}..{end}"))
 }
 
@@ -551,9 +553,9 @@ pub(super) fn render_search_card(
         session.current_index + 1,
         session.hits.len(),
         session.pattern.pattern,
-        hit.line_start
+        hit.match_start
     ))];
-    if let Some(message) = prior_view_message(view_history, hit.line_start) {
+    if let Some(message) = prior_view_message(view_history, hit.match_start) {
         contents.push(WorkerContent::stderr(message));
     }
 

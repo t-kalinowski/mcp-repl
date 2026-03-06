@@ -854,18 +854,20 @@ impl Pager {
     }
 
     fn ensure_search_session_fresh(state: &mut PagerState) -> bool {
-        let Some(existing) = state.search_session.clone() else {
+        let Some(existing) = state.search_session.as_ref() else {
             return false;
         };
-        if existing.buffer_len == state.buffer.len() {
+        let buffer_len = state.buffer.len();
+        if existing.buffer_len == buffer_len {
             return true;
         }
         let anchor = existing
             .hits
             .get(existing.current_index)
-            .map(|hit| hit.line_start)
+            .map(|hit| hit.match_start)
             .unwrap_or_else(|| state.buffer.current_offset());
-        state.search_session = build_search_session(&state.buffer, &existing.pattern, anchor);
+        let pattern = existing.pattern.clone();
+        state.search_session = build_search_session(&state.buffer, &pattern, anchor);
         state.search_session.is_some()
     }
 
@@ -2189,6 +2191,29 @@ mod tests {
     }
 
     #[test]
+    fn slash_search_starts_from_later_same_line_match_when_cursor_is_mid_line() {
+        let text = format!(
+            "prefix {} foo {} foo suffix\n",
+            "a".repeat(60),
+            "b".repeat(60)
+        );
+        let mut pager = activate_pager_with_text(&text);
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(80);
+
+        let found = text_from_reply(pager.handle_command(":/foo\n"));
+
+        assert!(
+            found.contains("[pager] search #2/2"),
+            "expected later same-line hit from mid-line cursor, got: {found}"
+        );
+    }
+
+    #[test]
     fn slash_search_returns_compact_card_and_match_count() {
         let text = "intro\nalpha foo\nmiddle\nbeta foo\noutro\n";
         let mut pager = activate_pager_with_text(text);
@@ -2246,7 +2271,7 @@ mod tests {
 
         let listed = text_from_reply(pager.handle_command(":matches\n"));
         assert!(
-            listed.contains("#1 @6") && listed.contains("#2 @23") && listed.contains("#3 @32"),
+            listed.contains("#1 @12") && listed.contains("#2 @28") && listed.contains("#3 @38"),
             "expected active search listing, got: {listed}"
         );
 

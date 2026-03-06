@@ -71,7 +71,7 @@ response:
     },
     {
       "type": "text",
-      "text": "[pager] search #1/1 for ` r` @5040"
+      "text": "[pager] search #1/1 for ` r` @5249"
     },
     {
       "type": "text",
@@ -123,7 +123,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] search #1/2 for `r` @5040"
+      "text": "[pager] search #1/2 for `r` @5250"
     },
     {
       "type": "text",
