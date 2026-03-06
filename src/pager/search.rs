@@ -462,10 +462,8 @@ fn clean_breadcrumb(breadcrumb: &str) -> String {
         .to_string()
 }
 
-fn first_hit_index_for_offset(hits: &[SearchHit], offset: u64) -> usize {
-    hits.iter()
-        .position(|hit| hit.match_start >= offset)
-        .unwrap_or(0)
+fn first_hit_index_for_offset(hits: &[SearchHit], offset: u64) -> Option<usize> {
+    hits.iter().position(|hit| hit.match_start >= offset)
 }
 
 pub(super) fn build_search_session(
@@ -517,9 +515,11 @@ pub(super) fn build_search_session(
         return None;
     }
 
+    let current_index = first_hit_index_for_offset(&hits, start_offset)?;
+
     Some(SearchSession {
         pattern: pattern.clone(),
-        current_index: first_hit_index_for_offset(&hits, start_offset),
+        current_index,
         hits,
         buffer_len: buffer.len(),
     })

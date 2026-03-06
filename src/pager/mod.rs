@@ -847,8 +847,11 @@ impl Pager {
         )
     }
 
-    fn ensure_search_session_from_pattern(state: &mut PagerState, pattern: &SearchPattern) -> bool {
-        let start_offset = state.buffer.current_offset();
+    fn ensure_search_session_from_pattern(
+        state: &mut PagerState,
+        pattern: &SearchPattern,
+        start_offset: u64,
+    ) -> bool {
         state.search_session = build_search_session(&state.buffer, pattern, start_offset);
         state.search_session.is_some()
     }
@@ -968,7 +971,11 @@ impl Pager {
                 }
                 PagerCommand::Search { pattern } => {
                     let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
-                    if Self::ensure_search_session_from_pattern(state, &pattern) {
+                    if Self::ensure_search_session_from_pattern(
+                        state,
+                        &pattern,
+                        state.buffer.current_offset(),
+                    ) {
                         let session = state
                             .search_session
                             .as_ref()
@@ -1006,7 +1013,7 @@ impl Pager {
                 PagerCommand::Matches { spec } => {
                     let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                     if let Some(pattern) = spec.pattern.as_ref() {
-                        if !Self::ensure_search_session_from_pattern(state, pattern) {
+                        if !Self::ensure_search_session_from_pattern(state, pattern, 0) {
                             let contents = vec![WorkerContent::stderr(format!(
                                 "[pager] pattern not found: {}",
                                 pattern.pattern
@@ -2214,6 +2221,29 @@ mod tests {
     }
 
     #[test]
+    fn slash_search_past_last_hit_does_not_wrap_to_first_hit() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(40);
+
+        let found = text_from_reply(pager.handle_command(":/foo\n"));
+
+        assert!(
+            found.contains("[pager] pattern not found: foo"),
+            "expected forward-only miss past final hit, got: {found}"
+        );
+        assert!(
+            !found.contains("[pager] search #1/"),
+            "expected no wrap to first hit, got: {found}"
+        );
+    }
+
+    #[test]
     fn slash_search_returns_compact_card_and_match_count() {
         let text = "intro\nalpha foo\nmiddle\nbeta foo\noutro\n";
         let mut pager = activate_pager_with_text(text);
@@ -2283,6 +2313,34 @@ mod tests {
         assert!(
             jumped.contains("[pager] search #3/3"),
             "expected goto to update search index, got: {jumped}"
+        );
+    }
+
+    #[test]
+    fn explicit_matches_pattern_resets_navigation_to_list_start() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega foo\n";
+        let mut pager = activate_pager_with_text(text);
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(20);
+
+        let listed = text_from_reply(pager.handle_command(":matches foo\n"));
+        assert!(
+            listed.contains("#1 @12") && listed.contains("#2 @28") && listed.contains("#3 @38"),
+            "expected full numbered list, got: {listed}"
+        );
+
+        let next = text_from_reply(pager.handle_command(":n\n"));
+        assert!(
+            next.contains("beta foo"),
+            "expected :n to continue from list hit #1 to #2, got: {next}"
+        );
+        assert!(
+            next.contains("[pager] search #2/3"),
+            "expected navigation to align with list numbering, got: {next}"
         );
     }
 }
