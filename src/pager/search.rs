@@ -11,6 +11,7 @@ pub(super) struct SearchSession {
     pub(super) hits: Vec<SearchHit>,
     pub(super) current_index: usize,
     pub(super) anchor_offset: u64,
+    pub(super) max_indexed_hits: Option<usize>,
     pub(super) buffer_len: u64,
     next_search_offset: u64,
     complete: bool,
@@ -486,6 +487,10 @@ fn first_hit_index_for_offset(hits: &[SearchHit], offset: u64) -> usize {
         .unwrap_or(hits.len())
 }
 
+fn boundary_hit_index(hits: &[SearchHit], offset: u64) -> usize {
+    hits.partition_point(|hit| hit.match_start < offset)
+}
+
 fn floor_char_boundary(text: &str, mut offset: usize) -> usize {
     offset = offset.min(text.len());
     while offset > 0 && !text.is_char_boundary(offset) {
@@ -578,10 +583,11 @@ fn full_session_match_offset_for_line(
         .unwrap_or(match_offset)
 }
 
-pub(super) fn build_full_search_session(
+fn build_indexed_search_session(
     buffer: &PagerBuffer,
     pattern: &SearchPattern,
     start_offset: u64,
+    max_indexed_hits: Option<usize>,
 ) -> Option<SearchSession> {
     let end_offset = buffer.len();
     let total_lines = line_count(buffer);
@@ -593,6 +599,7 @@ pub(super) fn build_full_search_session(
     let mut search_offset = 0u64;
     let mut heading_state = HeadingState::new();
     let mut hits = Vec::new();
+    let mut indexed_to_end = false;
 
     loop {
         let Some(match_offset) = buffer.find_next_bytes_with_options(
@@ -601,6 +608,7 @@ pub(super) fn build_full_search_session(
             pattern_bytes,
             pattern.case_insensitive_ascii,
         ) else {
+            indexed_to_end = true;
             break;
         };
 
@@ -627,7 +635,11 @@ pub(super) fn build_full_search_session(
         };
         hits.push(hit);
         search_offset = hits.last().map(|hit| hit.line_end).unwrap_or(end_offset);
+        if max_indexed_hits.is_some_and(|limit| hits.len() >= limit) {
+            break;
+        }
         if search_offset >= end_offset {
+            indexed_to_end = true;
             break;
         }
     }
@@ -642,13 +654,35 @@ pub(super) fn build_full_search_session(
         pattern: pattern.clone(),
         current_index,
         anchor_offset: start_offset,
+        max_indexed_hits,
         hits,
         buffer_len: buffer.len(),
-        next_search_offset: end_offset,
-        complete: true,
+        next_search_offset: if indexed_to_end {
+            end_offset
+        } else {
+            search_offset
+        },
+        complete: indexed_to_end,
         indexed_from_start: true,
         headings: heading_state,
     })
+}
+
+pub(super) fn build_full_search_session(
+    buffer: &PagerBuffer,
+    pattern: &SearchPattern,
+    start_offset: u64,
+) -> Option<SearchSession> {
+    build_indexed_search_session(buffer, pattern, start_offset, None)
+}
+
+pub(super) fn build_bounded_search_session(
+    buffer: &PagerBuffer,
+    pattern: &SearchPattern,
+    start_offset: u64,
+    max_indexed_hits: usize,
+) -> Option<SearchSession> {
+    build_indexed_search_session(buffer, pattern, start_offset, Some(max_indexed_hits))
 }
 
 pub(super) fn build_forward_search_session(
@@ -679,6 +713,7 @@ pub(super) fn build_forward_search_session(
         hits: vec![hit],
         current_index: 0,
         anchor_offset: match_offset,
+        max_indexed_hits: None,
         buffer_len: buffer.len(),
         next_search_offset,
         complete: false,
@@ -693,6 +728,10 @@ pub(super) fn session_is_complete(session: &SearchSession) -> bool {
 
 pub(super) fn session_is_indexed_from_start(session: &SearchSession) -> bool {
     session.indexed_from_start
+}
+
+pub(super) fn session_max_indexed_hits(session: &SearchSession) -> Option<usize> {
+    session.max_indexed_hits
 }
 
 pub(super) fn current_search_anchor(session: &SearchSession) -> Option<u64> {
@@ -815,15 +854,24 @@ pub(super) fn move_search_session(
     }
     let count = count.max(1) as usize;
     let last = session.hits.len().saturating_sub(1);
+    let boundary = boundary_hit_index(&session.hits, session.anchor_offset);
     let old = session.current_index;
     session.current_index = if forward {
         if session.current_index >= session.hits.len() {
-            session.current_index
+            if boundary >= session.hits.len() {
+                session.current_index
+            } else {
+                boundary.saturating_add(count - 1).min(last)
+            }
         } else {
             session.current_index.saturating_add(count).min(last)
         }
     } else if session.current_index >= session.hits.len() {
-        session.hits.len().saturating_sub(count)
+        if boundary == 0 {
+            session.current_index
+        } else {
+            boundary.saturating_sub(count)
+        }
     } else {
         session.current_index.saturating_sub(count)
     };

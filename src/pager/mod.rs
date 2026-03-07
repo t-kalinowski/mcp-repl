@@ -19,11 +19,11 @@ use presentation::{
 };
 use ranges::{RangeSet, RangeSpan};
 use search::{
-    HitState, SearchSession, SearchStepOutcome, build_forward_search_session,
-    build_full_search_session, current_search_anchor, extend_search_session_forward,
-    goto_search_hit, move_search_session, render_search_card, search_boundary_message,
-    session_is_complete, session_is_indexed_from_start, take_hits_next, take_matches,
-    where_in_buffer,
+    HitState, SearchSession, SearchStepOutcome, build_bounded_search_session,
+    build_forward_search_session, build_full_search_session, current_search_anchor,
+    extend_search_session_forward, goto_search_hit, move_search_session, render_search_card,
+    search_boundary_message, session_is_complete, session_is_indexed_from_start,
+    session_max_indexed_hits, take_hits_next, take_matches, where_in_buffer,
 };
 
 pub(crate) const PAGER_PAGE_CHARS_ENV: &str = "MCP_CONSOLE_PAGER_PAGE_CHARS";
@@ -903,8 +903,25 @@ impl Pager {
         limit: usize,
     ) -> Option<SearchSession> {
         let needed_hits = limit.saturating_add(1);
-        let mut session = build_forward_search_session(buffer, pattern, 0)?;
-        extend_search_session_forward(buffer, &mut session, needed_hits);
+        build_bounded_search_session(buffer, pattern, 0, needed_hits)
+    }
+
+    fn rebuild_search_session(
+        buffer: &PagerBuffer,
+        existing: &SearchSession,
+    ) -> Option<SearchSession> {
+        let anchor = existing.anchor_offset;
+        let pattern = existing.pattern.clone();
+        let mut session = if let Some(limit) = session_max_indexed_hits(existing) {
+            build_bounded_search_session(buffer, &pattern, anchor, limit)
+        } else if session_is_complete(existing) || session_is_indexed_from_start(existing) {
+            build_full_search_session(buffer, &pattern, anchor)
+        } else {
+            build_forward_search_session(buffer, &pattern, anchor)
+        }?;
+        if existing.current_index >= existing.hits.len() {
+            session.current_index = session.hits.len();
+        }
         Some(session)
     }
 
@@ -916,14 +933,7 @@ impl Pager {
         if existing.buffer_len == buffer_len {
             return true;
         }
-        let anchor = existing.anchor_offset;
-        let pattern = existing.pattern.clone();
-        state.search_session =
-            if session_is_complete(existing) || session_is_indexed_from_start(existing) {
-                build_full_search_session(&state.buffer, &pattern, anchor)
-            } else {
-                build_forward_search_session(&state.buffer, &pattern, anchor)
-            };
+        state.search_session = Self::rebuild_search_session(&state.buffer, existing);
         state.search_session.is_some()
     }
 
@@ -934,11 +944,15 @@ impl Pager {
         if session_is_complete(existing) && session_is_indexed_from_start(existing) {
             return true;
         }
-        let Some(anchor) = current_search_anchor(existing) else {
+        let Some(_anchor) = current_search_anchor(existing) else {
             return false;
         };
-        let pattern = existing.pattern.clone();
-        state.search_session = build_full_search_session(&state.buffer, &pattern, anchor);
+        state.search_session = if session_max_indexed_hits(existing).is_some() {
+            Self::rebuild_search_session(&state.buffer, existing)
+        } else {
+            let pattern = existing.pattern.clone();
+            build_full_search_session(&state.buffer, &pattern, existing.anchor_offset)
+        };
         state.search_session.is_some()
     }
 
@@ -1959,8 +1973,19 @@ fn take_line_range(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output_capture::OutputEvent;
+    use crate::output_capture::{
+        OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEvent, OutputTimeline, ensure_output_ring,
+        reset_output_ring,
+    };
     use crate::worker_protocol::TextStream;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    struct OutputPagerFixture {
+        _guard: MutexGuard<'static, ()>,
+        pager: Pager,
+        output: OutputBuffer,
+        timeline: OutputTimeline,
+    }
 
     fn text_from_reply(reply: WorkerReply) -> String {
         let WorkerReply::Output { contents, .. } = reply;
@@ -1985,6 +2010,35 @@ mod tests {
         let mut pager = Pager::default();
         pager.activate(buffer, false);
         pager
+    }
+
+    fn output_ring_test_guard() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("output ring test lock")
+    }
+
+    fn activate_pager_from_output(text: &str) -> OutputPagerFixture {
+        let guard = output_ring_test_guard();
+        reset_output_ring();
+        let ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        let timeline = OutputTimeline::new(ring);
+        let output = OutputBuffer::default();
+        output.start_capture();
+        timeline.append_text(text.as_bytes(), false);
+        let end_offset = output.end_offset().expect("output end offset");
+        let range = output.read_range(0, end_offset);
+        output.advance_offset_to(end_offset);
+        let buffer = PagerBuffer::from_range(range);
+        let mut pager = Pager::default();
+        pager.activate(buffer, false);
+        OutputPagerFixture {
+            _guard: guard,
+            pager,
+            output,
+            timeline,
+        }
     }
 
     #[test]
@@ -2435,6 +2489,40 @@ mod tests {
     }
 
     #[test]
+    fn refreshed_matches_all_session_stays_bounded() {
+        let text = (0..(MAX_MATCH_LIMIT + 25))
+            .map(|idx| format!("foo line {idx}\n"))
+            .collect::<String>();
+        let mut fixture = activate_pager_from_output(&text);
+
+        let initial = text_from_reply(fixture.pager.handle_command(":matches -n all foo\n"));
+        assert!(
+            initial.contains("[pager] matches: 500 shown (limit 500), more available"),
+            "expected bounded all-matches header, got: {initial}"
+        );
+
+        fixture
+            .timeline
+            .append_text(b"foo line refresh-a\nfoo line refresh-b\n", false);
+        fixture.pager.refresh_from_output(&fixture.output);
+
+        let _refreshed = text_from_reply(fixture.pager.handle_command(":matches\n"));
+
+        let session = fixture
+            .pager
+            .state
+            .as_ref()
+            .and_then(|state| state.search_session.as_ref())
+            .expect("search session retained after refresh");
+        assert_eq!(
+            session.hits.len(),
+            MAX_MATCH_LIMIT + 1,
+            "expected refreshed search session to stay bounded, got {} hits",
+            session.hits.len()
+        );
+    }
+
+    #[test]
     fn slash_search_miss_after_same_line_hit_anchors_previous_match() {
         let text = "alpha foo suffix\nomega\n";
         let mut pager = activate_pager_with_text(text);
@@ -2455,6 +2543,34 @@ mod tests {
         assert!(
             previous.contains("alpha foo suffix"),
             "expected :p to recover the earlier same-line hit, got: {previous}"
+        );
+    }
+
+    #[test]
+    fn refreshed_tail_miss_session_uses_next_appended_hit() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut fixture = activate_pager_from_output(text);
+        fixture
+            .pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(40);
+
+        let miss = text_from_reply(fixture.pager.handle_command(":/foo\n"));
+        assert!(
+            miss.contains("[pager] pattern not found: foo"),
+            "expected forward miss message, got: {miss}"
+        );
+
+        fixture.timeline.append_text(b"gamma foo\n", false);
+        fixture.pager.refresh_from_output(&fixture.output);
+
+        let next = text_from_reply(fixture.pager.handle_command(":n\n"));
+        assert!(
+            next.contains("gamma foo"),
+            "expected :n to land on the newly appended hit after refresh, got: {next}"
         );
     }
 
