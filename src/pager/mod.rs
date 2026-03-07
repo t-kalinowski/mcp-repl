@@ -1074,6 +1074,12 @@ impl Pager {
                             Some(false),
                         )
                     } else {
+                        let _ = Self::ensure_search_session_from_pattern(
+                            state,
+                            &pattern,
+                            state.buffer.current_offset(),
+                            true,
+                        );
                         let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                         let contents = vec![WorkerContent::stderr(format!(
                             "[pager] pattern not found: {}",
@@ -2372,6 +2378,36 @@ mod tests {
             "expected no wrap to first hit, got: {found}"
         );
         assert!(pager.state.is_some(), "expected pager to stay active");
+    }
+
+    #[test]
+    fn slash_search_past_last_hit_keeps_bidirectional_search_active() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(40);
+
+        let miss = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            miss.contains("[pager] pattern not found: foo"),
+            "expected forward miss message, got: {miss}"
+        );
+
+        let previous = text_from_reply(pager.handle_command(":p\n"));
+        assert!(
+            previous.contains("alpha foo"),
+            "expected :p to recover an earlier hit after the miss, got: {previous}"
+        );
+
+        let listed = text_from_reply(pager.handle_command(":matches\n"));
+        assert!(
+            listed.contains("#1 @12") && listed.contains("#2 @28"),
+            "expected full search session to remain available after the miss, got: {listed}"
+        );
     }
 
     #[test]

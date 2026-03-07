@@ -486,7 +486,9 @@ fn first_hit_index_for_offset(hits: &[SearchHit], offset: u64) -> Option<usize> 
     {
         return Some(index);
     }
-    hits.iter().position(|hit| hit.match_start >= offset)
+    hits.iter()
+        .position(|hit| hit.match_start >= offset)
+        .or_else(|| hits.len().checked_sub(1))
 }
 
 fn floor_char_boundary(text: &str, mut offset: usize) -> usize {
