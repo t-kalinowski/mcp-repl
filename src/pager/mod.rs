@@ -2583,6 +2583,36 @@ mod tests {
     }
 
     #[test]
+    fn completing_search_session_preserves_active_same_line_occurrence() {
+        let text = "alpha foo beta foo\nomega foo\n";
+        let mut pager = activate_pager_with_text(text);
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(10);
+
+        let first = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            first.contains("[pager] search for `foo` @15"),
+            "expected slash search to land on later same-line occurrence, got: {first}"
+        );
+
+        let listed = text_from_reply(pager.handle_command(":matches\n"));
+        assert!(
+            listed.contains("#1 @15"),
+            "expected completed session to keep the active same-line occurrence, got: {listed}"
+        );
+
+        let jumped = text_from_reply(pager.handle_command(":goto 1\n"));
+        assert!(
+            jumped.contains("[pager] search #1/2 for `foo` @15"),
+            "expected goto to preserve the active same-line occurrence, got: {jumped}"
+        );
+    }
+
+    #[test]
     fn matches_miss_preserves_active_search_session() {
         let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
         let mut pager = activate_pager_with_text(text);

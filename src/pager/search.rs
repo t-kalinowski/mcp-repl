@@ -560,6 +560,27 @@ fn build_search_hit(
     })
 }
 
+fn full_session_match_offset_for_line(
+    buffer: &PagerBuffer,
+    pattern: &SearchPattern,
+    start_offset: u64,
+    match_offset: u64,
+    line_end: u64,
+) -> u64 {
+    if match_offset >= start_offset || start_offset >= line_end {
+        return match_offset;
+    }
+
+    buffer
+        .find_next_bytes_with_options(
+            start_offset,
+            line_end,
+            pattern.pattern.as_bytes(),
+            pattern.case_insensitive_ascii,
+        )
+        .unwrap_or(match_offset)
+}
+
 pub(super) fn build_full_search_session(
     buffer: &PagerBuffer,
     pattern: &SearchPattern,
@@ -586,8 +607,25 @@ pub(super) fn build_full_search_session(
             break;
         };
 
-        let Some(hit) = build_search_hit(buffer, &mut heading_state, match_offset, total_lines)
-        else {
+        let line_idx = line_index_for_offset(buffer, match_offset);
+        if line_idx >= total_lines {
+            break;
+        }
+        let (_, line_end) = line_bounds_for_index(buffer, line_idx);
+        let effective_match_offset = full_session_match_offset_for_line(
+            buffer,
+            pattern,
+            start_offset,
+            match_offset,
+            line_end,
+        );
+
+        let Some(hit) = build_search_hit(
+            buffer,
+            &mut heading_state,
+            effective_match_offset,
+            total_lines,
+        ) else {
             break;
         };
         hits.push(hit);
