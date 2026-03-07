@@ -640,6 +640,7 @@ struct CommandOutcome {
     dismiss: bool,
     is_error: bool,
     update_range: bool,
+    update_last_emitted: bool,
     first_range: Option<(u64, u64)>,
     last_range: Option<(u64, u64)>,
     view_ranges: Vec<(u64, u64)>,
@@ -662,6 +663,7 @@ impl CommandOutcome {
             dismiss,
             is_error,
             update_range,
+            update_last_emitted: true,
             first_range,
             last_range,
             view_ranges: match (first_range, last_range) {
@@ -673,6 +675,11 @@ impl CommandOutcome {
 
     fn with_view_ranges(mut self, view_ranges: Vec<(u64, u64)>) -> Self {
         self.view_ranges = view_ranges;
+        self
+    }
+
+    fn without_last_emitted_update(mut self) -> Self {
+        self.update_last_emitted = false;
         self
     }
 
@@ -877,12 +884,17 @@ impl Pager {
         start_offset: u64,
         full: bool,
     ) -> bool {
-        state.search_session = if full {
+        let next_session = if full {
             build_full_search_session(&state.buffer, pattern, start_offset)
         } else {
             build_forward_search_session(&state.buffer, pattern, start_offset)
         };
-        state.search_session.is_some()
+        if let Some(session) = next_session {
+            state.search_session = Some(session);
+            true
+        } else {
+            false
+        }
     }
 
     fn build_matches_session(
@@ -987,6 +999,7 @@ impl Pager {
             pages_left,
             dismiss,
             is_error,
+            update_last_emitted,
             first_range,
             last_range,
             view_ranges,
@@ -1066,7 +1079,6 @@ impl Pager {
                             "[pager] pattern not found: {}",
                             pattern.pattern
                         ))];
-                        state.search_session = None;
                         CommandOutcome::no_range_keep(contents, pages_left, is_error)
                     }
                 }
@@ -1104,6 +1116,7 @@ impl Pager {
                                 Some(false),
                             )
                             .with_view_ranges(view_ranges)
+                            .without_last_emitted_update()
                         } else {
                             let contents = vec![WorkerContent::stderr(format!(
                                 "[pager] pattern not found: {}",
@@ -1131,6 +1144,7 @@ impl Pager {
                             Some(false),
                         )
                         .with_view_ranges(view_ranges)
+                        .without_last_emitted_update()
                     } else {
                         let contents = vec![WorkerContent::stderr(
                             "[pager] no active search; use `:/PATTERN` or `:matches PATTERN`"
@@ -1339,7 +1353,7 @@ impl Pager {
             for range in view_ranges {
                 state.view_history.push(range);
             }
-            if let Some(last) = last_range {
+            if update_last_emitted && let Some(last) = last_range {
                 state.last_emitted = Some(last);
             }
         }
@@ -2584,6 +2598,40 @@ mod tests {
         assert!(
             next.contains("[pager] search #2/2") && next.contains("beta foo"),
             "expected prior foo search session to survive :matches miss, got: {next}"
+        );
+    }
+
+    #[test]
+    fn slash_search_miss_preserves_active_search_session() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let _ = pager.handle_command(":/foo\n");
+        let miss = text_from_reply(pager.handle_command(":/bar\n"));
+        assert!(
+            miss.contains("[pager] pattern not found: bar"),
+            "expected miss message, got: {miss}"
+        );
+
+        let next = text_from_reply(pager.handle_command(":goto 2\n"));
+        assert!(
+            next.contains("[pager] search #2/2") && next.contains("beta foo"),
+            "expected prior foo search session to survive slash-search miss, got: {next}"
+        );
+    }
+
+    #[test]
+    fn matches_does_not_update_last_emitted_range() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+        pager.state.as_mut().expect("pager active").last_emitted = Some((0, 6));
+
+        let _ = pager.handle_command(":matches foo\n");
+
+        assert_eq!(
+            pager.state.as_ref().expect("pager active").last_emitted,
+            Some((0, 6)),
+            "expected :matches to leave sequential emission marker unchanged"
         );
     }
 }
