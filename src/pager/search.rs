@@ -1,4 +1,3 @@
-use crate::output_capture::OutputEventKind;
 use crate::worker_protocol::{TextStream, WorkerContent};
 
 use super::{
@@ -272,16 +271,9 @@ fn decoded_match_stream(
     line: &str,
     default_stream: TextStream,
 ) -> TextStream {
-    let mut saw_text_event = false;
-    for event in &buffer.events {
-        let OutputEventKind::Text { text, is_stderr } = &event.kind else {
-            continue;
-        };
-        saw_text_event = true;
-        let event_start = event.offset;
-        let event_end = event_start.saturating_add(text.chars().count() as u64);
-        if event_start <= match_start && match_start < event_end {
-            return if *is_stderr {
+    for span in &buffer.text_spans {
+        if span.start <= match_start && match_start < span.end {
+            return if span.is_stderr {
                 TextStream::Stderr
             } else {
                 TextStream::Stdout
@@ -291,11 +283,22 @@ fn decoded_match_stream(
 
     if line.starts_with("stderr: ") {
         TextStream::Stderr
-    } else if saw_text_event {
-        TextStream::Stdout
     } else {
         default_stream
     }
+}
+
+fn prefix_snippet_shows_match(line: &str, match_start_in_line: usize, pattern: &str) -> bool {
+    let trimmed = line.trim_end();
+    if trimmed.len() <= MATCH_LINE_MAX_BYTES {
+        return true;
+    }
+
+    let visible_prefix_bytes = MATCH_LINE_MAX_BYTES.saturating_sub(3);
+    match_start_in_line
+        .saturating_add(pattern.len())
+        .min(trimmed.len())
+        <= visible_prefix_bytes
 }
 
 fn strip_trailing_anchor_link(text: &str) -> &str {
@@ -463,13 +466,17 @@ pub(super) fn take_matches(
         if spec.context == 0 {
             let line = read_line_text(buffer, entry.line_idx);
             let snippet = truncate_with_ellipsis(line.trim_end(), MATCH_LINE_MAX_BYTES);
+            let match_start_in_line =
+                decoded_match_start_in_line(buffer, entry.line_start, entry.match_start);
             output.push_str(&format!(
                 "#{label} @{} {} | {snippet}\n",
                 entry.match_start, entry.breadcrumb
             ));
             let range = (entry.line_start, entry.line_end);
             span.record(Some(range));
-            view_ranges.push(range);
+            if prefix_snippet_shows_match(&line, match_start_in_line, &session.pattern.pattern) {
+                view_ranges.push(range);
+            }
             continue;
         }
 

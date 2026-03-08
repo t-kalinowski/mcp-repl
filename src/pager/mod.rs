@@ -49,6 +49,7 @@ pub(crate) struct PagerBuffer {
     line_ends: Vec<u64>,
     cursor: u64,
     events: Vec<PagerEvent>,
+    text_spans: Vec<PagerTextSpan>,
     source_end: u64,
 }
 
@@ -56,6 +57,13 @@ pub(crate) struct PagerBuffer {
 struct PagerEvent {
     offset: u64,
     kind: OutputEventKind,
+}
+
+#[derive(Debug, Clone)]
+struct PagerTextSpan {
+    start: u64,
+    end: u64,
+    is_stderr: bool,
 }
 
 impl merge::EventView for crate::output_capture::OutputEvent {
@@ -98,6 +106,20 @@ impl PagerBuffer {
                 })
             })
             .collect();
+        let text_spans = range
+            .text_spans
+            .into_iter()
+            .filter_map(|span| {
+                if span.start_byte >= span.end_byte || span.end_byte > bytes.len() {
+                    return None;
+                }
+                Some(PagerTextSpan {
+                    start: char_offset_for_byte_index(&char_to_byte, span.start_byte),
+                    end: char_offset_for_byte_index(&char_to_byte, span.end_byte),
+                    is_stderr: span.is_stderr,
+                })
+            })
+            .collect();
         let line_ends = line_end_offsets(&bytes, &char_to_byte, 0);
         Self {
             bytes,
@@ -105,6 +127,7 @@ impl PagerBuffer {
             line_ends,
             cursor: 0,
             events,
+            text_spans,
             source_end: end_offset,
         }
     }
@@ -121,12 +144,22 @@ impl PagerBuffer {
     ) -> Self {
         let char_to_byte = build_char_index(&bytes);
         let line_ends = line_end_offsets(&bytes, &char_to_byte, 0);
+        let mut text_spans = Vec::new();
         let events = events
             .into_iter()
             .filter_map(|(byte_offset, kind)| {
                 let byte_offset: usize = byte_offset.try_into().unwrap_or(usize::MAX);
                 if byte_offset > bytes.len() {
                     return None;
+                }
+                if let OutputEventKind::Text { text, is_stderr } = &kind {
+                    let start = char_offset_for_byte_index(&char_to_byte, byte_offset);
+                    let end = start.saturating_add(text.chars().count() as u64);
+                    text_spans.push(PagerTextSpan {
+                        start,
+                        end,
+                        is_stderr: *is_stderr,
+                    });
                 }
                 Some(PagerEvent {
                     offset: char_offset_for_byte_index(&char_to_byte, byte_offset),
@@ -140,6 +173,7 @@ impl PagerBuffer {
             line_ends,
             cursor: 0,
             events,
+            text_spans,
             source_end,
         }
     }
@@ -2043,8 +2077,8 @@ fn take_line_range(
 mod tests {
     use super::*;
     use crate::output_capture::{
-        OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEvent, OutputTimeline, ensure_output_ring,
-        reset_output_ring,
+        OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEvent, OutputTextSpan, OutputTimeline,
+        ensure_output_ring, reset_output_ring,
     };
     use crate::worker_protocol::TextStream;
     use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -2074,6 +2108,7 @@ mod tests {
             end_offset: text.len() as u64,
             bytes: text.as_bytes().to_vec(),
             events: Vec::new(),
+            text_spans: Vec::new(),
         };
         let buffer = PagerBuffer::from_range(range);
         let mut pager = Pager::default();
@@ -2087,6 +2122,7 @@ mod tests {
             end_offset: bytes.len() as u64,
             bytes,
             events: Vec::new(),
+            text_spans: Vec::new(),
         };
         let buffer = PagerBuffer::from_range(range);
         let mut pager = Pager::default();
@@ -2132,6 +2168,7 @@ mod tests {
             end_offset: bytes.len() as u64,
             bytes,
             events: Vec::new(),
+            text_spans: Vec::new(),
         };
         let buffer = PagerBuffer::from_range(range);
 
@@ -2152,6 +2189,7 @@ mod tests {
             end_offset: bytes.len() as u64,
             bytes,
             events: Vec::new(),
+            text_spans: Vec::new(),
         };
         let buffer = PagerBuffer::from_range(range);
         let mut seen = RangeSet::default();
@@ -2244,6 +2282,7 @@ mod tests {
             end_offset: bytes.len() as u64,
             bytes,
             events,
+            text_spans: Vec::new(),
         };
         let buffer = PagerBuffer::from_range(range);
 
@@ -2260,6 +2299,7 @@ mod tests {
             end_offset: 0,
             bytes: Vec::new(),
             events: Vec::new(),
+            text_spans: Vec::new(),
         };
         let buffer = PagerBuffer::from_range(range);
         let mut pager = Pager::default();
@@ -2304,6 +2344,7 @@ mod tests {
             end_offset: 0,
             bytes: Vec::new(),
             events: Vec::new(),
+            text_spans: Vec::new(),
         };
         let buffer = PagerBuffer::from_range(range);
         let mut pager = Pager::default();
@@ -2377,6 +2418,7 @@ mod tests {
             end_offset: bytes.len() as u64,
             bytes,
             events: Vec::new(),
+            text_spans: Vec::new(),
         };
         let buffer = PagerBuffer::from_range(range);
 
@@ -3159,29 +3201,32 @@ mod tests {
     fn compact_search_cards_keep_stdout_in_mixed_stream_sessions() {
         let text = "stderr: warning one\nalpha foo\nstderr: warning two\n";
         let bytes = text.as_bytes().to_vec();
-        let stderr_one = "stderr: warning one\n";
-        let stdout_line = "alpha foo\n";
-        let stderr_two_offset = (stderr_one.len() + stdout_line.len()) as u64;
-        let buffer = PagerBuffer::from_bytes_and_events(
-            bytes.clone(),
-            vec![
-                (
-                    0,
-                    OutputEventKind::Text {
-                        text: stderr_one.to_string(),
-                        is_stderr: true,
-                    },
-                ),
-                (
-                    stderr_two_offset,
-                    OutputEventKind::Text {
-                        text: "stderr: warning two\n".to_string(),
-                        is_stderr: true,
-                    },
-                ),
+        let stderr_one = "stderr: warning one\n".len();
+        let stdout_line = "alpha foo\n".len();
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: bytes.len() as u64,
+            bytes,
+            events: Vec::new(),
+            text_spans: vec![
+                OutputTextSpan {
+                    start_byte: 0,
+                    end_byte: stderr_one,
+                    is_stderr: true,
+                },
+                OutputTextSpan {
+                    start_byte: stderr_one,
+                    end_byte: stderr_one + stdout_line,
+                    is_stderr: false,
+                },
+                OutputTextSpan {
+                    start_byte: stderr_one + stdout_line,
+                    end_byte: text.len(),
+                    is_stderr: true,
+                },
             ],
-            bytes.len() as u64,
-        );
+        };
+        let buffer = PagerBuffer::from_range(range);
         let mut pager = Pager::default();
         pager.activate(buffer, true);
 
@@ -3199,6 +3244,25 @@ mod tests {
             matches!(stream, TextStream::Stdout),
             "expected compact search body to preserve stdout stream for stdout lines, got: {:?}",
             stream
+        );
+    }
+
+    #[test]
+    fn matches_without_context_does_not_mark_hidden_long_line_match_as_shown() {
+        let long_prefix = "x".repeat(MATCH_LINE_MAX_BYTES);
+        let text = format!("{long_prefix}foo trailing text\nbeta foo\n");
+        let mut pager = activate_pager_with_text(&text);
+
+        let listed = text_from_reply(pager.handle_command(":matches foo\n"));
+        assert!(
+            listed.contains("#1 @"),
+            "expected long-line match to appear in list output, got: {listed}"
+        );
+
+        let first = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            !first.contains("[pager] shown earlier @"),
+            "expected truncated :matches row not to mark hidden long-line match as shown, got: {first}"
         );
     }
 
