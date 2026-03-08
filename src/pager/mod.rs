@@ -1186,7 +1186,6 @@ impl Pager {
                             .search_session
                             .as_mut()
                             .expect("search session missing");
-                        let _ = goto_search_hit(session, 1);
                         let (contents, span, view_ranges) =
                             take_matches(&state.buffer, &spec, session);
                         CommandOutcome::new(
@@ -3154,6 +3153,91 @@ mod tests {
         );
 
         drop(guard);
+    }
+
+    #[test]
+    fn compact_search_cards_keep_stdout_in_mixed_stream_sessions() {
+        let text = "stderr: warning one\nalpha foo\nstderr: warning two\n";
+        let bytes = text.as_bytes().to_vec();
+        let stderr_one = "stderr: warning one\n";
+        let stdout_line = "alpha foo\n";
+        let stderr_two_offset = (stderr_one.len() + stdout_line.len()) as u64;
+        let buffer = PagerBuffer::from_bytes_and_events(
+            bytes.clone(),
+            vec![
+                (
+                    0,
+                    OutputEventKind::Text {
+                        text: stderr_one.to_string(),
+                        is_stderr: true,
+                    },
+                ),
+                (
+                    stderr_two_offset,
+                    OutputEventKind::Text {
+                        text: "stderr: warning two\n".to_string(),
+                        is_stderr: true,
+                    },
+                ),
+            ],
+            bytes.len() as u64,
+        );
+        let mut pager = Pager::default();
+        pager.activate(buffer, true);
+
+        let WorkerReply::Output { contents, .. } = pager.handle_command(":/foo\n");
+        let stream = contents
+            .iter()
+            .find_map(|content| match content {
+                WorkerContent::ContentText { text, stream } if text.contains("alpha foo") => {
+                    Some(*stream)
+                }
+                _ => None,
+            })
+            .expect("expected compact search body in reply");
+        assert!(
+            matches!(stream, TextStream::Stdout),
+            "expected compact search body to preserve stdout stream for stdout lines, got: {:?}",
+            stream
+        );
+    }
+
+    #[test]
+    fn bare_matches_keeps_active_search_position() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\ngamma foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let _ = pager.handle_command(":/foo\n");
+        let _ = pager.handle_command(":n\n");
+        let current_index = pager
+            .state
+            .as_ref()
+            .and_then(|state| state.search_session.as_ref())
+            .map(|session| session.current_index)
+            .expect("search session after navigation");
+
+        let listed = text_from_reply(pager.handle_command(":matches\n"));
+        assert!(
+            listed.contains("#1 @") && listed.contains("#2 @") && listed.contains("#3 @"),
+            "expected bare :matches to list the active search session, got: {listed}"
+        );
+
+        let current_after = pager
+            .state
+            .as_ref()
+            .and_then(|state| state.search_session.as_ref())
+            .map(|session| session.current_index)
+            .expect("search session after listing");
+        assert_eq!(
+            current_after, current_index,
+            "expected bare :matches to leave the active search position unchanged"
+        );
+
+        let next = text_from_reply(pager.handle_command(":n\n"));
+        assert!(
+            next.contains("gamma foo"),
+            "expected search navigation to continue from the previously active hit, got: {next}"
+        );
     }
 
     #[test]

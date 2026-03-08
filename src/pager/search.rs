@@ -266,24 +266,32 @@ fn decoded_match_start_in_line(buffer: &PagerBuffer, line_start: u64, match_star
     String::from_utf8_lossy(&buffer.bytes[line_start_byte..match_start_byte]).len()
 }
 
-fn decoded_line_stream(
+fn decoded_match_stream(
     buffer: &PagerBuffer,
-    line_start: u64,
-    line_end: u64,
+    match_start: u64,
+    line: &str,
     default_stream: TextStream,
 ) -> TextStream {
-    let mut saw_stdout = false;
-    for event in buffer.events_in_byte_offsets(line_start, line_end) {
-        let OutputEventKind::Text { is_stderr, .. } = event.kind else {
+    let mut saw_text_event = false;
+    for event in &buffer.events {
+        let OutputEventKind::Text { text, is_stderr } = &event.kind else {
             continue;
         };
-        if is_stderr {
-            return TextStream::Stderr;
+        saw_text_event = true;
+        let event_start = event.offset;
+        let event_end = event_start.saturating_add(text.chars().count() as u64);
+        if event_start <= match_start && match_start < event_end {
+            return if *is_stderr {
+                TextStream::Stderr
+            } else {
+                TextStream::Stdout
+            };
         }
-        saw_stdout = true;
     }
 
-    if saw_stdout {
+    if line.starts_with("stderr: ") {
+        TextStream::Stderr
+    } else if saw_text_event {
         TextStream::Stdout
     } else {
         default_stream
@@ -871,7 +879,7 @@ pub(super) fn render_search_card(
     } else {
         format!("{}\n> {snippet}\n", hit.breadcrumb)
     };
-    let stream = decoded_line_stream(buffer, hit.line_start, hit.line_end, default_stream);
+    let stream = decoded_match_stream(buffer, hit.match_start, &line, default_stream);
     contents.push(WorkerContent::ContentText { text: body, stream });
     let current_offset = buffer.current_offset();
     let match_char_len = session.pattern.pattern.chars().count().max(1) as u64;
