@@ -947,12 +947,13 @@ impl Pager {
         let Some(_anchor) = current_search_anchor(existing) else {
             return false;
         };
-        state.search_session = if session_max_indexed_hits(existing).is_some() {
-            Self::rebuild_search_session(&state.buffer, existing)
-        } else {
-            let pattern = existing.pattern.clone();
-            build_full_search_session(&state.buffer, &pattern, existing.anchor_offset)
-        };
+        state.search_session =
+            if session_max_indexed_hits(existing) == Some(MAX_MATCH_LIMIT.saturating_add(1)) {
+                Self::rebuild_search_session(&state.buffer, existing)
+            } else {
+                let pattern = existing.pattern.clone();
+                build_full_search_session(&state.buffer, &pattern, existing.anchor_offset)
+            };
         state.search_session.is_some()
     }
 
@@ -1079,13 +1080,38 @@ impl Pager {
                             range,
                             Some(false),
                         )
-                    } else {
-                        let _ = Self::ensure_search_session_from_pattern(
-                            state,
-                            &pattern,
-                            state.buffer.current_offset(),
-                            true,
+                    } else if Self::ensure_search_session_from_pattern(
+                        state,
+                        &pattern,
+                        state.buffer.current_offset(),
+                        true,
+                    ) {
+                        let session = state
+                            .search_session
+                            .as_mut()
+                            .expect("search session missing after full rebuild");
+                        let moved = move_search_session(session, 1, false);
+                        debug_assert_eq!(
+                            moved,
+                            SearchStepOutcome::Moved,
+                            "full search session should have an earlier hit after a forward miss"
                         );
+                        let (contents, range) =
+                            render_search_card(&state.buffer, session, &state.view_history);
+                        if let Some((_, end)) = range {
+                            state.buffer.advance_offset_to(end);
+                        }
+                        let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
+                        CommandOutcome::new(
+                            contents,
+                            pages_left,
+                            is_error,
+                            true,
+                            range,
+                            range,
+                            Some(false),
+                        )
+                    } else {
                         let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                         let contents = vec![WorkerContent::stderr(format!(
                             "[pager] pattern not found: {}",
@@ -2403,7 +2429,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_search_past_last_hit_does_not_wrap_to_first_hit() {
+    fn slash_search_past_last_hit_jumps_to_last_earlier_hit() {
         let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
         let mut pager = activate_pager_with_text(text);
         pager
@@ -2416,8 +2442,8 @@ mod tests {
         let found = text_from_reply(pager.handle_command(":/foo\n"));
 
         assert!(
-            found.contains("[pager] pattern not found: foo"),
-            "expected forward-only miss past final hit, got: {found}"
+            found.contains("[pager] search #2/2") && found.contains("beta foo"),
+            "expected slash search to fall back to the nearest earlier hit, got: {found}"
         );
         assert!(
             !found.contains("[pager] search #1/"),
@@ -2439,8 +2465,8 @@ mod tests {
 
         let miss = text_from_reply(pager.handle_command(":/foo\n"));
         assert!(
-            miss.contains("[pager] pattern not found: foo"),
-            "expected forward miss message, got: {miss}"
+            miss.contains("[pager] search #2/2") && miss.contains("beta foo"),
+            "expected slash search to land on the nearest earlier hit, got: {miss}"
         );
 
         let next = text_from_reply(pager.handle_command(":n\n"));
@@ -2451,8 +2477,8 @@ mod tests {
 
         let previous = text_from_reply(pager.handle_command(":p\n"));
         assert!(
-            previous.contains("beta foo"),
-            "expected :p to recover the last hit after the miss, got: {previous}"
+            previous.contains("alpha foo"),
+            "expected :p to move backward from the recovered hit, got: {previous}"
         );
 
         let listed = text_from_reply(pager.handle_command(":matches\n"));
@@ -2485,6 +2511,26 @@ mod tests {
             MAX_MATCH_LIMIT + 1,
             "expected bounded search session, got {} hits",
             session.hits.len()
+        );
+    }
+
+    #[test]
+    fn default_matches_session_completes_before_goto() {
+        let text = (0..80)
+            .map(|idx| format!("foo line {idx}\n"))
+            .collect::<String>();
+        let mut pager = activate_pager_with_text(&text);
+
+        let listed = text_from_reply(pager.handle_command(":matches foo\n"));
+        assert!(
+            listed.contains("[pager] matches: 50 shown (limit 50), more available"),
+            "expected default limited match listing, got: {listed}"
+        );
+
+        let jumped = text_from_reply(pager.handle_command(":goto 60\n"));
+        assert!(
+            jumped.contains("[pager] search #60/80") && jumped.contains("foo line 59"),
+            "expected goto to rebuild a full search session, got: {jumped}"
         );
     }
 
@@ -2535,14 +2581,8 @@ mod tests {
 
         let miss = text_from_reply(pager.handle_command(":/foo\n"));
         assert!(
-            miss.contains("[pager] pattern not found: foo"),
-            "expected miss message after moving past the same-line hit, got: {miss}"
-        );
-
-        let previous = text_from_reply(pager.handle_command(":p\n"));
-        assert!(
-            previous.contains("alpha foo suffix"),
-            "expected :p to recover the earlier same-line hit, got: {previous}"
+            miss.contains("[pager] search #1/1") && miss.contains("alpha foo suffix"),
+            "expected slash search to recover the earlier same-line hit, got: {miss}"
         );
     }
 
@@ -2560,8 +2600,14 @@ mod tests {
 
         let miss = text_from_reply(fixture.pager.handle_command(":/foo\n"));
         assert!(
-            miss.contains("[pager] pattern not found: foo"),
-            "expected forward miss message, got: {miss}"
+            miss.contains("[pager] search #2/2") && miss.contains("beta foo"),
+            "expected slash search to recover the last earlier hit, got: {miss}"
+        );
+
+        let boundary = text_from_reply(fixture.pager.handle_command(":n\n"));
+        assert!(
+            boundary.contains("[pager] already at the last search hit #2/2 for `foo`"),
+            "expected :n to move to the past-end boundary before refresh, got: {boundary}"
         );
 
         fixture.timeline.append_text(b"gamma foo\n", false);
