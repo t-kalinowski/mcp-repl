@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use memchr::{memchr, memchr_iter, memchr2, memmem};
 
 use crate::output_capture::{OutputBuffer, OutputEventKind, OutputRange};
-use crate::worker_protocol::{WorkerContent, WorkerErrorCode, WorkerReply};
+use crate::worker_protocol::{TextStream, WorkerContent, WorkerErrorCode, WorkerReply};
 
 mod command;
 mod merge;
@@ -1062,8 +1062,16 @@ impl Pager {
                             .search_session
                             .as_ref()
                             .expect("search session missing after build");
-                        let (contents, range, resume_offset) =
-                            render_search_card(&state.buffer, session, &state.view_history);
+                        let (contents, range, resume_offset) = render_search_card(
+                            &state.buffer,
+                            session,
+                            &state.view_history,
+                            if state.is_error {
+                                TextStream::Stderr
+                            } else {
+                                TextStream::Stdout
+                            },
+                        );
                         if let Some(offset) = resume_offset {
                             state.buffer.advance_offset_to(offset);
                         }
@@ -1077,6 +1085,7 @@ impl Pager {
                             range,
                             Some(false),
                         )
+                        .without_last_emitted_update()
                     } else if Self::ensure_search_session_from_pattern(
                         state,
                         &pattern,
@@ -1093,8 +1102,16 @@ impl Pager {
                             SearchStepOutcome::Moved,
                             "full search session should have an earlier hit after a forward miss"
                         );
-                        let (contents, range, resume_offset) =
-                            render_search_card(&state.buffer, session, &state.view_history);
+                        let (contents, range, resume_offset) = render_search_card(
+                            &state.buffer,
+                            session,
+                            &state.view_history,
+                            if state.is_error {
+                                TextStream::Stderr
+                            } else {
+                                TextStream::Stdout
+                            },
+                        );
                         if let Some(offset) = resume_offset {
                             state.buffer.advance_offset_to(offset);
                         }
@@ -1108,6 +1125,7 @@ impl Pager {
                             range,
                             Some(false),
                         )
+                        .without_last_emitted_update()
                     } else {
                         state.search_session = None;
                         let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
@@ -1220,8 +1238,16 @@ impl Pager {
                             let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                             CommandOutcome::no_range_keep(contents, pages_left, is_error)
                         } else {
-                            let (contents, range, resume_offset) =
-                                render_search_card(&state.buffer, session, &state.view_history);
+                            let (contents, range, resume_offset) = render_search_card(
+                                &state.buffer,
+                                session,
+                                &state.view_history,
+                                if state.is_error {
+                                    TextStream::Stderr
+                                } else {
+                                    TextStream::Stdout
+                                },
+                            );
                             if let Some(offset) = resume_offset {
                                 state.buffer.advance_offset_to(offset);
                             }
@@ -1235,6 +1261,7 @@ impl Pager {
                                 range,
                                 Some(false),
                             )
+                            .without_last_emitted_update()
                         }
                     } else {
                         let (contents, pages_left, span) = take_next_pages(
@@ -1264,8 +1291,16 @@ impl Pager {
                             let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                             CommandOutcome::no_range_keep(contents, pages_left, is_error)
                         } else {
-                            let (contents, range, resume_offset) =
-                                render_search_card(&state.buffer, session, &state.view_history);
+                            let (contents, range, resume_offset) = render_search_card(
+                                &state.buffer,
+                                session,
+                                &state.view_history,
+                                if state.is_error {
+                                    TextStream::Stderr
+                                } else {
+                                    TextStream::Stdout
+                                },
+                            );
                             if let Some(offset) = resume_offset {
                                 state.buffer.advance_offset_to(offset);
                             }
@@ -1279,6 +1314,7 @@ impl Pager {
                                 range,
                                 Some(false),
                             )
+                            .without_last_emitted_update()
                         }
                     } else {
                         let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
@@ -1297,8 +1333,16 @@ impl Pager {
                             .as_mut()
                             .expect("search session missing after refresh");
                         if goto_search_hit(session, index) {
-                            let (contents, range, resume_offset) =
-                                render_search_card(&state.buffer, session, &state.view_history);
+                            let (contents, range, resume_offset) = render_search_card(
+                                &state.buffer,
+                                session,
+                                &state.view_history,
+                                if state.is_error {
+                                    TextStream::Stderr
+                                } else {
+                                    TextStream::Stdout
+                                },
+                            );
                             if let Some(offset) = resume_offset {
                                 state.buffer.advance_offset_to(offset);
                             }
@@ -1312,6 +1356,7 @@ impl Pager {
                                 range,
                                 Some(false),
                             )
+                            .without_last_emitted_update()
                         } else {
                             let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                             let contents = vec![WorkerContent::stderr(format!(
@@ -3051,6 +3096,64 @@ mod tests {
             Some((0, 6)),
             "expected :matches to leave sequential emission marker unchanged"
         );
+    }
+
+    #[test]
+    fn compact_search_cards_do_not_update_last_emitted_range() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+        pager.state.as_mut().expect("pager active").last_emitted = Some((0, 6));
+
+        let _ = pager.handle_command(":/foo\n");
+        assert_eq!(
+            pager.state.as_ref().expect("pager active").last_emitted,
+            Some((0, 6)),
+            "expected slash-search card to leave sequential emission marker unchanged"
+        );
+
+        let _ = pager.handle_command(":n\n");
+        assert_eq!(
+            pager.state.as_ref().expect("pager active").last_emitted,
+            Some((0, 6)),
+            "expected search-navigation cards to leave sequential emission marker unchanged"
+        );
+    }
+
+    #[test]
+    fn compact_search_cards_preserve_original_stream() {
+        let guard = output_ring_test_guard();
+        reset_output_ring();
+        let ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        let timeline = OutputTimeline::new(ring);
+        let output = OutputBuffer::default();
+        output.start_capture();
+        timeline.append_text(b"warning foo details\n", true);
+        let end_offset = output.end_offset().expect("output end offset");
+        let range = output.read_range(0, end_offset);
+        output.advance_offset_to(end_offset);
+        let buffer = PagerBuffer::from_range(range);
+        let mut pager = Pager::default();
+        pager.activate(buffer, true);
+
+        let WorkerReply::Output { contents, .. } = pager.handle_command(":/foo\n");
+        let body = contents
+            .iter()
+            .find_map(|content| match content {
+                WorkerContent::ContentText { text, stream }
+                    if text.contains("warning foo details") =>
+                {
+                    Some((*stream, text.as_str()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected compact search body in reply: {:?}", contents));
+        assert!(
+            matches!(body.0, TextStream::Stderr),
+            "expected compact search body to preserve stderr stream, got: {:?}",
+            body.0
+        );
+
+        drop(guard);
     }
 
     #[test]

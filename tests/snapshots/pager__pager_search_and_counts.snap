@@ -75,7 +75,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] elided output (already shown): @20796..21000"
+      "text": "[pager] elided output (already shown): @210..21000"
     },
     {
       "type": "text",
@@ -105,6 +105,10 @@ response:
   "type": "tool_result",
   "is_error": false,
   "content": [
+    {
+      "type": "text",
+      "text": "[pager] elided output (already shown): @210..21000"
+    },
     {
       "type": "text",
       "text": "line0101 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"

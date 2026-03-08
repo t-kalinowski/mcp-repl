@@ -1,4 +1,5 @@
-use crate::worker_protocol::WorkerContent;
+use crate::output_capture::OutputEventKind;
+use crate::worker_protocol::{TextStream, WorkerContent};
 
 use super::{
     MATCH_BREADCRUMB_MAX_BYTES, MATCH_LINE_MAX_BYTES, MAX_MATCH_LIMIT, MatchSpec, PagerBuffer,
@@ -263,6 +264,30 @@ fn decoded_match_start_in_line(buffer: &PagerBuffer, line_start: u64, match_star
     let line_start_byte = buffer.byte_index_for_char_offset(line_start);
     let match_start_byte = buffer.byte_index_for_char_offset(match_start);
     String::from_utf8_lossy(&buffer.bytes[line_start_byte..match_start_byte]).len()
+}
+
+fn decoded_line_stream(
+    buffer: &PagerBuffer,
+    line_start: u64,
+    line_end: u64,
+    default_stream: TextStream,
+) -> TextStream {
+    let mut saw_stdout = false;
+    for event in buffer.events_in_byte_offsets(line_start, line_end) {
+        let OutputEventKind::Text { is_stderr, .. } = event.kind else {
+            continue;
+        };
+        if is_stderr {
+            return TextStream::Stderr;
+        }
+        saw_stdout = true;
+    }
+
+    if saw_stdout {
+        TextStream::Stdout
+    } else {
+        default_stream
+    }
 }
 
 fn strip_trailing_anchor_link(text: &str) -> &str {
@@ -799,6 +824,7 @@ pub(super) fn render_search_card(
     buffer: &PagerBuffer,
     session: &SearchSession,
     view_history: &[(u64, u64)],
+    default_stream: TextStream,
 ) -> (Vec<WorkerContent>, Option<(u64, u64)>, Option<u64>) {
     let Some(hit) = session.hits.get(session.current_index) else {
         return (
@@ -845,7 +871,8 @@ pub(super) fn render_search_card(
     } else {
         format!("{}\n> {snippet}\n", hit.breadcrumb)
     };
-    contents.push(WorkerContent::stdout(body));
+    let stream = decoded_line_stream(buffer, hit.line_start, hit.line_end, default_stream);
+    contents.push(WorkerContent::ContentText { text: body, stream });
     let current_offset = buffer.current_offset();
     let match_char_len = session.pattern.pattern.chars().count().max(1) as u64;
     let match_end = hit
