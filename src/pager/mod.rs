@@ -954,23 +954,42 @@ impl Pager {
         build_bounded_search_session(buffer, pattern, 0, needed_hits)
     }
 
+    fn search_session_covers_cursor(session: &SearchSession, cursor: u64) -> bool {
+        session
+            .hits
+            .get(session.current_index)
+            .is_some_and(|hit| hit.line_start <= cursor && cursor < hit.line_end)
+    }
+
     fn rebuild_search_session(
         buffer: &PagerBuffer,
         existing: &SearchSession,
+        start_offset: u64,
+        preserve_boundary: bool,
     ) -> Option<SearchSession> {
-        let anchor = existing.anchor_offset;
         let pattern = existing.pattern.clone();
         let mut session = if let Some(limit) = session_max_indexed_hits(existing) {
             let rebuilt_limit = existing.hits.len().max(limit);
-            build_bounded_search_session(buffer, &pattern, anchor, rebuilt_limit)
+            build_bounded_search_session(buffer, &pattern, start_offset, rebuilt_limit)
         } else if session_is_complete(existing) || session_is_indexed_from_start(existing) {
-            build_full_search_session(buffer, &pattern, anchor)
+            build_full_search_session(buffer, &pattern, start_offset)
         } else {
-            build_forward_search_session(buffer, &pattern, anchor)
+            build_forward_search_session(buffer, &pattern, start_offset)
         }?;
-        if existing.current_index >= existing.hits.len() {
+        if preserve_boundary && existing.current_index >= existing.hits.len() {
             session.current_index = session.hits.len();
         }
+        Some(session)
+    }
+
+    fn reseed_search_session(
+        buffer: &PagerBuffer,
+        existing: &SearchSession,
+        start_offset: u64,
+    ) -> Option<SearchSession> {
+        let mut session = build_full_search_session(buffer, &existing.pattern, start_offset)?;
+        session.anchor_offset = start_offset;
+        session.current_index = session.hits.len();
         Some(session)
     }
 
@@ -979,10 +998,16 @@ impl Pager {
             return false;
         };
         let buffer_len = state.buffer.len();
-        if existing.buffer_len == buffer_len {
+        let cursor = state.buffer.current_offset();
+        let cursor_aligned = Self::search_session_covers_cursor(existing, cursor);
+        if existing.buffer_len == buffer_len && cursor_aligned {
             return true;
         }
-        state.search_session = Self::rebuild_search_session(&state.buffer, existing);
+        state.search_session = if cursor_aligned {
+            Self::rebuild_search_session(&state.buffer, existing, existing.anchor_offset, true)
+        } else {
+            Self::reseed_search_session(&state.buffer, existing, cursor)
+        };
         state.search_session.is_some()
     }
 
@@ -2495,6 +2520,36 @@ mod tests {
         assert!(
             found.contains("manual-target-token"),
             "expected to find token after seek, got: {found}"
+        );
+    }
+
+    #[test]
+    fn search_next_reseeds_after_seek_moves_cursor() {
+        let text = (0..4000)
+            .map(|i| match i {
+                0 => "foo early\n".to_string(),
+                1000 => "foo middle\n".to_string(),
+                3900 => "foo late\n".to_string(),
+                _ => format!("line-{i:04}\n"),
+            })
+            .collect::<String>();
+        let mut pager = activate_pager_with_text(&text);
+
+        let first = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            first.contains("foo early"),
+            "expected initial search to land on the first hit, got: {first}"
+        );
+
+        let _ = pager.handle_command(":seek 80%\n");
+        let next = text_from_reply(pager.handle_command(":n\n"));
+        assert!(
+            next.contains("foo late"),
+            "expected :n to continue from the seek position, got: {next}"
+        );
+        assert!(
+            !next.contains("foo middle"),
+            "expected :n not to jump back to a stale earlier hit, got: {next}"
         );
     }
 
