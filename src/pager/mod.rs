@@ -683,6 +683,7 @@ struct PagerState {
     image_numbers: HashMap<String, u64>,
     next_image_number: u64,
     search_session: Option<SearchSession>,
+    search_session_needs_reseed: bool,
     view_history: Vec<(u64, u64)>,
 }
 
@@ -857,6 +858,7 @@ impl Pager {
             image_numbers: HashMap::new(),
             next_image_number: 1,
             search_session: None,
+            search_session_needs_reseed: false,
             view_history: Vec::new(),
         });
     }
@@ -954,13 +956,6 @@ impl Pager {
         build_bounded_search_session(buffer, pattern, 0, needed_hits)
     }
 
-    fn search_session_covers_cursor(session: &SearchSession, cursor: u64) -> bool {
-        session
-            .hits
-            .get(session.current_index)
-            .is_some_and(|hit| hit.line_start <= cursor && cursor < hit.line_end)
-    }
-
     fn rebuild_search_session(
         buffer: &PagerBuffer,
         existing: &SearchSession,
@@ -994,20 +989,19 @@ impl Pager {
     }
 
     fn ensure_search_session_fresh(state: &mut PagerState) -> bool {
-        let Some(existing) = state.search_session.as_ref() else {
+        let Some(existing) = state.search_session.as_ref().cloned() else {
             return false;
         };
         let buffer_len = state.buffer.len();
-        let cursor = state.buffer.current_offset();
-        let cursor_aligned = Self::search_session_covers_cursor(existing, cursor);
-        if existing.buffer_len == buffer_len && cursor_aligned {
+        if existing.buffer_len == buffer_len && !state.search_session_needs_reseed {
             return true;
         }
-        state.search_session = if cursor_aligned {
-            Self::rebuild_search_session(&state.buffer, existing, existing.anchor_offset, true)
+        state.search_session = if state.search_session_needs_reseed {
+            Self::reseed_search_session(&state.buffer, &existing, state.buffer.current_offset())
         } else {
-            Self::reseed_search_session(&state.buffer, existing, cursor)
+            Self::rebuild_search_session(&state.buffer, &existing, existing.anchor_offset, true)
         };
+        state.search_session_needs_reseed = false;
         state.search_session.is_some()
     }
 
@@ -1070,6 +1064,20 @@ impl Pager {
                 | PagerCommand::Seek { .. }
                 | PagerCommand::Help
         );
+        let command_keeps_search_anchor = matches!(
+            &command,
+            PagerCommand::Search { .. }
+                | PagerCommand::Matches { .. }
+                | PagerCommand::SearchNext { .. }
+                | PagerCommand::SearchPrev { .. }
+                | PagerCommand::Goto { .. }
+        );
+        let cursor_before = self
+            .state
+            .as_ref()
+            .expect("pager state disappeared")
+            .buffer
+            .current_offset();
 
         let CommandOutcome {
             mut contents,
@@ -1503,6 +1511,12 @@ impl Pager {
 
         self.dedupe_images(&mut contents);
         if let Some(state) = self.state.as_mut() {
+            let cursor_after = state.buffer.current_offset();
+            if state.search_session.is_none() || command_keeps_search_anchor {
+                state.search_session_needs_reseed = false;
+            } else if cursor_after != cursor_before {
+                state.search_session_needs_reseed = true;
+            }
             if let Some(marker) = gap_marker_if_needed(state.last_emitted, first_range) {
                 contents.insert(0, marker);
             }
@@ -3044,6 +3058,56 @@ mod tests {
         assert!(
             next.contains("[pager] search #2/3"),
             "expected navigation to align with list numbering, got: {next}"
+        );
+    }
+
+    #[test]
+    fn explicit_matches_keeps_first_selected_hit_active_for_next() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega foo\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let listed = text_from_reply(pager.handle_command(":matches foo\n"));
+        assert!(
+            listed.contains("#1 @12") && listed.contains("#2 @28") && listed.contains("#3 @38"),
+            "expected full numbered list, got: {listed}"
+        );
+
+        let next = text_from_reply(pager.handle_command(":n\n"));
+        assert!(
+            next.contains("beta foo"),
+            "expected :n to advance from selected hit #1 to #2, got: {next}"
+        );
+        assert!(
+            !next.contains("alpha foo"),
+            "expected :n not to redisplay hit #1 after :matches, got: {next}"
+        );
+    }
+
+    #[test]
+    fn explicit_matches_keeps_first_selected_hit_active_for_prev_boundary() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega foo\n";
+        let mut pager = activate_pager_with_text(text);
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(text.len() as u64);
+
+        let listed = text_from_reply(pager.handle_command(":matches foo\n"));
+        assert!(
+            listed.contains("#1 @12") && listed.contains("#2 @28") && listed.contains("#3 @38"),
+            "expected full numbered list, got: {listed}"
+        );
+
+        let prev = text_from_reply(pager.handle_command(":p\n"));
+        assert!(
+            prev.contains("already at the first"),
+            "expected :p to report the first-hit boundary after :matches, got: {prev}"
+        );
+        assert!(
+            !prev.contains("omega foo"),
+            "expected :p not to jump to the last hit from the old pager cursor, got: {prev}"
         );
     }
 
