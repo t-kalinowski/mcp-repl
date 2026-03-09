@@ -110,9 +110,13 @@ fn all_matches_shown_message(pattern: &str) -> String {
     )
 }
 
+fn plain_pattern_not_found_message(pattern: &str) -> String {
+    format!("[pager] pattern not found: {pattern}")
+}
+
 fn pattern_not_found_message(pattern: &str, start_offset: u64) -> String {
     if start_offset == 0 {
-        format!("[pager] pattern not found: {pattern}")
+        plain_pattern_not_found_message(pattern)
     } else {
         format!(
             "[pager] pattern not found (search is forward-only over unseen output; use `:matches -n all {pattern}` to locate offsets, then `:seek @OFFSET` to jump)"
@@ -186,7 +190,7 @@ pub(super) fn where_in_buffer(
     };
 
     let Some(session) = build_full_search_session(buffer, pattern, start_offset) else {
-        return pattern_not_found_message(&pattern.pattern, start_offset);
+        return plain_pattern_not_found_message(&pattern.pattern);
     };
 
     let Some(line_start) = session
@@ -195,7 +199,7 @@ pub(super) fn where_in_buffer(
         .map(|hit| hit.line_start)
     else {
         let Some(hit) = session.hits.last() else {
-            return pattern_not_found_message(&pattern.pattern, start_offset);
+            return plain_pattern_not_found_message(&pattern.pattern);
         };
         return format!(
             "[pager] no later match; nearest earlier match is behind the cursor @{}: use {search_cmd}",
@@ -559,8 +563,8 @@ pub(super) fn take_matches(
 
 fn clean_breadcrumb(breadcrumb: &str) -> String {
     breadcrumb
-        .replace("[¶]", "")
         .replace("[¶]()", "")
+        .replace("[¶]", "")
         .trim()
         .to_string()
 }
@@ -1203,4 +1207,47 @@ fn take_next_hit(
         last_range,
         view_ranges,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn buffer_from_text(text: &str) -> PagerBuffer {
+        PagerBuffer::from_bytes_and_events(
+            text.as_bytes().to_vec(),
+            Vec::new(),
+            Vec::new(),
+            text.len() as u64,
+        )
+    }
+
+    #[test]
+    fn where_miss_after_cursor_advance_drops_forward_only_hint() {
+        let mut buffer = buffer_from_text("alpha\nbeta\n");
+        buffer.advance_offset_to(3);
+        let pattern = SearchPattern {
+            pattern: "missing".to_string(),
+            case_insensitive_ascii: false,
+        };
+
+        let message = where_in_buffer(&buffer, 80, &pattern);
+
+        assert_eq!(message, "[pager] pattern not found: missing");
+        assert!(
+            !message.contains("forward-only") && !message.contains(":matches -n all"),
+            "expected :where miss guidance to match slash-search behavior, got: {message}"
+        );
+    }
+
+    #[test]
+    fn clean_breadcrumb_removes_empty_anchor_links_without_stray_parentheses() {
+        let cleaned = clean_breadcrumb("Manual [¶]()");
+
+        assert_eq!(cleaned, "Manual");
+        assert!(
+            !cleaned.contains("()"),
+            "expected empty anchor breadcrumbs to be removed cleanly, got: {cleaned}"
+        );
+    }
 }
