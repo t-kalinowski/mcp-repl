@@ -1221,6 +1221,7 @@ impl Pager {
                     let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                     let contents = vec![WorkerContent::stderr(where_in_buffer(
                         &state.buffer,
+                        &state.seen_ranges,
                         page_bytes,
                         &pattern,
                     ))];
@@ -2715,6 +2716,31 @@ mod tests {
     }
 
     #[test]
+    fn where_counts_skip_distance_over_unseen_pages_only() {
+        let leading = "a".repeat(3400);
+        let text = format!("{leading}\nfoo here\nomega\n");
+        let mut pager = activate_pager_with_text(&text);
+        let seen_end = leading.len() as u64 + 1;
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .seen_ranges
+            .insert(0, seen_end);
+
+        let reply = text_from_reply(pager.handle_command(":where foo\n"));
+
+        assert!(
+            reply.contains("match is on the current/next page"),
+            "expected :where to ignore already-seen pages when suggesting :skip, got: {reply}"
+        );
+        assert!(
+            !reply.contains(":skip 1"),
+            "expected :where not to suggest skipping past a match hidden only by seen ranges, got: {reply}"
+        );
+    }
+
+    #[test]
     fn matches_all_keeps_search_session_bounded_to_limit_plus_probe() {
         let text = (0..(MAX_MATCH_LIMIT + 25))
             .map(|idx| format!("foo line {idx}\n"))
@@ -3638,6 +3664,70 @@ mod tests {
             matches!(stream, TextStream::Stdout),
             "expected compact search body to preserve stdout stream after refresh, got: {:?}",
             stream
+        );
+    }
+
+    #[test]
+    fn compact_search_cards_preserve_mixed_stream_segments_within_one_line() {
+        let text = "alpha foo omega\n";
+        let bytes = text.as_bytes().to_vec();
+        let alpha_len = "alpha ".len();
+        let foo_len = "foo".len();
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: bytes.len() as u64,
+            bytes,
+            events: Vec::new(),
+            text_spans: vec![
+                OutputTextSpan {
+                    start_byte: 0,
+                    end_byte: alpha_len,
+                    is_stderr: false,
+                },
+                OutputTextSpan {
+                    start_byte: alpha_len,
+                    end_byte: alpha_len + foo_len,
+                    is_stderr: true,
+                },
+                OutputTextSpan {
+                    start_byte: alpha_len + foo_len,
+                    end_byte: text.len(),
+                    is_stderr: false,
+                },
+            ],
+        };
+        let buffer = PagerBuffer::from_range(range);
+        let mut pager = Pager::default();
+        pager.activate(buffer, false);
+
+        let WorkerReply::Output { contents, .. } = pager.handle_command(":/foo\n");
+
+        assert!(
+            contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentText { text, stream }
+                    if matches!(stream, TextStream::Stdout) && text.contains("alpha ")
+            )),
+            "expected compact search card to keep the stdout prefix segment, got: {:?}",
+            contents
+        );
+        assert!(
+            contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentText { text, stream }
+                    if matches!(stream, TextStream::Stderr) && text.contains("foo")
+            )),
+            "expected compact search card to keep the stderr match segment, got: {:?}",
+            contents
+        );
+        assert!(
+            contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentText { text, stream }
+                    if matches!(stream, TextStream::Stdout) && text.contains(" omega")
+            )),
+            "expected compact search card to keep the stdout suffix segment, got: {:?}",
+            contents
         );
     }
 
