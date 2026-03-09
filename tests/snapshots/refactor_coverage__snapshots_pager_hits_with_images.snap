@@ -95,10 +95,6 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] elided output (already shown): @600..978"
-    },
-    {
-      "type": "text",
       "text": "#1 @978 Title\n  > [repl] echoed input elided: 2 lines (79 bytes); head: > plot(1:5, type = \"l\"); tail: > for (i in 1:60) cat(\"beta line \", i, \"\\n\", sep = \"\")"
     },
     {

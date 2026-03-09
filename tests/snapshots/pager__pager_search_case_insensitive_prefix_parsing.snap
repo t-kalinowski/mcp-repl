@@ -1,6 +1,6 @@
 ---
 source: tests/pager.rs
-expression: snapshot.render()
+expression: rendered
 ---
 == session: default ==
 -- step 1 --
@@ -67,15 +67,15 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] elided output (already shown): @210..20790"
+      "text": "[pager] search for `LINE01` @20790"
     },
     {
       "type": "text",
-      "text": "line0100 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      "text": "[match] line0100 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..."
     },
     {
       "type": "text",
-      "text": "--More-- (70p, 50.0%, @20790..21000/42000)"
+      "text": "--More-- (71p, 49.5%, @20790/42000)"
     }
   ]
 }
@@ -95,11 +95,11 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] pattern not found (search is forward-only over unseen output; use `:matches -n all iLINE01` to locate offsets, then `:seek @OFFSET` to jump)"
+      "text": "[pager] pattern not found: iLINE01"
     },
     {
       "type": "text",
-      "text": "--More-- (70p, 50.0%, @21000/42000)"
+      "text": "--More-- (71p, 49.5%, @20790/42000)"
     }
   ]
 }
@@ -119,7 +119,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "(END, 50.0%, @21000/42000)"
+      "text": "(END, 49.5%, @20790/42000)"
     },
     {
       "type": "text",

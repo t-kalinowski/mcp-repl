@@ -1,6 +1,6 @@
 ---
 source: tests/pager.rs
-expression: snapshot.render()
+expression: rendered
 ---
 == session: default ==
 -- step 1 --
@@ -41,10 +41,6 @@ response:
   "type": "tool_result",
   "is_error": false,
   "content": [
-    {
-      "type": "text",
-      "text": "[pager] elided output (already shown): @288..1617"
-    },
     {
       "type": "text",
       "text": "#1 @1617 Title > Alpha\n  > alpha configure 01"

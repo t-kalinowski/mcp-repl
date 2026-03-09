@@ -161,3 +161,41 @@ async fn r_show_doc_does_not_open_pdfs() -> TestResult<()> {
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn r_show_doc_search_returns_compact_card() -> TestResult<()> {
+    let _guard = test_mutex()
+        .lock()
+        .map_err(|_| "r_manuals test mutex poisoned")?;
+    let mut session = common::spawn_server_with_pager_page_chars(3_500).await?;
+
+    let setup = session
+        .write_stdin_raw_with("RShowDoc(\"R-exts\"); invisible(NULL)", Some(60.0))
+        .await?;
+    let setup_text = result_text(&setup);
+    if backend_unavailable(&setup_text) {
+        eprintln!("r_manuals backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let result = session
+        .write_stdin_raw_with(":/shebang", Some(60.0))
+        .await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert!(
+        text.contains("[pager] search for `shebang` @"),
+        "expected compact search header, got: {text:?}"
+    );
+    assert!(
+        !text.contains("[¶]("),
+        "expected cleaned breadcrumb text, got: {text:?}"
+    );
+    assert!(
+        !text.contains("LD_LIBRARY_PATH") || text.len() < 2_000,
+        "expected compact card instead of full manual page, got: {text:?}"
+    );
+    Ok(())
+}

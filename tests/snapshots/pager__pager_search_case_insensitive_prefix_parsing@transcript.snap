@@ -1,6 +1,6 @@
 ---
 source: tests/pager.rs
-expression: snapshot.render_transcript()
+expression: transcript
 ---
 == session: default ==
 1) r_repl timeout_ms=30000
@@ -15,15 +15,15 @@ expression: snapshot.render_transcript()
 
 3) r_repl timeout_ms=30000
 >>> :/i LINE01
-<<< [pager] elided output (already shown): @210..20790
-<<< line0100 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-<<< --More-- (70p, 50.0%, @20790..21000/42000)
+<<< [pager] search for `LINE01` @20790
+<<< [match] line0100 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...
+<<< --More-- (71p, 49.5%, @20790/42000)
 
 4) r_repl timeout_ms=30000
 >>> :/iLINE01
-<<< [pager] pattern not found (search is forward-only over unseen output; use `:matches -n all iLINE01` to locate offsets, then `:seek @OFFSET` to jump)
-<<< --More-- (70p, 50.0%, @21000/42000)
+<<< [pager] pattern not found: iLINE01
+<<< --More-- (71p, 49.5%, @20790/42000)
 
 5) r_repl timeout_ms=30000
 >>> :q
-<<< (END, 50.0%, @21000/42000)
+<<< (END, 49.5%, @20790/42000)

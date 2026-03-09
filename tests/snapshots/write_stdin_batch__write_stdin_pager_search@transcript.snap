@@ -1,6 +1,6 @@
 ---
 source: tests/write_stdin_batch.rs
-expression: snapshot.render_transcript()
+expression: transcript
 ---
 == session: pager_search_queue ==
 1) r_repl timeout_ms=30000
@@ -10,15 +10,15 @@ expression: snapshot.render_transcript()
 
 2) r_repl timeout_ms=30000
 >>> :/line0050
-<<< [pager] elided output (already shown): @210..10290
-<<< line0050 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
-<<< --More-- (105p, 25.0%, @10290..10500/42000)
+<<< [pager] search for `line0050` @10290
+<<< [match] line0050 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...
+<<< --More-- (106p, 24.5%, @10290/42000)
 
 3) r_repl timeout_ms=30000
 >>> :n
-<<< [pager] pattern not found (search is forward-only over unseen output; use `:matches -n all line0050` to locate offsets, then `:seek @OFFSET` to jump)
-<<< --More-- (105p, 25.0%, @10500/42000)
+<<< [pager] already at the last known search hit for `line0050`
+<<< --More-- (106p, 24.5%, @10290/42000)
 
 4) r_repl timeout_ms=30000
 >>> :q
-<<< (END, 25.0%, @10500/42000)
+<<< (END, 24.5%, @10290/42000)

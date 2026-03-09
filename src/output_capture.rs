@@ -224,6 +224,14 @@ struct OutputChunk {
 struct OutputSlice {
     bytes: Arc<[u8]>,
     range: Range<usize>,
+    is_stderr: bool,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct OutputTextSpan {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub is_stderr: bool,
 }
 
 pub(crate) struct OutputRange {
@@ -231,6 +239,7 @@ pub(crate) struct OutputRange {
     pub end_offset: u64,
     pub bytes: Vec<u8>,
     pub events: Vec<OutputEvent>,
+    pub text_spans: Vec<OutputTextSpan>,
 }
 
 impl OutputRange {
@@ -240,6 +249,7 @@ impl OutputRange {
             end_offset,
             bytes: Vec::new(),
             events: Vec::new(),
+            text_spans: Vec::new(),
         }
     }
 }
@@ -376,11 +386,35 @@ impl OutputRing {
     pub(crate) fn read_range(&self, start_offset: u64, end_offset: u64) -> OutputRange {
         let collected = self.collect_range(start_offset, Some(end_offset));
         let bytes = assemble_bytes(&collected.slices);
+        let mut text_spans: Vec<OutputTextSpan> = Vec::new();
+        let mut cursor = 0usize;
+        for slice in &collected.slices {
+            let slice_len = slice.range.len();
+            if slice_len == 0 {
+                continue;
+            }
+            let start_byte = cursor;
+            let end_byte = start_byte.saturating_add(slice_len);
+            if let Some(last) = text_spans.last_mut()
+                && last.is_stderr == slice.is_stderr
+                && last.end_byte == start_byte
+            {
+                last.end_byte = end_byte;
+            } else {
+                text_spans.push(OutputTextSpan {
+                    start_byte,
+                    end_byte,
+                    is_stderr: slice.is_stderr,
+                });
+            }
+            cursor = end_byte;
+        }
         OutputRange {
             start_offset: collected.start_offset,
             end_offset: collected.end_offset,
             bytes,
             events: collected.events,
+            text_spans,
         }
     }
 
@@ -470,6 +504,7 @@ impl OutputRing {
                 slices.push(OutputSlice {
                     bytes: chunk.bytes.clone(),
                     range: slice_start..slice_end,
+                    is_stderr: chunk.is_stderr,
                 });
             }
         }

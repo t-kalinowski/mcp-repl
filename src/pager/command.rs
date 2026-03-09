@@ -12,6 +12,8 @@ pub(crate) enum PagerCommand {
     Matches { spec: MatchSpec },
     Hits { spec: HitSpec },
     SearchNext { count: u64 },
+    SearchPrev { count: u64 },
+    Goto { index: usize },
     Seek { spec: SeekSpec },
     Help,
     Quit,
@@ -69,7 +71,7 @@ impl SearchCountFlag {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MatchSpec {
-    pub(crate) pattern: SearchPattern,
+    pub(crate) pattern: Option<SearchPattern>,
     pub(crate) limit: usize,
     pub(crate) context: usize,
 }
@@ -220,19 +222,35 @@ fn parse_search_args(raw: &str, n_flag: SearchCountFlag) -> Option<SearchArgs> {
 }
 
 fn parse_match_spec(raw: &str) -> Option<MatchSpec> {
-    let args = parse_search_args(raw, SearchCountFlag::Limit)?;
-    let limit = match &args.n_value {
+    let raw = raw.trim_start();
+    if raw.is_empty() {
+        return Some(MatchSpec {
+            pattern: None,
+            limit: DEFAULT_MATCH_LIMIT,
+            context: DEFAULT_MATCH_CONTEXT,
+        });
+    }
+    let (flags, rest) = parse_search_flags(raw, SearchCountFlag::Limit)?;
+    let context = flags
+        .context
+        .unwrap_or(DEFAULT_MATCH_CONTEXT)
+        .min(MAX_MATCH_CONTEXT);
+    let limit = match &flags.n_value {
         Some(value) => parse_limit_token(value)?,
         None => DEFAULT_MATCH_LIMIT,
     };
 
     Some(MatchSpec {
-        pattern: SearchPattern {
-            pattern: args.pattern,
-            case_insensitive_ascii: args.case_insensitive_ascii,
+        pattern: if rest.trim().is_empty() {
+            None
+        } else {
+            Some(SearchPattern {
+                pattern: rest.trim_start().to_string(),
+                case_insensitive_ascii: flags.case_insensitive_ascii,
+            })
         },
         limit: limit.clamp(1, MAX_MATCH_LIMIT),
-        context: args.context,
+        context,
     })
 }
 
@@ -370,6 +388,10 @@ impl PagerCommand {
                 let arg = parts.collect::<Vec<_>>().join(" ");
                 parse_seek_spec(&arg).map(|spec| Self::Seek { spec })
             }
+            "goto" => {
+                let index = parts.next()?.parse::<usize>().ok()?;
+                (index > 0).then_some(Self::Goto { index })
+            }
             "q" => Some(Self::Quit),
             "n" => {
                 let count = parts
@@ -377,6 +399,15 @@ impl PagerCommand {
                     .and_then(|part| part.parse::<u64>().ok())
                     .unwrap_or(1);
                 Some(Self::SearchNext {
+                    count: count.max(1),
+                })
+            }
+            "p" => {
+                let count = parts
+                    .next()
+                    .and_then(|part| part.parse::<u64>().ok())
+                    .unwrap_or(1);
+                Some(Self::SearchPrev {
                     count: count.max(1),
                 })
             }
@@ -497,12 +528,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parses_previous_goto_and_bare_matches_commands() {
+        let prev = PagerCommand::parse(":p").expect("parse :p");
+        match prev {
+            PagerCommand::SearchPrev { count } => assert_eq!(count, 1),
+            other => panic!("expected SearchPrev, got {other:?}"),
+        }
+
+        let goto = PagerCommand::parse(":goto 3").expect("parse :goto");
+        match goto {
+            PagerCommand::Goto { index } => assert_eq!(index, 3),
+            other => panic!("expected Goto, got {other:?}"),
+        }
+
+        let matches = PagerCommand::parse(":matches").expect("parse bare :matches");
+        match matches {
+            PagerCommand::Matches { spec } => {
+                assert!(spec.pattern.is_none());
+                assert_eq!(spec.limit, DEFAULT_MATCH_LIMIT);
+                assert_eq!(spec.context, DEFAULT_MATCH_CONTEXT);
+            }
+            other => panic!("expected Matches, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn match_spec_accepts_all_limit_and_context() {
         let spec = parse_match_spec(" -i -n all -C 2 foo").expect("match spec");
         assert_eq!(spec.limit, MAX_MATCH_LIMIT);
         assert_eq!(spec.context, 2);
-        assert!(spec.pattern.case_insensitive_ascii);
-        assert_eq!(spec.pattern.pattern, "foo");
+        let pattern = spec.pattern.expect("pattern");
+        assert!(pattern.case_insensitive_ascii);
+        assert_eq!(pattern.pattern, "foo");
     }
 
     #[test]

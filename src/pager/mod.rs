@@ -4,7 +4,7 @@ use std::sync::OnceLock;
 use memchr::{memchr, memchr_iter, memchr2, memmem};
 
 use crate::output_capture::{OutputBuffer, OutputEventKind, OutputRange};
-use crate::worker_protocol::{WorkerContent, WorkerErrorCode, WorkerReply};
+use crate::worker_protocol::{TextStream, WorkerContent, WorkerErrorCode, WorkerReply};
 
 mod command;
 mod merge;
@@ -19,8 +19,11 @@ use presentation::{
 };
 use ranges::{RangeSet, RangeSpan};
 use search::{
-    HitState, SearchMode, take_hits_next, take_matches, take_search, take_search_next,
-    where_in_buffer,
+    HitState, SearchSession, SearchStepOutcome, build_bounded_search_session,
+    build_forward_search_session, build_full_search_session, current_search_anchor,
+    extend_search_session_forward, goto_search_hit, move_search_session, render_search_card,
+    search_boundary_message, session_is_complete, session_is_indexed_from_start,
+    session_max_indexed_hits, take_hits_next, take_matches, where_in_buffer,
 };
 
 pub(crate) const PAGER_PAGE_CHARS_ENV: &str = "MCP_CONSOLE_PAGER_PAGE_CHARS";
@@ -46,6 +49,7 @@ pub(crate) struct PagerBuffer {
     line_ends: Vec<u64>,
     cursor: u64,
     events: Vec<PagerEvent>,
+    text_spans: Vec<PagerTextSpan>,
     source_end: u64,
 }
 
@@ -53,6 +57,13 @@ pub(crate) struct PagerBuffer {
 struct PagerEvent {
     offset: u64,
     kind: OutputEventKind,
+}
+
+#[derive(Debug, Clone)]
+struct PagerTextSpan {
+    start: u64,
+    end: u64,
+    is_stderr: bool,
 }
 
 impl merge::EventView for crate::output_capture::OutputEvent {
@@ -95,6 +106,20 @@ impl PagerBuffer {
                 })
             })
             .collect();
+        let text_spans = range
+            .text_spans
+            .into_iter()
+            .filter_map(|span| {
+                if span.start_byte >= span.end_byte || span.end_byte > bytes.len() {
+                    return None;
+                }
+                Some(PagerTextSpan {
+                    start: char_offset_for_byte_index(&char_to_byte, span.start_byte),
+                    end: char_offset_for_byte_index(&char_to_byte, span.end_byte),
+                    is_stderr: span.is_stderr,
+                })
+            })
+            .collect();
         let line_ends = line_end_offsets(&bytes, &char_to_byte, 0);
         Self {
             bytes,
@@ -102,6 +127,7 @@ impl PagerBuffer {
             line_ends,
             cursor: 0,
             events,
+            text_spans,
             source_end: end_offset,
         }
     }
@@ -114,6 +140,7 @@ impl PagerBuffer {
     pub(crate) fn from_bytes_and_events(
         bytes: Vec<u8>,
         events: Vec<(u64, OutputEventKind)>,
+        text_spans: Vec<crate::output_capture::OutputTextSpan>,
         source_end: u64,
     ) -> Self {
         let char_to_byte = build_char_index(&bytes);
@@ -131,12 +158,26 @@ impl PagerBuffer {
                 })
             })
             .collect();
+        let text_spans = text_spans
+            .into_iter()
+            .filter_map(|span| {
+                if span.start_byte >= span.end_byte || span.end_byte > bytes.len() {
+                    return None;
+                }
+                Some(PagerTextSpan {
+                    start: char_offset_for_byte_index(&char_to_byte, span.start_byte),
+                    end: char_offset_for_byte_index(&char_to_byte, span.end_byte),
+                    is_stderr: span.is_stderr,
+                })
+            })
+            .collect();
         Self {
             bytes,
             char_to_byte,
             line_ends,
             cursor: 0,
             events,
+            text_spans,
             source_end,
         }
     }
@@ -438,6 +479,20 @@ impl PagerBuffer {
         self.append_bytes(&range.bytes);
 
         let chunk_char_index = build_char_index(&range.bytes);
+        for span in range.text_spans {
+            if span.start_byte >= span.end_byte || span.end_byte > range.bytes.len() {
+                continue;
+            }
+            self.text_spans.push(PagerTextSpan {
+                start: old_char_len.saturating_add(char_offset_for_byte_index(
+                    &chunk_char_index,
+                    span.start_byte,
+                )),
+                end: old_char_len
+                    .saturating_add(char_offset_for_byte_index(&chunk_char_index, span.end_byte)),
+                is_stderr: span.is_stderr,
+            });
+        }
         for event in range.events {
             if event.offset < base_offset || event.offset > range.end_offset {
                 continue;
@@ -627,7 +682,9 @@ struct PagerState {
     seen_images: HashSet<String>,
     image_numbers: HashMap<String, u64>,
     next_image_number: u64,
-    search_mode: SearchMode,
+    search_session: Option<SearchSession>,
+    search_session_needs_reseed: bool,
+    view_history: Vec<(u64, u64)>,
 }
 
 struct CommandOutcome {
@@ -636,8 +693,10 @@ struct CommandOutcome {
     dismiss: bool,
     is_error: bool,
     update_range: bool,
+    update_last_emitted: bool,
     first_range: Option<(u64, u64)>,
     last_range: Option<(u64, u64)>,
+    view_ranges: Vec<(u64, u64)>,
 }
 
 impl CommandOutcome {
@@ -657,67 +716,90 @@ impl CommandOutcome {
             dismiss,
             is_error,
             update_range,
+            update_last_emitted: true,
             first_range,
             last_range,
+            view_ranges: Vec::new(),
         }
+    }
+
+    fn with_single_view_range(mut self, range: Option<(u64, u64)>) -> Self {
+        self.view_ranges = range.into_iter().collect();
+        self
+    }
+
+    fn with_view_ranges(mut self, view_ranges: Vec<(u64, u64)>) -> Self {
+        self.view_ranges = view_ranges;
+        self
+    }
+
+    fn without_last_emitted_update(mut self) -> Self {
+        self.update_last_emitted = false;
+        self
     }
 
     fn page(
         contents: Vec<WorkerContent>,
         pages_left: u64,
         is_error: bool,
-        first_range: Option<(u64, u64)>,
-        last_range: Option<(u64, u64)>,
+        span: RangeSpan,
     ) -> Self {
         Self::new(
-            contents,
-            pages_left,
-            is_error,
-            true,
-            first_range,
-            last_range,
-            None,
+            contents, pages_left, is_error, true, span.first, span.last, None,
         )
+        .with_view_ranges(span.ranges)
     }
 
     fn page_keep(
         contents: Vec<WorkerContent>,
         pages_left: u64,
         is_error: bool,
-        first_range: Option<(u64, u64)>,
-        last_range: Option<(u64, u64)>,
+        span: RangeSpan,
     ) -> Self {
         Self::new(
             contents,
             pages_left,
             is_error,
             true,
-            first_range,
-            last_range,
+            span.first,
+            span.last,
             Some(false),
         )
+        .with_view_ranges(span.ranges)
     }
 
     fn page_dismiss(
         contents: Vec<WorkerContent>,
         pages_left: u64,
         is_error: bool,
-        first_range: Option<(u64, u64)>,
-        last_range: Option<(u64, u64)>,
+        span: RangeSpan,
     ) -> Self {
         Self::new(
             contents,
             pages_left,
             is_error,
             true,
-            first_range,
-            last_range,
+            span.first,
+            span.last,
             Some(true),
         )
+        .with_view_ranges(span.ranges)
     }
 
     fn no_range(contents: Vec<WorkerContent>, pages_left: u64, is_error: bool) -> Self {
         Self::new(contents, pages_left, is_error, false, None, None, None)
+    }
+
+    fn no_range_keep(contents: Vec<WorkerContent>, pages_left: u64, is_error: bool) -> Self {
+        Self::new(
+            contents,
+            pages_left,
+            is_error,
+            false,
+            None,
+            None,
+            Some(false),
+        )
     }
 }
 
@@ -760,6 +842,9 @@ impl Pager {
         let range = output.read_range(start_offset, end_offset);
         output.advance_offset_to(end_offset);
         state.buffer.append_range(range);
+        if let Some(session) = state.search_session.as_mut() {
+            session.buffer_len = 0;
+        }
     }
 
     pub(crate) fn activate(&mut self, buffer: PagerBuffer, is_error: bool) {
@@ -772,7 +857,9 @@ impl Pager {
             seen_images: HashSet::new(),
             image_numbers: HashMap::new(),
             next_image_number: 1,
-            search_mode: SearchMode::None,
+            search_session: None,
+            search_session_needs_reseed: false,
+            view_history: Vec::new(),
         });
     }
 
@@ -841,6 +928,99 @@ impl Pager {
         )
     }
 
+    fn ensure_search_session_from_pattern(
+        state: &mut PagerState,
+        pattern: &SearchPattern,
+        start_offset: u64,
+        full: bool,
+    ) -> bool {
+        let next_session = if full {
+            build_full_search_session(&state.buffer, pattern, start_offset)
+        } else {
+            build_forward_search_session(&state.buffer, pattern, start_offset)
+        };
+        if let Some(session) = next_session {
+            state.search_session = Some(session);
+            true
+        } else {
+            false
+        }
+    }
+
+    fn build_matches_session(
+        buffer: &PagerBuffer,
+        pattern: &SearchPattern,
+        limit: usize,
+    ) -> Option<SearchSession> {
+        let needed_hits = limit.saturating_add(1);
+        build_bounded_search_session(buffer, pattern, 0, needed_hits)
+    }
+
+    fn rebuild_search_session(
+        buffer: &PagerBuffer,
+        existing: &SearchSession,
+        start_offset: u64,
+        preserve_boundary: bool,
+    ) -> Option<SearchSession> {
+        let pattern = existing.pattern.clone();
+        let mut session = if let Some(limit) = session_max_indexed_hits(existing) {
+            let rebuilt_limit = existing.hits.len().max(limit);
+            build_bounded_search_session(buffer, &pattern, start_offset, rebuilt_limit)
+        } else if session_is_complete(existing) || session_is_indexed_from_start(existing) {
+            build_full_search_session(buffer, &pattern, start_offset)
+        } else {
+            build_forward_search_session(buffer, &pattern, start_offset)
+        }?;
+        if preserve_boundary && existing.current_index >= existing.hits.len() {
+            session.current_index = session.hits.len();
+        }
+        Some(session)
+    }
+
+    fn reseed_search_session(
+        buffer: &PagerBuffer,
+        existing: &SearchSession,
+        start_offset: u64,
+    ) -> Option<SearchSession> {
+        let mut session = build_full_search_session(buffer, &existing.pattern, start_offset)?;
+        session.anchor_offset = start_offset;
+        session.current_index = session.hits.len();
+        Some(session)
+    }
+
+    fn ensure_search_session_fresh(state: &mut PagerState) -> bool {
+        let Some(existing) = state.search_session.as_ref().cloned() else {
+            return false;
+        };
+        let buffer_len = state.buffer.len();
+        if existing.buffer_len == buffer_len && !state.search_session_needs_reseed {
+            return true;
+        }
+        state.search_session = if state.search_session_needs_reseed {
+            Self::reseed_search_session(&state.buffer, &existing, state.buffer.current_offset())
+        } else {
+            Self::rebuild_search_session(&state.buffer, &existing, existing.anchor_offset, true)
+        };
+        state.search_session_needs_reseed = false;
+        state.search_session.is_some()
+    }
+
+    fn ensure_search_session_complete(state: &mut PagerState) -> bool {
+        let Some(existing) = state.search_session.as_ref() else {
+            return false;
+        };
+        if session_is_complete(existing) && session_is_indexed_from_start(existing) {
+            return true;
+        }
+        let Some(_anchor) = current_search_anchor(existing) else {
+            return false;
+        };
+        let pattern = existing.pattern.clone();
+        state.search_session =
+            build_full_search_session(&state.buffer, &pattern, existing.anchor_offset);
+        state.search_session.is_some()
+    }
+
     pub(crate) fn handle_command(&mut self, input: &str) -> WorkerReply {
         if self.state.is_none() {
             return pager_reply(
@@ -879,103 +1059,404 @@ impl Pager {
                 | PagerCommand::Matches { .. }
                 | PagerCommand::Hits { .. }
                 | PagerCommand::SearchNext { .. }
+                | PagerCommand::SearchPrev { .. }
+                | PagerCommand::Goto { .. }
                 | PagerCommand::Seek { .. }
                 | PagerCommand::Help
         );
+        let command_keeps_search_anchor = matches!(
+            &command,
+            PagerCommand::Search { .. }
+                | PagerCommand::Matches { .. }
+                | PagerCommand::SearchNext { .. }
+                | PagerCommand::SearchPrev { .. }
+                | PagerCommand::Goto { .. }
+        );
+        let cursor_before = self
+            .state
+            .as_ref()
+            .expect("pager state disappeared")
+            .buffer
+            .current_offset();
 
         let CommandOutcome {
             mut contents,
             pages_left,
             dismiss,
             is_error,
+            update_last_emitted,
             first_range,
             last_range,
+            view_ranges,
             ..
         } = {
             let state = self.state.as_mut().expect("pager state disappeared");
             let is_error = state.is_error;
-            let buffer = &mut state.buffer;
             let outcome = match command {
                 PagerCommand::Next { count } => {
-                    let (contents, pages_left, span) =
-                        take_next_pages(buffer, page_bytes, count, &mut state.seen_ranges);
-                    CommandOutcome::page(contents, pages_left, is_error, span.first, span.last)
+                    let (contents, pages_left, span) = take_next_pages(
+                        &mut state.buffer,
+                        page_bytes,
+                        count,
+                        &mut state.seen_ranges,
+                    );
+                    CommandOutcome::page(contents, pages_left, is_error, span)
                 }
                 PagerCommand::Skip { count } => {
-                    let (contents, pages_left, span) =
-                        skip_pages_and_take_next(buffer, page_bytes, count, &mut state.seen_ranges);
-                    CommandOutcome::page(contents, pages_left, is_error, span.first, span.last)
+                    let (contents, pages_left, span) = skip_pages_and_take_next(
+                        &mut state.buffer,
+                        page_bytes,
+                        count,
+                        &mut state.seen_ranges,
+                    );
+                    CommandOutcome::page(contents, pages_left, is_error, span)
                 }
                 PagerCommand::All => {
                     let (contents, pages_left, span) =
-                        take_all(buffer, page_bytes, &mut state.seen_ranges);
-                    CommandOutcome::page(contents, pages_left, is_error, span.first, span.last)
+                        take_all(&mut state.buffer, page_bytes, &mut state.seen_ranges);
+                    CommandOutcome::page(contents, pages_left, is_error, span)
                 }
                 PagerCommand::Tail { spec } => {
                     let (contents, pages_left, span) = match spec {
-                        TailSpec::Default => take_tail(buffer, page_bytes, &mut state.seen_ranges),
+                        TailSpec::Default => {
+                            take_tail(&mut state.buffer, page_bytes, &mut state.seen_ranges)
+                        }
                         TailSpec::Bytes(bytes) => {
-                            take_tail(buffer, bytes.max(1), &mut state.seen_ranges)
+                            take_tail(&mut state.buffer, bytes.max(1), &mut state.seen_ranges)
                         }
                         TailSpec::Lines(lines) => {
-                            take_tail_lines(buffer, lines, &mut state.seen_ranges)
+                            take_tail_lines(&mut state.buffer, lines, &mut state.seen_ranges)
                         }
                     };
-                    CommandOutcome::page_dismiss(
-                        contents, pages_left, is_error, span.first, span.last,
-                    )
+                    CommandOutcome::page_dismiss(contents, pages_left, is_error, span)
                 }
                 PagerCommand::Search { pattern } => {
-                    state.search_mode = SearchMode::Page(pattern.clone());
-                    let (contents, pages_left, span) =
-                        take_search(buffer, page_bytes, &pattern, &mut state.seen_ranges);
-                    CommandOutcome::page_keep(contents, pages_left, is_error, span.first, span.last)
+                    if Self::ensure_search_session_from_pattern(
+                        state,
+                        &pattern,
+                        state.buffer.current_offset(),
+                        false,
+                    ) {
+                        let session = state
+                            .search_session
+                            .as_ref()
+                            .expect("search session missing after build");
+                        let (contents, range, resume_offset) = render_search_card(
+                            &state.buffer,
+                            session,
+                            &state.view_history,
+                            if state.is_error {
+                                TextStream::Stderr
+                            } else {
+                                TextStream::Stdout
+                            },
+                        );
+                        if let Some(offset) = resume_offset {
+                            state.buffer.advance_offset_to(offset);
+                        }
+                        let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
+                        CommandOutcome::new(
+                            contents,
+                            pages_left,
+                            is_error,
+                            true,
+                            range,
+                            range,
+                            Some(false),
+                        )
+                        .with_single_view_range(range)
+                        .without_last_emitted_update()
+                    } else if Self::ensure_search_session_from_pattern(
+                        state,
+                        &pattern,
+                        state.buffer.current_offset(),
+                        true,
+                    ) {
+                        let session = state
+                            .search_session
+                            .as_mut()
+                            .expect("search session missing after full rebuild");
+                        let moved = move_search_session(session, 1, false);
+                        debug_assert_eq!(
+                            moved,
+                            SearchStepOutcome::Moved,
+                            "full search session should have an earlier hit after a forward miss"
+                        );
+                        let (contents, range, resume_offset) = render_search_card(
+                            &state.buffer,
+                            session,
+                            &state.view_history,
+                            if state.is_error {
+                                TextStream::Stderr
+                            } else {
+                                TextStream::Stdout
+                            },
+                        );
+                        if let Some(offset) = resume_offset {
+                            state.buffer.advance_offset_to(offset);
+                        }
+                        let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
+                        CommandOutcome::new(
+                            contents,
+                            pages_left,
+                            is_error,
+                            true,
+                            range,
+                            range,
+                            Some(false),
+                        )
+                        .with_single_view_range(range)
+                        .without_last_emitted_update()
+                    } else {
+                        state.search_session = None;
+                        let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
+                        let contents = vec![WorkerContent::stderr(format!(
+                            "[pager] pattern not found: {}",
+                            pattern.pattern
+                        ))];
+                        CommandOutcome::no_range_keep(contents, pages_left, is_error)
+                    }
                 }
                 PagerCommand::Where { pattern } => {
-                    let pages_left = pages_left_for_buffer(buffer, page_bytes);
+                    let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                     let contents = vec![WorkerContent::stderr(where_in_buffer(
-                        buffer,
+                        &state.buffer,
+                        &state.seen_ranges,
                         page_bytes,
                         &pattern,
-                        &state.seen_ranges,
                     ))];
                     CommandOutcome::new(contents, pages_left, is_error, true, None, None, None)
                 }
                 PagerCommand::Matches { spec } => {
-                    let pages_left = pages_left_for_buffer(buffer, page_bytes);
-                    let (contents, is_error) = take_matches(buffer, &spec, &mut state.seen_ranges);
-                    CommandOutcome::no_range(contents, pages_left, is_error)
+                    let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
+                    if let Some(pattern) = spec.pattern.as_ref() {
+                        if let Some(mut session) =
+                            Self::build_matches_session(&state.buffer, pattern, spec.limit)
+                        {
+                            let _ = goto_search_hit(&mut session, 1);
+                            state.search_session = Some(session);
+                            let session = state
+                                .search_session
+                                .as_ref()
+                                .expect("search session missing");
+                            let (contents, span, view_ranges) =
+                                take_matches(&state.buffer, &spec, session);
+                            CommandOutcome::new(
+                                contents,
+                                pages_left,
+                                is_error,
+                                false,
+                                span.first,
+                                span.last,
+                                Some(false),
+                            )
+                            .with_view_ranges(view_ranges)
+                            .without_last_emitted_update()
+                        } else {
+                            state.search_session = None;
+                            let contents = vec![WorkerContent::stderr(format!(
+                                "[pager] pattern not found: {}",
+                                pattern.pattern
+                            ))];
+                            CommandOutcome::no_range_keep(contents, pages_left, is_error)
+                        }
+                    } else if Self::ensure_search_session_fresh(state)
+                        && Self::ensure_search_session_complete(state)
+                    {
+                        let session = state
+                            .search_session
+                            .as_mut()
+                            .expect("search session missing");
+                        let (contents, span, view_ranges) =
+                            take_matches(&state.buffer, &spec, session);
+                        CommandOutcome::new(
+                            contents,
+                            pages_left,
+                            is_error,
+                            false,
+                            span.first,
+                            span.last,
+                            Some(false),
+                        )
+                        .with_view_ranges(view_ranges)
+                        .without_last_emitted_update()
+                    } else {
+                        let contents = vec![WorkerContent::stderr(
+                            "[pager] no active search; use `:/PATTERN` or `:matches PATTERN`"
+                                .to_string(),
+                        )];
+                        CommandOutcome::no_range_keep(contents, pages_left, is_error)
+                    }
                 }
                 PagerCommand::Hits { spec } => {
                     let mut hit_state = HitState::new(spec.pattern.clone(), spec.context);
-                    let (contents, pages_left, span) = take_hits_next(
-                        buffer,
+                    let (contents, pages_left, span, view_ranges) = take_hits_next(
+                        &mut state.buffer,
                         &mut hit_state,
                         page_bytes,
                         spec.count,
                         &mut state.seen_ranges,
                     );
-                    CommandOutcome::page_keep(contents, pages_left, is_error, span.first, span.last)
+                    CommandOutcome::page_keep(contents, pages_left, is_error, span)
+                        .with_view_ranges(view_ranges)
                 }
                 PagerCommand::SearchNext { count } => {
-                    let (contents, pages_left, span) = match &mut state.search_mode {
-                        SearchMode::Page(pattern) => take_search_next(
-                            buffer,
+                    if Self::ensure_search_session_fresh(state) {
+                        let session = state
+                            .search_session
+                            .as_mut()
+                            .expect("search session missing after refresh");
+                        let needed_hits = session
+                            .current_index
+                            .saturating_add(count.max(1) as usize + 1);
+                        extend_search_session_forward(&state.buffer, session, needed_hits);
+                        let moved = move_search_session(session, count, true);
+                        if moved == SearchStepOutcome::Boundary {
+                            let contents = vec![WorkerContent::stderr(search_boundary_message(
+                                session, true,
+                            ))];
+                            let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
+                            CommandOutcome::no_range_keep(contents, pages_left, is_error)
+                        } else {
+                            let (contents, range, resume_offset) = render_search_card(
+                                &state.buffer,
+                                session,
+                                &state.view_history,
+                                if state.is_error {
+                                    TextStream::Stderr
+                                } else {
+                                    TextStream::Stdout
+                                },
+                            );
+                            if let Some(offset) = resume_offset {
+                                state.buffer.advance_offset_to(offset);
+                            }
+                            let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
+                            CommandOutcome::new(
+                                contents,
+                                pages_left,
+                                is_error,
+                                true,
+                                range,
+                                range,
+                                Some(false),
+                            )
+                            .with_single_view_range(range)
+                            .without_last_emitted_update()
+                        }
+                    } else {
+                        let (contents, pages_left, span) = take_next_pages(
+                            &mut state.buffer,
                             page_bytes,
-                            pattern,
                             count,
                             &mut state.seen_ranges,
-                        ),
-                        SearchMode::None => {
-                            take_next_pages(buffer, page_bytes, count, &mut state.seen_ranges)
+                        );
+                        CommandOutcome::page_keep(contents, pages_left, is_error, span)
+                    }
+                }
+                PagerCommand::SearchPrev { count } => {
+                    if Self::ensure_search_session_fresh(state)
+                        && Self::ensure_search_session_complete(state)
+                    {
+                        let session = state
+                            .search_session
+                            .as_mut()
+                            .expect("search session missing after refresh");
+                        let moved = move_search_session(session, count, false);
+                        if moved == SearchStepOutcome::Boundary {
+                            let contents = vec![WorkerContent::stderr(search_boundary_message(
+                                session, false,
+                            ))];
+                            let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
+                            CommandOutcome::no_range_keep(contents, pages_left, is_error)
+                        } else {
+                            let (contents, range, resume_offset) = render_search_card(
+                                &state.buffer,
+                                session,
+                                &state.view_history,
+                                if state.is_error {
+                                    TextStream::Stderr
+                                } else {
+                                    TextStream::Stdout
+                                },
+                            );
+                            if let Some(offset) = resume_offset {
+                                state.buffer.advance_offset_to(offset);
+                            }
+                            let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
+                            CommandOutcome::new(
+                                contents,
+                                pages_left,
+                                is_error,
+                                true,
+                                range,
+                                range,
+                                Some(false),
+                            )
+                            .with_single_view_range(range)
+                            .without_last_emitted_update()
                         }
-                    };
-                    CommandOutcome::page_keep(contents, pages_left, is_error, span.first, span.last)
+                    } else {
+                        let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
+                        let contents = vec![WorkerContent::stderr(
+                            "[pager] no active search; use `:/PATTERN` first".to_string(),
+                        )];
+                        CommandOutcome::no_range_keep(contents, pages_left, is_error)
+                    }
+                }
+                PagerCommand::Goto { index } => {
+                    if Self::ensure_search_session_fresh(state)
+                        && Self::ensure_search_session_complete(state)
+                    {
+                        let session = state
+                            .search_session
+                            .as_mut()
+                            .expect("search session missing after refresh");
+                        if goto_search_hit(session, index) {
+                            let (contents, range, resume_offset) = render_search_card(
+                                &state.buffer,
+                                session,
+                                &state.view_history,
+                                if state.is_error {
+                                    TextStream::Stderr
+                                } else {
+                                    TextStream::Stdout
+                                },
+                            );
+                            if let Some(offset) = resume_offset {
+                                state.buffer.advance_offset_to(offset);
+                            }
+                            let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
+                            CommandOutcome::new(
+                                contents,
+                                pages_left,
+                                is_error,
+                                true,
+                                range,
+                                range,
+                                Some(false),
+                            )
+                            .with_single_view_range(range)
+                            .without_last_emitted_update()
+                        } else {
+                            let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
+                            let contents = vec![WorkerContent::stderr(format!(
+                                "[pager] search hit out of range: {index}"
+                            ))];
+                            CommandOutcome::no_range_keep(contents, pages_left, is_error)
+                        }
+                    } else {
+                        let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
+                        let contents = vec![WorkerContent::stderr(
+                            "[pager] no active search; use `:/PATTERN` first".to_string(),
+                        )];
+                        CommandOutcome::no_range_keep(contents, pages_left, is_error)
+                    }
                 }
                 PagerCommand::Range { start, end } => {
-                    let pages_left = pages_left_for_buffer(buffer, page_bytes);
+                    let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                     let (mut contents, span) =
-                        take_line_range(buffer, start, end, &mut state.seen_ranges);
+                        take_line_range(&state.buffer, start, end, &mut state.seen_ranges);
                     if contents.is_empty() {
                         contents.push(WorkerContent::stderr(
                             "[pager] no remaining output in range".to_string(),
@@ -984,17 +1465,18 @@ impl Pager {
                     CommandOutcome::new(
                         contents, pages_left, is_error, false, span.first, span.last, None,
                     )
+                    .with_view_ranges(span.ranges)
                 }
                 PagerCommand::Seek { spec } => {
-                    let end_offset = buffer.len();
-                    let pages_left = pages_left_for_buffer(buffer, page_bytes);
+                    let end_offset = state.buffer.len();
+                    let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                     let (desired_offset, error_message) = match spec {
                         SeekSpec::Offset(offset) => (Some(offset.min(end_offset)), None),
                         SeekSpec::Percent(percent) => (
                             Some(end_offset.saturating_mul(percent).saturating_div(100)),
                             None,
                         ),
-                        SeekSpec::Line(line) => match buffer.line_start_offset(line) {
+                        SeekSpec::Line(line) => match state.buffer.line_start_offset(line) {
                             Some(offset) => (Some(offset), None),
                             None => (None, Some(format!("[pager] line out of range: {line}"))),
                         },
@@ -1005,14 +1487,14 @@ impl Pager {
                         CommandOutcome::no_range(contents, pages_left, is_error)
                     } else {
                         let desired_offset = desired_offset.expect("seek offset missing");
-                        buffer.advance_offset_to(desired_offset);
+                        state.buffer.advance_offset_to(desired_offset);
                         let (contents, pages_left, span) =
-                            take_next_page(buffer, page_bytes, &mut state.seen_ranges);
-                        CommandOutcome::page(contents, pages_left, is_error, span.first, span.last)
+                            take_next_page(&mut state.buffer, page_bytes, &mut state.seen_ranges);
+                        CommandOutcome::page(contents, pages_left, is_error, span)
                     }
                 }
                 PagerCommand::Help => {
-                    let pages_left = pages_left_for_buffer(buffer, page_bytes);
+                    let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                     let contents = vec![WorkerContent::stderr(pager_help_text())];
                     CommandOutcome::no_range(contents, pages_left, is_error)
                 }
@@ -1029,10 +1511,21 @@ impl Pager {
 
         self.dedupe_images(&mut contents);
         if let Some(state) = self.state.as_mut() {
-            if let Some(marker) = gap_marker_if_needed(state.last_emitted, first_range) {
+            let cursor_after = state.buffer.current_offset();
+            if state.search_session.is_none() || command_keeps_search_anchor {
+                state.search_session_needs_reseed = false;
+            } else if cursor_after != cursor_before {
+                state.search_session_needs_reseed = true;
+            }
+            if let Some(marker) =
+                gap_marker_if_needed(state.last_emitted, first_range, &state.seen_ranges)
+            {
                 contents.insert(0, marker);
             }
-            if let Some(last) = last_range {
+            for range in view_ranges {
+                state.view_history.push(range);
+            }
+            if update_last_emitted && let Some(last) = last_range {
                 state.last_emitted = Some(last);
             }
         }
@@ -1072,6 +1565,7 @@ pub(crate) fn maybe_activate_and_append_footer(
         state.last_emitted = range;
         if let Some((start, end)) = range {
             state.seen_ranges.insert(start, end);
+            state.view_history.push((start, end));
         }
     }
     pager.dedupe_images(contents);
@@ -1338,8 +1832,7 @@ fn take_next_pages(
             break;
         }
         contents.extend(page_contents);
-        span.record(range.first);
-        span.record(range.last);
+        span.extend(&range);
         if pages_left == 0 {
             break;
         }
@@ -1639,8 +2132,19 @@ fn take_line_range(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::output_capture::OutputEvent;
+    use crate::output_capture::{
+        OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEvent, OutputTextSpan, OutputTimeline,
+        ensure_output_ring, reset_output_ring,
+    };
     use crate::worker_protocol::TextStream;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    struct OutputPagerFixture {
+        _guard: MutexGuard<'static, ()>,
+        pager: Pager,
+        output: OutputBuffer,
+        timeline: OutputTimeline,
+    }
 
     fn text_from_reply(reply: WorkerReply) -> String {
         let WorkerReply::Output { contents, .. } = reply;
@@ -1660,11 +2164,55 @@ mod tests {
             end_offset: text.len() as u64,
             bytes: text.as_bytes().to_vec(),
             events: Vec::new(),
+            text_spans: Vec::new(),
         };
         let buffer = PagerBuffer::from_range(range);
         let mut pager = Pager::default();
         pager.activate(buffer, false);
         pager
+    }
+
+    fn activate_pager_with_bytes(bytes: Vec<u8>) -> Pager {
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: bytes.len() as u64,
+            bytes,
+            events: Vec::new(),
+            text_spans: Vec::new(),
+        };
+        let buffer = PagerBuffer::from_range(range);
+        let mut pager = Pager::default();
+        pager.activate(buffer, false);
+        pager
+    }
+
+    fn output_ring_test_guard() -> MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("output ring test lock")
+    }
+
+    fn activate_pager_from_output(text: &str) -> OutputPagerFixture {
+        let guard = output_ring_test_guard();
+        reset_output_ring();
+        let ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        let timeline = OutputTimeline::new(ring);
+        let output = OutputBuffer::default();
+        output.start_capture();
+        timeline.append_text(text.as_bytes(), false);
+        let end_offset = output.end_offset().expect("output end offset");
+        let range = output.read_range(0, end_offset);
+        output.advance_offset_to(end_offset);
+        let buffer = PagerBuffer::from_range(range);
+        let mut pager = Pager::default();
+        pager.activate(buffer, false);
+        OutputPagerFixture {
+            _guard: guard,
+            pager,
+            output,
+            timeline,
+        }
     }
 
     #[test]
@@ -1676,6 +2224,7 @@ mod tests {
             end_offset: bytes.len() as u64,
             bytes,
             events: Vec::new(),
+            text_spans: Vec::new(),
         };
         let buffer = PagerBuffer::from_range(range);
 
@@ -1696,6 +2245,7 @@ mod tests {
             end_offset: bytes.len() as u64,
             bytes,
             events: Vec::new(),
+            text_spans: Vec::new(),
         };
         let buffer = PagerBuffer::from_range(range);
         let mut seen = RangeSet::default();
@@ -1738,8 +2288,11 @@ mod tests {
     }
 
     #[test]
-    fn gap_marker_emits_for_forward_jump() {
-        let marker = gap_marker_if_needed(Some((0, 5)), Some((10, 12))).expect("expected marker");
+    fn gap_marker_emits_for_seen_forward_jump() {
+        let mut seen = RangeSet::default();
+        seen.insert(0, 10);
+        let marker =
+            gap_marker_if_needed(Some((0, 5)), Some((10, 12)), &seen).expect("expected marker");
         let text = match marker {
             WorkerContent::ContentText { text, stream } => {
                 assert!(matches!(stream, TextStream::Stderr));
@@ -1748,6 +2301,15 @@ mod tests {
             _ => panic!("expected text marker"),
         };
         assert!(text.contains("@5..10"));
+    }
+
+    #[test]
+    fn gap_marker_skips_unseen_forward_jump() {
+        let seen = RangeSet::default();
+        assert!(
+            gap_marker_if_needed(Some((0, 5)), Some((10, 12)), &seen).is_none(),
+            "expected unseen forward jump not to be labeled as already shown"
+        );
     }
 
     #[test]
@@ -1788,6 +2350,7 @@ mod tests {
             end_offset: bytes.len() as u64,
             bytes,
             events,
+            text_spans: Vec::new(),
         };
         let buffer = PagerBuffer::from_range(range);
 
@@ -1804,6 +2367,7 @@ mod tests {
             end_offset: 0,
             bytes: Vec::new(),
             events: Vec::new(),
+            text_spans: Vec::new(),
         };
         let buffer = PagerBuffer::from_range(range);
         let mut pager = Pager::default();
@@ -1848,6 +2412,7 @@ mod tests {
             end_offset: 0,
             bytes: Vec::new(),
             events: Vec::new(),
+            text_spans: Vec::new(),
         };
         let buffer = PagerBuffer::from_range(range);
         let mut pager = Pager::default();
@@ -1921,6 +2486,7 @@ mod tests {
             end_offset: bytes.len() as u64,
             bytes,
             events: Vec::new(),
+            text_spans: Vec::new(),
         };
         let buffer = PagerBuffer::from_range(range);
 
@@ -1982,6 +2548,1346 @@ mod tests {
         assert!(
             found.contains("manual-target-token"),
             "expected to find token after seek, got: {found}"
+        );
+    }
+
+    #[test]
+    fn search_next_reseeds_after_seek_moves_cursor() {
+        let text = (0..4000)
+            .map(|i| match i {
+                0 => "foo early\n".to_string(),
+                1000 => "foo middle\n".to_string(),
+                3900 => "foo late\n".to_string(),
+                _ => format!("line-{i:04}\n"),
+            })
+            .collect::<String>();
+        let mut pager = activate_pager_with_text(&text);
+
+        let first = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            first.contains("foo early"),
+            "expected initial search to land on the first hit, got: {first}"
+        );
+
+        let _ = pager.handle_command(":seek 80%\n");
+        let next = text_from_reply(pager.handle_command(":n\n"));
+        assert!(
+            next.contains("foo late"),
+            "expected :n to continue from the seek position, got: {next}"
+        );
+        assert!(
+            !next.contains("foo middle"),
+            "expected :n not to jump back to a stale earlier hit, got: {next}"
+        );
+    }
+
+    #[test]
+    fn slash_search_advances_pager_cursor_to_search_hit() {
+        let text = (0..200)
+            .map(|i| format!("line-{i:04}\n"))
+            .collect::<String>();
+        let mut pager = activate_pager_with_text(&text);
+
+        let _ = pager.handle_command(":/line-0100\n");
+        let next = text_from_reply(pager.handle_command(":next\n"));
+
+        assert!(
+            next.contains("line-0101"),
+            "expected paging to continue after the search hit, got: {next}"
+        );
+        assert!(
+            next.contains("line-0100"),
+            "expected paging to resume from the full hit line, got: {next}"
+        );
+        assert!(
+            !next.contains("line-0001"),
+            "expected search to move the pager forward, got: {next}"
+        );
+        assert!(
+            !next.contains("\n0100"),
+            "expected search paging to avoid truncated mid-line fragments, got: {next}"
+        );
+    }
+
+    #[test]
+    fn slash_search_starts_from_later_same_line_match_when_cursor_is_mid_line() {
+        let text = format!(
+            "prefix {} foo {} foo suffix\n",
+            "a".repeat(60),
+            "b".repeat(60)
+        );
+        let mut pager = activate_pager_with_text(&text);
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(80);
+
+        let found = text_from_reply(pager.handle_command(":/foo\n"));
+
+        assert!(
+            found.contains("[pager] search for `foo` @133"),
+            "expected later same-line hit from mid-line cursor, got: {found}"
+        );
+    }
+
+    #[test]
+    fn slash_search_past_last_hit_jumps_to_last_earlier_hit() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(40);
+
+        let found = text_from_reply(pager.handle_command(":/foo\n"));
+
+        assert!(
+            found.contains("[pager] search #2/2") && found.contains("beta foo"),
+            "expected slash search to fall back to the nearest earlier hit, got: {found}"
+        );
+        assert!(
+            !found.contains("[pager] search #1/"),
+            "expected no wrap to first hit, got: {found}"
+        );
+        assert!(pager.state.is_some(), "expected pager to stay active");
+    }
+
+    #[test]
+    fn slash_search_past_last_hit_keeps_bidirectional_search_active() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(40);
+
+        let miss = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            miss.contains("[pager] search #2/2") && miss.contains("beta foo"),
+            "expected slash search to land on the nearest earlier hit, got: {miss}"
+        );
+
+        let next = text_from_reply(pager.handle_command(":n\n"));
+        assert!(
+            next.contains("[pager] already at the last search hit #2/2 for `foo`"),
+            "expected :n to stay at the boundary after the miss, got: {next}"
+        );
+
+        let previous = text_from_reply(pager.handle_command(":p\n"));
+        assert!(
+            previous.contains("alpha foo"),
+            "expected :p to move backward from the recovered hit, got: {previous}"
+        );
+
+        let listed = text_from_reply(pager.handle_command(":matches\n"));
+        assert!(
+            listed.contains("#1 @12") && listed.contains("#2 @28"),
+            "expected full search session to remain available after the miss, got: {listed}"
+        );
+    }
+
+    #[test]
+    fn where_reports_backward_search_fallback_after_last_hit() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(40);
+
+        let reply = text_from_reply(pager.handle_command(":where foo\n"));
+
+        assert!(
+            reply.contains("nearest earlier match is behind the cursor @28: use :/foo"),
+            "expected :where to describe the backward slash-search fallback, got: {reply}"
+        );
+        assert!(
+            !reply.contains("pattern not found"),
+            "expected :where not to report a false miss when :/foo can recover an earlier hit, got: {reply}"
+        );
+    }
+
+    #[test]
+    fn where_counts_skip_distance_over_unseen_pages_only() {
+        let leading = "a".repeat(3400);
+        let text = format!("{leading}\nfoo here\nomega\n");
+        let mut pager = activate_pager_with_text(&text);
+        let seen_end = leading.len() as u64 + 1;
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .seen_ranges
+            .insert(0, seen_end);
+
+        let reply = text_from_reply(pager.handle_command(":where foo\n"));
+
+        assert!(
+            reply.contains("match is on the current/next page"),
+            "expected :where to ignore already-seen pages when suggesting :skip, got: {reply}"
+        );
+        assert!(
+            !reply.contains(":skip 1"),
+            "expected :where not to suggest skipping past a match hidden only by seen ranges, got: {reply}"
+        );
+    }
+
+    #[test]
+    fn matches_all_keeps_search_session_bounded_to_limit_plus_probe() {
+        let text = (0..(MAX_MATCH_LIMIT + 25))
+            .map(|idx| format!("foo line {idx}\n"))
+            .collect::<String>();
+        let mut pager = activate_pager_with_text(&text);
+
+        let matches = text_from_reply(pager.handle_command(":matches -n all foo\n"));
+        assert!(
+            matches.contains("[pager] matches: 500 shown (limit 500), more available"),
+            "expected bounded all-matches header, got: {matches}"
+        );
+
+        let session = pager
+            .state
+            .as_ref()
+            .and_then(|state| state.search_session.as_ref())
+            .expect("search session retained after :matches -n all");
+        assert_eq!(
+            session.hits.len(),
+            MAX_MATCH_LIMIT + 1,
+            "expected bounded search session, got {} hits",
+            session.hits.len()
+        );
+    }
+
+    #[test]
+    fn matches_all_session_completes_before_goto() {
+        let text = (0..700)
+            .map(|idx| format!("foo line {idx}\n"))
+            .collect::<String>();
+        let mut pager = activate_pager_with_text(&text);
+
+        let listed = text_from_reply(pager.handle_command(":matches -n all foo\n"));
+        assert!(
+            listed.contains("[pager] matches: 500 shown (limit 500), more available"),
+            "expected bounded all-matches listing, got: {listed}"
+        );
+
+        let jumped = text_from_reply(pager.handle_command(":goto 600\n"));
+        assert!(
+            jumped.contains("[pager] search #600/700") && jumped.contains("foo line 599"),
+            "expected goto to rebuild a full search session after :matches -n all, got: {jumped}"
+        );
+    }
+
+    #[test]
+    fn default_matches_session_completes_before_goto() {
+        let text = (0..80)
+            .map(|idx| format!("foo line {idx}\n"))
+            .collect::<String>();
+        let mut pager = activate_pager_with_text(&text);
+
+        let listed = text_from_reply(pager.handle_command(":matches foo\n"));
+        assert!(
+            listed.contains("[pager] matches: 50 shown (limit 50), more available"),
+            "expected default limited match listing, got: {listed}"
+        );
+
+        let jumped = text_from_reply(pager.handle_command(":goto 60\n"));
+        assert!(
+            jumped.contains("[pager] search #60/80") && jumped.contains("foo line 59"),
+            "expected goto to rebuild a full search session, got: {jumped}"
+        );
+    }
+
+    #[test]
+    fn refreshed_matches_all_session_stays_bounded() {
+        let text = (0..(MAX_MATCH_LIMIT + 25))
+            .map(|idx| format!("foo line {idx}\n"))
+            .collect::<String>();
+        let mut fixture = activate_pager_from_output(&text);
+
+        let initial = text_from_reply(fixture.pager.handle_command(":matches -n all foo\n"));
+        assert!(
+            initial.contains("[pager] matches: 500 shown (limit 500), more available"),
+            "expected bounded all-matches header, got: {initial}"
+        );
+
+        fixture
+            .timeline
+            .append_text(b"foo line refresh-a\nfoo line refresh-b\n", false);
+        fixture.pager.refresh_from_output(&fixture.output);
+
+        let next = text_from_reply(fixture.pager.handle_command(":n\n"));
+        assert!(
+            next.contains("foo line 1"),
+            "expected non-random-access refresh navigation to keep working, got: {next}"
+        );
+
+        let session = fixture
+            .pager
+            .state
+            .as_ref()
+            .and_then(|state| state.search_session.as_ref())
+            .expect("search session retained after refresh");
+        assert_eq!(
+            session.hits.len(),
+            MAX_MATCH_LIMIT + 1,
+            "expected refreshed search session to stay bounded, got {} hits",
+            session.hits.len()
+        );
+    }
+
+    #[test]
+    fn slash_search_miss_after_same_line_hit_anchors_previous_match() {
+        let text = "alpha foo suffix\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(12);
+
+        let miss = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            miss.contains("[pager] search #1/1") && miss.contains("alpha foo suffix"),
+            "expected slash search to recover the earlier same-line hit, got: {miss}"
+        );
+    }
+
+    #[test]
+    fn refreshed_tail_miss_session_uses_next_appended_hit() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut fixture = activate_pager_from_output(text);
+        fixture
+            .pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(40);
+
+        let miss = text_from_reply(fixture.pager.handle_command(":/foo\n"));
+        assert!(
+            miss.contains("[pager] search #2/2") && miss.contains("beta foo"),
+            "expected slash search to recover the last earlier hit, got: {miss}"
+        );
+
+        let boundary = text_from_reply(fixture.pager.handle_command(":n\n"));
+        assert!(
+            boundary.contains("[pager] already at the last search hit #2/2 for `foo`"),
+            "expected :n to move to the past-end boundary before refresh, got: {boundary}"
+        );
+
+        fixture.timeline.append_text(b"gamma foo\n", false);
+        fixture.pager.refresh_from_output(&fixture.output);
+
+        let next = text_from_reply(fixture.pager.handle_command(":n\n"));
+        assert!(
+            next.contains("gamma foo"),
+            "expected :n to land on the newly appended hit after refresh, got: {next}"
+        );
+    }
+
+    #[test]
+    fn slash_search_returns_compact_card_and_match_count() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\noutro\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let reply = text_from_reply(pager.handle_command(":/foo\n"));
+
+        assert!(
+            reply.contains("[pager] search #1/?"),
+            "expected compact search header, got: {reply}"
+        );
+        assert!(
+            reply.contains("alpha foo"),
+            "expected match line, got: {reply}"
+        );
+        assert!(
+            !reply.contains("middle\nbeta foo"),
+            "expected compact card instead of full page, got: {reply}"
+        );
+    }
+
+    #[test]
+    fn compact_same_line_search_keeps_unseen_text_pageable() {
+        let text = format!(
+            "{}{}{} target foo suffix\nomega\n",
+            "a".repeat(1200),
+            "UNSEEN-MARKER ",
+            "b".repeat(1800)
+        );
+        let mut pager = activate_pager_with_text(&text);
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(1000);
+
+        let found = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            found.contains("target foo"),
+            "expected compact search card for the later same-line hit, got: {found}"
+        );
+
+        let next_page = text_from_reply(pager.handle_command("\n"));
+        assert!(
+            next_page.contains("UNSEEN-MARKER"),
+            "expected paging to continue through unseen same-line text, got: {next_page}"
+        );
+    }
+
+    #[test]
+    fn compact_same_line_backward_hit_keeps_unseen_tail_pageable() {
+        let text = format!(
+            "{} foo {} foo {}TAIL-MARKER {}\nomega\n",
+            "a".repeat(1200),
+            "b".repeat(900),
+            "c".repeat(200),
+            "d".repeat(1400)
+        );
+        let mut pager = activate_pager_with_text(&text);
+        let cursor = text.find("TAIL-MARKER").expect("tail marker offset");
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(cursor as u64);
+
+        let found = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            found.contains("foo"),
+            "expected compact search card for the earlier same-line hit, got: {found}"
+        );
+
+        let next_page = text_from_reply(pager.handle_command("\n"));
+        assert!(
+            next_page.contains("TAIL-MARKER"),
+            "expected paging to continue through the unseen tail after same-line backward hit, got: {next_page}"
+        );
+    }
+
+    #[test]
+    fn goto_same_line_backward_hit_moves_cursor_to_line_start() {
+        let text = format!(
+            "{}HEAD-MARKER {} foo {}TAIL-MARKER {}\nomega\n",
+            "a".repeat(200),
+            "b".repeat(200),
+            "c".repeat(900),
+            "d".repeat(1400)
+        );
+        let mut pager = activate_pager_with_text(&text);
+        let cursor = text.find("TAIL-MARKER").expect("tail marker offset");
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(cursor as u64);
+
+        let _ = pager.handle_command(":matches foo\n");
+        let jumped = text_from_reply(pager.handle_command(":goto 1\n"));
+        assert!(
+            jumped.contains("HEAD-MARKER") || jumped.contains("[match]"),
+            "expected compact goto card for the earlier same-line hit, got: {jumped}"
+        );
+
+        let next_page = text_from_reply(pager.handle_command("\n"));
+        assert!(
+            next_page.contains("HEAD-MARKER"),
+            "expected paging after :goto to resume from the line start for same-line backward hits, got: {next_page}"
+        );
+    }
+
+    #[test]
+    fn compact_search_on_long_later_line_keeps_unseen_tail_pageable() {
+        let text = format!(
+            "intro\n{} foo {}TAIL-MARKER {}\nomega\n",
+            "a".repeat(1200),
+            "b".repeat(200),
+            "c".repeat(1400)
+        );
+        let mut pager = activate_pager_with_text(&text);
+
+        let found = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            found.contains("foo"),
+            "expected compact search card for the long later line, got: {found}"
+        );
+
+        let next_page = text_from_reply(pager.handle_command("\n"));
+        assert!(
+            next_page.contains("TAIL-MARKER"),
+            "expected paging to continue through the unseen tail after a compact long-line hit, got: {next_page}"
+        );
+    }
+
+    #[test]
+    fn compact_search_card_includes_match_from_long_line_tail() {
+        let text = format!("{} token-at-tail suffix\n", "x".repeat(260));
+        let mut pager = activate_pager_with_text(&text);
+
+        let reply = text_from_reply(pager.handle_command(":/token-at-tail\n"));
+        let body_match_count = reply.match_indices("token-at-tail").count();
+
+        assert!(
+            body_match_count >= 2,
+            "expected compact card body to include matched text in addition to the header, got: {reply}"
+        );
+    }
+
+    #[test]
+    fn compact_search_card_includes_match_after_non_ascii_prefix() {
+        let text = format!("{} token-at-tail suffix\n", "ż".repeat(260));
+        let mut pager = activate_pager_with_text(&text);
+
+        let reply = text_from_reply(pager.handle_command(":/token-at-tail\n"));
+        let body_match_count = reply.match_indices("token-at-tail").count();
+
+        assert!(
+            body_match_count >= 2,
+            "expected compact card body to include matched text after non-ASCII prefix, got: {reply}"
+        );
+    }
+
+    #[test]
+    fn compact_search_card_includes_match_after_invalid_utf8_prefix() {
+        let mut bytes = vec![0xff; 260];
+        bytes.extend_from_slice(b" token-at-tail suffix\n");
+        let mut pager = activate_pager_with_bytes(bytes);
+
+        let reply = text_from_reply(pager.handle_command(":/token-at-tail\n"));
+        let body_match_count = reply.match_indices("token-at-tail").count();
+
+        assert!(
+            body_match_count >= 2,
+            "expected compact card body to include matched text after invalid UTF-8 prefix, got: {reply}"
+        );
+    }
+
+    #[test]
+    fn search_navigation_is_bidirectional_and_reuses_refs() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let first = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            first.contains("alpha foo"),
+            "expected first hit, got: {first}"
+        );
+
+        let second = text_from_reply(pager.handle_command(":n\n"));
+        assert!(
+            second.contains("beta foo"),
+            "expected second hit, got: {second}"
+        );
+
+        let back = text_from_reply(pager.handle_command(":p\n"));
+        assert!(
+            back.contains("alpha foo"),
+            "expected previous hit, got: {back}"
+        );
+        assert!(
+            back.contains("[pager] shown earlier @"),
+            "expected prior reference marker, got: {back}"
+        );
+    }
+
+    #[test]
+    fn goto_and_bare_matches_use_active_search_session() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega foo\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let _ = pager.handle_command(":/foo\n");
+
+        let listed = text_from_reply(pager.handle_command(":matches\n"));
+        assert!(
+            listed.contains("#1 @12") && listed.contains("#2 @28") && listed.contains("#3 @38"),
+            "expected active search listing, got: {listed}"
+        );
+
+        let jumped = text_from_reply(pager.handle_command(":goto 3\n"));
+        assert!(
+            jumped.contains("omega foo"),
+            "expected goto hit, got: {jumped}"
+        );
+        assert!(
+            jumped.contains("[pager] search #3/3"),
+            "expected goto to update search index, got: {jumped}"
+        );
+    }
+
+    #[test]
+    fn explicit_matches_pattern_resets_navigation_to_list_start() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega foo\n";
+        let mut pager = activate_pager_with_text(text);
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(20);
+
+        let listed = text_from_reply(pager.handle_command(":matches foo\n"));
+        assert!(
+            listed.contains("#1 @12") && listed.contains("#2 @28") && listed.contains("#3 @38"),
+            "expected full numbered list, got: {listed}"
+        );
+
+        let next = text_from_reply(pager.handle_command(":n\n"));
+        assert!(
+            next.contains("beta foo"),
+            "expected :n to continue from list hit #1 to #2, got: {next}"
+        );
+        assert!(
+            next.contains("[pager] search #2/3"),
+            "expected navigation to align with list numbering, got: {next}"
+        );
+    }
+
+    #[test]
+    fn explicit_matches_keeps_first_selected_hit_active_for_next() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega foo\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let listed = text_from_reply(pager.handle_command(":matches foo\n"));
+        assert!(
+            listed.contains("#1 @12") && listed.contains("#2 @28") && listed.contains("#3 @38"),
+            "expected full numbered list, got: {listed}"
+        );
+
+        let next = text_from_reply(pager.handle_command(":n\n"));
+        assert!(
+            next.contains("beta foo"),
+            "expected :n to advance from selected hit #1 to #2, got: {next}"
+        );
+        assert!(
+            !next.contains("alpha foo"),
+            "expected :n not to redisplay hit #1 after :matches, got: {next}"
+        );
+    }
+
+    #[test]
+    fn explicit_matches_keeps_first_selected_hit_active_for_prev_boundary() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega foo\n";
+        let mut pager = activate_pager_with_text(text);
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(text.len() as u64);
+
+        let listed = text_from_reply(pager.handle_command(":matches foo\n"));
+        assert!(
+            listed.contains("#1 @12") && listed.contains("#2 @28") && listed.contains("#3 @38"),
+            "expected full numbered list, got: {listed}"
+        );
+
+        let prev = text_from_reply(pager.handle_command(":p\n"));
+        assert!(
+            prev.contains("already at the first"),
+            "expected :p to report the first-hit boundary after :matches, got: {prev}"
+        );
+        assert!(
+            !prev.contains("omega foo"),
+            "expected :p not to jump to the last hit from the old pager cursor, got: {prev}"
+        );
+    }
+
+    #[test]
+    fn search_boundary_message_keeps_pager_active() {
+        let text = "intro\nalpha foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let _ = pager.handle_command(":/foo\n");
+        let boundary = text_from_reply(pager.handle_command(":n\n"));
+
+        assert!(
+            boundary.contains("already at the last"),
+            "expected boundary message, got: {boundary}"
+        );
+        assert!(pager.state.is_some(), "expected pager to stay active");
+    }
+
+    #[test]
+    fn matches_with_context_uses_first_context_line_for_gap_marker() {
+        let text = "intro\nctx before\nalpha foo\nctx after\n";
+        let mut pager = activate_pager_with_text(text);
+        pager.state.as_mut().expect("pager active").last_emitted = Some((0, 6));
+
+        let listed = text_from_reply(pager.handle_command(":matches -C 1 foo\n"));
+
+        assert!(
+            !listed.contains("[pager] elided output"),
+            "expected no overlapping gap marker before context output, got: {listed}"
+        );
+        assert!(
+            listed.contains("ctx before"),
+            "expected leading context line, got: {listed}"
+        );
+    }
+
+    #[test]
+    fn matches_history_keeps_disjoint_hits_separate() {
+        let text = "alpha foo\nbetween token\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let _ = pager.handle_command(":matches -n 2 foo\n");
+        let found = text_from_reply(pager.handle_command(":/token\n"));
+
+        assert!(
+            !found.contains("[pager] shown earlier @"),
+            "expected unseen gap content not to be marked as shown, got: {found}"
+        );
+    }
+
+    #[test]
+    fn range_with_elided_gap_does_not_mark_hidden_text_as_shown() {
+        let text = "alpha foo\nmiddle token\nbeta foo\n";
+        let mut pager = activate_pager_with_text(text);
+        let middle_start = "alpha foo\n".len() as u64;
+        let middle_end = middle_start + "middle token\n".len() as u64;
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .seen_ranges
+            .insert(middle_start, middle_end);
+
+        let ranged = text_from_reply(pager.handle_command(":range 1 3\n"));
+        assert!(
+            ranged.contains("[pager] elided output"),
+            "expected elision marker for the seen middle line, got: {ranged}"
+        );
+
+        let found = text_from_reply(pager.handle_command(":/token\n"));
+        assert!(
+            !found.contains("[pager] shown earlier @"),
+            "expected elided middle text not to be marked as shown, got: {found}"
+        );
+    }
+
+    #[test]
+    fn search_sessions_index_each_matching_line_once() {
+        let text = "alpha foo foo\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let first = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            first.contains("alpha foo foo"),
+            "expected first hit on first matching line, got: {first}"
+        );
+
+        let next = text_from_reply(pager.handle_command(":n\n"));
+        assert!(
+            next.contains("beta foo"),
+            "expected :n to advance to the next matching line, got: {next}"
+        );
+        assert!(
+            !next.contains("alpha foo foo"),
+            "expected duplicate same-line hit to be skipped, got: {next}"
+        );
+
+        let listed = text_from_reply(pager.handle_command(":matches foo\n"));
+        assert!(
+            listed.contains("#1 @6") && listed.contains("#2 @19"),
+            "expected two matching lines in list, got: {listed}"
+        );
+        assert!(
+            !listed.contains("#3 @"),
+            "expected no duplicate third hit from same line, got: {listed}"
+        );
+    }
+
+    #[test]
+    fn completing_search_session_preserves_active_same_line_occurrence() {
+        let text = "alpha foo beta foo\nomega foo\n";
+        let mut pager = activate_pager_with_text(text);
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(10);
+
+        let first = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            first.contains("[pager] search for `foo` @15"),
+            "expected slash search to land on later same-line occurrence, got: {first}"
+        );
+
+        let listed = text_from_reply(pager.handle_command(":matches\n"));
+        assert!(
+            listed.contains("#1 @15"),
+            "expected completed session to keep the active same-line occurrence, got: {listed}"
+        );
+
+        let jumped = text_from_reply(pager.handle_command(":goto 1\n"));
+        assert!(
+            jumped.contains("[pager] search #1/2 for `foo` @15"),
+            "expected goto to preserve the active same-line occurrence, got: {jumped}"
+        );
+    }
+
+    #[test]
+    fn matches_miss_clears_active_search_session() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let _ = pager.handle_command(":/foo\n");
+        let miss = text_from_reply(pager.handle_command(":matches bar\n"));
+        assert!(
+            miss.contains("[pager] pattern not found: bar"),
+            "expected miss message, got: {miss}"
+        );
+
+        let next = text_from_reply(pager.handle_command(":goto 2\n"));
+        assert!(
+            next.contains("[pager] no active search; use `:/PATTERN` first"),
+            "expected :matches miss to clear the previous search session, got: {next}"
+        );
+    }
+
+    #[test]
+    fn slash_search_miss_clears_active_search_session() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let _ = pager.handle_command(":/foo\n");
+        let miss = text_from_reply(pager.handle_command(":/bar\n"));
+        assert!(
+            miss.contains("[pager] pattern not found: bar"),
+            "expected miss message, got: {miss}"
+        );
+
+        let next = text_from_reply(pager.handle_command(":goto 2\n"));
+        assert!(
+            next.contains("[pager] no active search; use `:/PATTERN` first"),
+            "expected slash-search miss to clear the previous search session, got: {next}"
+        );
+    }
+
+    #[test]
+    fn matches_does_not_update_last_emitted_range() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+        pager.state.as_mut().expect("pager active").last_emitted = Some((0, 6));
+
+        let _ = pager.handle_command(":matches foo\n");
+
+        assert_eq!(
+            pager.state.as_ref().expect("pager active").last_emitted,
+            Some((0, 6)),
+            "expected :matches to leave sequential emission marker unchanged"
+        );
+    }
+
+    #[test]
+    fn compact_search_cards_do_not_update_last_emitted_range() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+        pager.state.as_mut().expect("pager active").last_emitted = Some((0, 6));
+
+        let _ = pager.handle_command(":/foo\n");
+        assert_eq!(
+            pager.state.as_ref().expect("pager active").last_emitted,
+            Some((0, 6)),
+            "expected slash-search card to leave sequential emission marker unchanged"
+        );
+
+        let _ = pager.handle_command(":n\n");
+        assert_eq!(
+            pager.state.as_ref().expect("pager active").last_emitted,
+            Some((0, 6)),
+            "expected search-navigation cards to leave sequential emission marker unchanged"
+        );
+    }
+
+    #[test]
+    fn compact_search_jumps_do_not_emit_false_elision_markers() {
+        let text = (0..200)
+            .map(|idx| match idx {
+                100 => "foo first\n".to_string(),
+                150 => "foo second\n".to_string(),
+                _ => format!("line-{idx:04}\n"),
+            })
+            .collect::<String>();
+        let mut pager = activate_pager_with_text(&text);
+        let state = pager.state.as_mut().expect("pager active");
+        state.last_emitted = Some((0, 12));
+        state.seen_ranges.insert(0, 12);
+
+        let first = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            first.contains("foo first"),
+            "expected slash search to land on the first later hit, got: {first}"
+        );
+        assert!(
+            !first.contains("[pager] elided output (already shown)"),
+            "expected compact search jump not to label unseen output as already shown, got: {first}"
+        );
+
+        let next = text_from_reply(pager.handle_command(":n\n"));
+        assert!(
+            next.contains("foo second"),
+            "expected :n to advance to the next hit, got: {next}"
+        );
+        assert!(
+            !next.contains("[pager] elided output (already shown)"),
+            "expected compact search navigation not to label unseen output as already shown, got: {next}"
+        );
+    }
+
+    #[test]
+    fn compact_search_cards_preserve_original_stream() {
+        let guard = output_ring_test_guard();
+        reset_output_ring();
+        let ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        let timeline = OutputTimeline::new(ring);
+        let output = OutputBuffer::default();
+        output.start_capture();
+        timeline.append_text(b"warning foo details\n", true);
+        let end_offset = output.end_offset().expect("output end offset");
+        let range = output.read_range(0, end_offset);
+        output.advance_offset_to(end_offset);
+        let buffer = PagerBuffer::from_range(range);
+        let mut pager = Pager::default();
+        pager.activate(buffer, true);
+
+        let WorkerReply::Output { contents, .. } = pager.handle_command(":/foo\n");
+        let body = contents
+            .iter()
+            .find_map(|content| match content {
+                WorkerContent::ContentText { text, stream }
+                    if text.contains("warning foo details") =>
+                {
+                    Some((*stream, text.as_str()))
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected compact search body in reply: {:?}", contents));
+        assert!(
+            matches!(body.0, TextStream::Stderr),
+            "expected compact search body to preserve stderr stream, got: {:?}",
+            body.0
+        );
+
+        drop(guard);
+    }
+
+    #[test]
+    fn compact_search_cards_use_non_prompt_match_prefix() {
+        let mut pager = activate_pager_with_text("alpha foo\n");
+
+        let WorkerReply::Output { contents, .. } = pager.handle_command(":/foo\n");
+        let body = contents
+            .iter()
+            .find_map(|content| match content {
+                WorkerContent::ContentText { text, .. } if text.contains("alpha foo") => {
+                    Some(text.as_str())
+                }
+                _ => None,
+            })
+            .expect("expected compact search body in reply");
+
+        assert!(
+            body.contains("[match] alpha foo"),
+            "expected compact search body to use a neutral match prefix, got: {body}"
+        );
+        assert!(
+            !body.starts_with("> ") && !body.contains("\n> "),
+            "expected compact search body to avoid prompt-looking prefixes, got: {body}"
+        );
+    }
+
+    #[test]
+    fn compact_search_cards_keep_stdout_in_mixed_stream_sessions() {
+        let text = "stderr: warning one\nalpha foo\nstderr: warning two\n";
+        let bytes = text.as_bytes().to_vec();
+        let stderr_one = "stderr: warning one\n".len();
+        let stdout_line = "alpha foo\n".len();
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: bytes.len() as u64,
+            bytes,
+            events: Vec::new(),
+            text_spans: vec![
+                OutputTextSpan {
+                    start_byte: 0,
+                    end_byte: stderr_one,
+                    is_stderr: true,
+                },
+                OutputTextSpan {
+                    start_byte: stderr_one,
+                    end_byte: stderr_one + stdout_line,
+                    is_stderr: false,
+                },
+                OutputTextSpan {
+                    start_byte: stderr_one + stdout_line,
+                    end_byte: text.len(),
+                    is_stderr: true,
+                },
+            ],
+        };
+        let buffer = PagerBuffer::from_range(range);
+        let mut pager = Pager::default();
+        pager.activate(buffer, true);
+
+        let WorkerReply::Output { contents, .. } = pager.handle_command(":/foo\n");
+        let stream = contents
+            .iter()
+            .find_map(|content| match content {
+                WorkerContent::ContentText { text, stream } if text.contains("alpha foo") => {
+                    Some(*stream)
+                }
+                _ => None,
+            })
+            .expect("expected compact search body in reply");
+        assert!(
+            matches!(stream, TextStream::Stdout),
+            "expected compact search body to preserve stdout stream for stdout lines, got: {:?}",
+            stream
+        );
+    }
+
+    #[test]
+    fn compact_search_cards_keep_stdout_in_collapsed_mixed_stream_sessions() {
+        let text = "stderr: warning one\nalpha foo\nstderr: warning two\n";
+        let bytes = text.as_bytes().to_vec();
+        let stderr_one = "stderr: warning one\n".len();
+        let stdout_line = "alpha foo\n".len();
+        let buffer = PagerBuffer::from_bytes_and_events(
+            bytes,
+            Vec::new(),
+            vec![
+                OutputTextSpan {
+                    start_byte: 0,
+                    end_byte: stderr_one,
+                    is_stderr: true,
+                },
+                OutputTextSpan {
+                    start_byte: stderr_one,
+                    end_byte: stderr_one + stdout_line,
+                    is_stderr: false,
+                },
+                OutputTextSpan {
+                    start_byte: stderr_one + stdout_line,
+                    end_byte: text.len(),
+                    is_stderr: true,
+                },
+            ],
+            text.len() as u64,
+        );
+        let mut pager = Pager::default();
+        pager.activate(buffer, true);
+
+        let WorkerReply::Output { contents, .. } = pager.handle_command(":/foo\n");
+        let stream = contents
+            .iter()
+            .find_map(|content| match content {
+                WorkerContent::ContentText { text, stream } if text.contains("alpha foo") => {
+                    Some(*stream)
+                }
+                _ => None,
+            })
+            .expect("expected compact search body in reply");
+        assert!(
+            matches!(stream, TextStream::Stdout),
+            "expected compact search body to preserve stdout stream for collapsed stdout lines, got: {:?}",
+            stream
+        );
+    }
+
+    #[test]
+    fn compact_search_cards_keep_stdout_after_refresh_appends_mixed_streams() {
+        let initial = OutputRange {
+            start_offset: 0,
+            end_offset: "stderr: init\n".len() as u64,
+            bytes: b"stderr: init\n".to_vec(),
+            events: Vec::new(),
+            text_spans: vec![OutputTextSpan {
+                start_byte: 0,
+                end_byte: "stderr: init\n".len(),
+                is_stderr: true,
+            }],
+        };
+        let mut pager = Pager::default();
+        pager.activate(PagerBuffer::from_range(initial), true);
+
+        let appended_text = "alpha foo\nstderr: warning two\n";
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .append_range(OutputRange {
+                start_offset: "stderr: init\n".len() as u64,
+                end_offset: ("stderr: init\n".len() + appended_text.len()) as u64,
+                bytes: appended_text.as_bytes().to_vec(),
+                events: Vec::new(),
+                text_spans: vec![
+                    OutputTextSpan {
+                        start_byte: 0,
+                        end_byte: "alpha foo\n".len(),
+                        is_stderr: false,
+                    },
+                    OutputTextSpan {
+                        start_byte: "alpha foo\n".len(),
+                        end_byte: appended_text.len(),
+                        is_stderr: true,
+                    },
+                ],
+            });
+
+        let WorkerReply::Output { contents, .. } = pager.handle_command(":/foo\n");
+        let stream = contents
+            .iter()
+            .find_map(|content| match content {
+                WorkerContent::ContentText { text, stream } if text.contains("alpha foo") => {
+                    Some(*stream)
+                }
+                _ => None,
+            })
+            .expect("expected compact search body in reply");
+        assert!(
+            matches!(stream, TextStream::Stdout),
+            "expected compact search body to preserve stdout stream after refresh, got: {:?}",
+            stream
+        );
+    }
+
+    #[test]
+    fn compact_search_cards_preserve_mixed_stream_segments_within_one_line() {
+        let text = "alpha foo omega\n";
+        let bytes = text.as_bytes().to_vec();
+        let alpha_len = "alpha ".len();
+        let foo_len = "foo".len();
+        let range = OutputRange {
+            start_offset: 0,
+            end_offset: bytes.len() as u64,
+            bytes,
+            events: Vec::new(),
+            text_spans: vec![
+                OutputTextSpan {
+                    start_byte: 0,
+                    end_byte: alpha_len,
+                    is_stderr: false,
+                },
+                OutputTextSpan {
+                    start_byte: alpha_len,
+                    end_byte: alpha_len + foo_len,
+                    is_stderr: true,
+                },
+                OutputTextSpan {
+                    start_byte: alpha_len + foo_len,
+                    end_byte: text.len(),
+                    is_stderr: false,
+                },
+            ],
+        };
+        let buffer = PagerBuffer::from_range(range);
+        let mut pager = Pager::default();
+        pager.activate(buffer, false);
+
+        let WorkerReply::Output { contents, .. } = pager.handle_command(":/foo\n");
+
+        assert!(
+            contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentText { text, stream }
+                    if matches!(stream, TextStream::Stdout) && text.contains("alpha ")
+            )),
+            "expected compact search card to keep the stdout prefix segment, got: {:?}",
+            contents
+        );
+        assert!(
+            contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentText { text, stream }
+                    if matches!(stream, TextStream::Stderr) && text.contains("foo")
+            )),
+            "expected compact search card to keep the stderr match segment, got: {:?}",
+            contents
+        );
+        assert!(
+            contents.iter().any(|content| matches!(
+                content,
+                WorkerContent::ContentText { text, stream }
+                    if matches!(stream, TextStream::Stdout) && text.contains(" omega")
+            )),
+            "expected compact search card to keep the stdout suffix segment, got: {:?}",
+            contents
+        );
+    }
+
+    #[test]
+    fn matches_without_context_does_not_mark_hidden_long_line_match_as_shown() {
+        let long_prefix = "x".repeat(MATCH_LINE_MAX_BYTES);
+        let text = format!("{long_prefix}foo trailing text\nbeta foo\n");
+        let mut pager = activate_pager_with_text(&text);
+
+        let listed = text_from_reply(pager.handle_command(":matches foo\n"));
+        assert!(
+            listed.contains("#1 @"),
+            "expected long-line match to appear in list output, got: {listed}"
+        );
+
+        let first = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            !first.contains("[pager] shown earlier @"),
+            "expected truncated :matches row not to mark hidden long-line match as shown, got: {first}"
+        );
+    }
+
+    #[test]
+    fn matches_without_context_do_not_mark_hidden_long_line_tail_as_shown() {
+        let hidden_term = "tailterm";
+        let long_middle = "x".repeat(MATCH_LINE_MAX_BYTES);
+        let text = format!("foo {long_middle}{hidden_term}\n");
+        let mut pager = activate_pager_with_text(&text);
+
+        let listed = text_from_reply(pager.handle_command(":matches foo\n"));
+        assert!(
+            listed.contains("#1 @0"),
+            "expected visible-prefix match to appear in list output, got: {listed}"
+        );
+
+        let hidden = text_from_reply(pager.handle_command(":/tailterm\n"));
+        assert!(
+            !hidden.contains("[pager] shown earlier @"),
+            "expected hidden tail term to remain unviewed after truncated :matches row, got: {hidden}"
+        );
+    }
+
+    #[test]
+    fn matches_with_context_does_not_mark_hidden_long_line_match_as_shown() {
+        let long_prefix = "x".repeat(MATCH_LINE_MAX_BYTES);
+        let text = format!("ctx before\n{long_prefix}foo trailing text\nctx after\n");
+        let mut pager = activate_pager_with_text(&text);
+
+        let listed = text_from_reply(pager.handle_command(":matches -C 1 foo\n"));
+        assert!(
+            listed.contains("ctx before") && listed.contains("ctx after"),
+            "expected context lines in list output, got: {listed}"
+        );
+
+        let first = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            !first.contains("[pager] shown earlier @"),
+            "expected truncated context match row not to mark hidden long-line match as shown, got: {first}"
+        );
+    }
+
+    #[test]
+    fn hits_with_context_do_not_mark_hidden_long_context_tail_as_shown() {
+        let hidden_term = "tailterm";
+        let long_middle = "x".repeat(MATCH_LINE_MAX_BYTES);
+        let text = format!("foo\n{long_middle}{hidden_term}\n");
+        let mut pager = activate_pager_with_text(&text);
+
+        let listed = text_from_reply(pager.handle_command(":hits -C 1 foo\n"));
+        assert!(
+            listed.contains("#1 @0"),
+            "expected :hits output for the first match, got: {listed}"
+        );
+
+        let hidden = text_from_reply(pager.handle_command(":/tailterm\n"));
+        assert!(
+            !hidden.contains("[pager] shown earlier @"),
+            "expected hidden long context tail not to be marked as shown after :hits, got: {hidden}"
+        );
+    }
+
+    #[test]
+    fn bare_matches_keeps_active_search_position() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\ngamma foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+
+        let _ = pager.handle_command(":/foo\n");
+        let _ = pager.handle_command(":n\n");
+        let current_index = pager
+            .state
+            .as_ref()
+            .and_then(|state| state.search_session.as_ref())
+            .map(|session| session.current_index)
+            .expect("search session after navigation");
+
+        let listed = text_from_reply(pager.handle_command(":matches\n"));
+        assert!(
+            listed.contains("#1 @") && listed.contains("#2 @") && listed.contains("#3 @"),
+            "expected bare :matches to list the active search session, got: {listed}"
+        );
+
+        let current_after = pager
+            .state
+            .as_ref()
+            .and_then(|state| state.search_session.as_ref())
+            .map(|session| session.current_index)
+            .expect("search session after listing");
+        assert_eq!(
+            current_after, current_index,
+            "expected bare :matches to leave the active search position unchanged"
+        );
+
+        let next = text_from_reply(pager.handle_command(":n\n"));
+        assert!(
+            next.contains("gamma foo"),
+            "expected search navigation to continue from the previously active hit, got: {next}"
+        );
+    }
+
+    #[test]
+    fn refreshed_extended_matches_session_keeps_discovered_position() {
+        let text = (0..80)
+            .map(|i| format!("entry-{i:03} foo\n"))
+            .collect::<String>();
+        let mut fixture = activate_pager_from_output(&text);
+
+        let listed = text_from_reply(fixture.pager.handle_command(":matches -n 2 foo\n"));
+        assert!(
+            listed.contains("entry-000 foo") && listed.contains("entry-001 foo"),
+            "expected limited matches output, got: {listed}"
+        );
+
+        for expected in 1..=5 {
+            let next = text_from_reply(fixture.pager.handle_command(":n\n"));
+            assert!(
+                next.contains(&format!("entry-{expected:03} foo")),
+                "expected to advance to discovered hit {expected}, got: {next}"
+            );
+        }
+
+        fixture.timeline.append_text(b"entry-080 foo\n", false);
+        fixture.pager.refresh_from_output(&fixture.output);
+
+        let next = text_from_reply(fixture.pager.handle_command(":n\n"));
+        assert!(
+            next.contains("entry-006 foo"),
+            "expected refresh to preserve the extended search position, got: {next}"
+        );
+
+        let refreshed_session = fixture
+            .pager
+            .state
+            .as_ref()
+            .and_then(|state| state.search_session.as_ref())
+            .expect("search session retained after refresh");
+        assert_eq!(
+            refreshed_session.hits.len(),
+            7,
+            "expected post-refresh navigation to preserve a bounded discovered window, got {} indexed hits",
+            refreshed_session.hits.len()
         );
     }
 }
