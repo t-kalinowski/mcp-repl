@@ -26,8 +26,8 @@ use crate::ipc::{
 #[cfg(any(target_family = "unix", target_family = "windows"))]
 use crate::ipc::{IpcHandlers, IpcPlotImage};
 use crate::output_capture::{
-    OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEventKind, OutputRange, OutputTimeline,
-    ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
+    OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, OutputEventKind, OutputRange, OutputTextSpan,
+    OutputTimeline, ensure_output_ring, reset_last_reply_marker_offset, reset_output_ring,
 };
 use crate::pager::{self, Pager};
 use crate::sandbox::{
@@ -1867,10 +1867,11 @@ fn snapshot_page_with_images(
 fn snapshot_page_with_images_from_collapsed(
     bytes: Vec<u8>,
     events: Vec<(u64, OutputEventKind)>,
+    text_spans: Vec<OutputTextSpan>,
     source_end: u64,
     target_bytes: u64,
 ) -> SnapshotWithImages {
-    let buffer = pager::PagerBuffer::from_bytes_and_events(bytes, events, source_end);
+    let buffer = pager::PagerBuffer::from_bytes_and_events(bytes, events, text_spans, source_end);
     let pager::SnapshotPage {
         contents,
         pages_left,
@@ -1902,10 +1903,15 @@ fn snapshot_after_completion(
         let range = output.read_range(start_offset, end_offset);
         output.advance_offset_to(end_offset);
         let prompt_variants = completion.prompt_variants.clone().unwrap_or_default();
-        let (bytes, events) =
+        let (bytes, events, text_spans) =
             collapse_echo_with_attribution(range, &completion.echo_events, &prompt_variants);
-        let snapshot =
-            snapshot_page_with_images_from_collapsed(bytes, events, end_offset, target_bytes);
+        let snapshot = snapshot_page_with_images_from_collapsed(
+            bytes,
+            events,
+            text_spans,
+            end_offset,
+            target_bytes,
+        );
         return CompletionSnapshot {
             snapshot,
             saw_stderr,
@@ -2138,11 +2144,12 @@ fn collapse_echo_with_attribution(
     range: OutputRange,
     echo_events: &[IpcEchoEvent],
     prompt_variants: &[String],
-) -> (Vec<u8>, Vec<(u64, OutputEventKind)>) {
+) -> (Vec<u8>, Vec<(u64, OutputEventKind)>, Vec<OutputTextSpan>) {
     const ECHO_MARKER_MIN_BYTES: usize = 512;
 
     let mut out_bytes: Vec<u8> = Vec::new();
     let mut out_events: Vec<(u64, OutputEventKind)> = Vec::new();
+    let mut out_text_spans: Vec<OutputTextSpan> = Vec::new();
 
     let prompt_variants = prompt_variants_bytes(prompt_variants);
     let mut pending = PendingEchoRun::default();
@@ -2151,6 +2158,7 @@ fn collapse_echo_with_attribution(
     let base_offset = range.start_offset;
     let end_offset = range.end_offset;
     let bytes = range.bytes;
+    let text_spans = range.text_spans;
 
     // Convert ring offsets to byte indices within `bytes`.
     let mut events: Vec<(usize, OutputEventKind)> = range
@@ -2166,7 +2174,9 @@ fn collapse_echo_with_attribution(
         .collect();
     events.sort_by_key(|(offset, _)| *offset);
 
-    let mut flush_pending = |out_bytes: &mut Vec<u8>, pending: &mut PendingEchoRun| {
+    let mut flush_pending = |out_bytes: &mut Vec<u8>,
+                             out_text_spans: &mut Vec<OutputTextSpan>,
+                             pending: &mut PendingEchoRun| {
         if pending.is_empty() {
             return;
         }
@@ -2180,9 +2190,14 @@ fn collapse_echo_with_attribution(
                 "[repl] echoed input elided: {} lines ({} bytes); head: {}; tail: {}\n",
                 pending.lines, pending.bytes, head_snip, tail_snip
             );
-            out_bytes.extend_from_slice(marker.as_bytes());
+            append_text_with_span(out_bytes, out_text_spans, marker.as_bytes(), false);
         } else {
-            out_bytes.extend_from_slice(&summarize_echo_line_for_output(tail));
+            append_text_with_span(
+                out_bytes,
+                out_text_spans,
+                &summarize_echo_line_for_output(tail),
+                false,
+            );
         }
     };
 
@@ -2190,52 +2205,150 @@ fn collapse_echo_with_attribution(
     for (event_offset, kind) in events {
         let event_offset = event_offset.min(bytes.len());
         if event_offset > cursor {
-            let segment = &bytes[cursor..event_offset];
-            cursor = event_offset;
-            consume_text_segment(
-                segment,
+            consume_text_segment_with_spans(
+                &bytes[cursor..event_offset],
+                cursor,
+                &text_spans,
                 echo_events,
                 &mut echo_idx,
                 &prompt_variants,
                 &mut pending,
                 &mut flush_pending,
                 &mut out_bytes,
+                &mut out_text_spans,
             );
+            cursor = event_offset;
         }
 
         // Image events can race with stdout capture and land at slightly different byte offsets.
         // Treat text events as hard boundaries, but avoid splitting echo runs on image markers.
         if matches!(kind, OutputEventKind::Text { .. }) {
-            flush_pending(&mut out_bytes, &mut pending);
+            flush_pending(&mut out_bytes, &mut out_text_spans, &mut pending);
         }
         out_events.push((out_bytes.len() as u64, kind));
     }
 
     if cursor < bytes.len() {
-        let segment = &bytes[cursor..];
-        consume_text_segment(
-            segment,
+        consume_text_segment_with_spans(
+            &bytes[cursor..],
+            cursor,
+            &text_spans,
             echo_events,
             &mut echo_idx,
             &prompt_variants,
             &mut pending,
             &mut flush_pending,
             &mut out_bytes,
+            &mut out_text_spans,
         );
     }
 
     // Drop any trailing echo-only run (no output followed it).
-    (out_bytes, out_events)
+    (out_bytes, out_events, out_text_spans)
 }
 
-fn consume_text_segment(
+fn append_text_with_span(
+    out_bytes: &mut Vec<u8>,
+    out_text_spans: &mut Vec<OutputTextSpan>,
+    bytes: &[u8],
+    is_stderr: bool,
+) {
+    if bytes.is_empty() {
+        return;
+    }
+    let start_byte = out_bytes.len();
+    out_bytes.extend_from_slice(bytes);
+    let end_byte = out_bytes.len();
+    if let Some(last) = out_text_spans.last_mut()
+        && last.is_stderr == is_stderr
+        && last.end_byte == start_byte
+    {
+        last.end_byte = end_byte;
+    } else {
+        out_text_spans.push(OutputTextSpan {
+            start_byte,
+            end_byte,
+            is_stderr,
+        });
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consume_text_segment_with_spans(
     segment: &[u8],
+    segment_start: usize,
+    text_spans: &[OutputTextSpan],
     echo_events: &[IpcEchoEvent],
     echo_idx: &mut usize,
     prompt_variants: &[Vec<u8>],
     pending: &mut PendingEchoRun,
-    flush_pending: &mut impl FnMut(&mut Vec<u8>, &mut PendingEchoRun),
+    flush_pending: &mut impl FnMut(&mut Vec<u8>, &mut Vec<OutputTextSpan>, &mut PendingEchoRun),
     out_bytes: &mut Vec<u8>,
+    out_text_spans: &mut Vec<OutputTextSpan>,
+) {
+    let segment_end = segment_start.saturating_add(segment.len());
+    let mut cursor = segment_start;
+    for span in text_spans {
+        if span.end_byte <= segment_start {
+            continue;
+        }
+        if span.start_byte >= segment_end {
+            break;
+        }
+        let start = span.start_byte.max(segment_start);
+        let end = span.end_byte.min(segment_end);
+        if cursor < start {
+            consume_text_segment(
+                &segment[cursor - segment_start..start - segment_start],
+                false,
+                echo_events,
+                echo_idx,
+                prompt_variants,
+                pending,
+                flush_pending,
+                out_bytes,
+                out_text_spans,
+            );
+        }
+        consume_text_segment(
+            &segment[start - segment_start..end - segment_start],
+            span.is_stderr,
+            echo_events,
+            echo_idx,
+            prompt_variants,
+            pending,
+            flush_pending,
+            out_bytes,
+            out_text_spans,
+        );
+        cursor = end;
+    }
+    if cursor < segment_end {
+        consume_text_segment(
+            &segment[cursor - segment_start..],
+            false,
+            echo_events,
+            echo_idx,
+            prompt_variants,
+            pending,
+            flush_pending,
+            out_bytes,
+            out_text_spans,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consume_text_segment(
+    segment: &[u8],
+    is_stderr: bool,
+    echo_events: &[IpcEchoEvent],
+    echo_idx: &mut usize,
+    prompt_variants: &[Vec<u8>],
+    pending: &mut PendingEchoRun,
+    flush_pending: &mut impl FnMut(&mut Vec<u8>, &mut Vec<OutputTextSpan>, &mut PendingEchoRun),
+    out_bytes: &mut Vec<u8>,
+    out_text_spans: &mut Vec<OutputTextSpan>,
 ) {
     let mut start = 0usize;
     while start < segment.len() {
@@ -2260,9 +2373,9 @@ fn consume_text_segment(
         let substantive =
             !is_ascii_whitespace_only(line) && !is_prompt_only_fragment(line, prompt_variants);
         if substantive {
-            flush_pending(out_bytes, pending);
+            flush_pending(out_bytes, out_text_spans, pending);
         }
-        out_bytes.extend_from_slice(line);
+        append_text_with_span(out_bytes, out_text_spans, line, is_stderr);
     }
 }
 

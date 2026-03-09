@@ -487,8 +487,6 @@ pub(super) fn take_matches(
 
         let start_idx = entry.line_idx.saturating_sub(spec.context);
         let end_idx = (entry.line_idx + spec.context).min(total_lines.saturating_sub(1));
-        let mut entry_first = None;
-        let mut entry_last = None;
         for line_idx in start_idx..=end_idx {
             let (line_start, line_end) = line_bounds_for_index(buffer, line_idx);
             let line = read_line_text(buffer, line_idx);
@@ -497,11 +495,9 @@ pub(super) fn take_matches(
             output.push_str(&format!("  {marker} {snippet}\n"));
             let range = (line_start, line_end);
             span.record(Some(range));
-            entry_first.get_or_insert(range.0);
-            entry_last = Some(range.1);
-        }
-        if let (Some(start), Some(end)) = (entry_first, entry_last) {
-            view_ranges.push((start, end));
+            if line.trim_end().len() <= MATCH_LINE_MAX_BYTES {
+                view_ranges.push(range);
+            }
         }
     }
 
