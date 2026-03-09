@@ -3453,6 +3453,26 @@ mod tests {
     }
 
     #[test]
+    fn hits_with_context_do_not_mark_hidden_long_context_tail_as_shown() {
+        let hidden_term = "tailterm";
+        let long_middle = "x".repeat(MATCH_LINE_MAX_BYTES);
+        let text = format!("foo\n{long_middle}{hidden_term}\n");
+        let mut pager = activate_pager_with_text(&text);
+
+        let listed = text_from_reply(pager.handle_command(":hits -C 1 foo\n"));
+        assert!(
+            listed.contains("#1 @0"),
+            "expected :hits output for the first match, got: {listed}"
+        );
+
+        let hidden = text_from_reply(pager.handle_command(":/tailterm\n"));
+        assert!(
+            !hidden.contains("[pager] shown earlier @"),
+            "expected hidden long context tail not to be marked as shown after :hits, got: {hidden}"
+        );
+    }
+
+    #[test]
     fn bare_matches_keeps_active_search_position() {
         let text = "intro\nalpha foo\nmiddle\nbeta foo\ngamma foo\nomega\n";
         let mut pager = activate_pager_with_text(text);

@@ -1022,12 +1022,9 @@ pub(super) fn take_hits_next(
     for _ in 0..count {
         match take_next_hit(buffer, hit_state, seen) {
             HitTakeResult::Found(hit_output) => {
+                span.record(hit_output.first_range);
                 span.record(hit_output.last_range);
-                if let (Some((start, _)), Some((_, end))) =
-                    (hit_output.first_range, hit_output.last_range)
-                {
-                    view_ranges.push((start, end));
-                }
+                view_ranges.extend(hit_output.view_ranges);
                 output.push_str(&hit_output.text);
             }
             HitTakeResult::SeenOnly => {
@@ -1090,6 +1087,7 @@ struct HitOutput {
     text: String,
     first_range: Option<(u64, u64)>,
     last_range: Option<(u64, u64)>,
+    view_ranges: Vec<(u64, u64)>,
 }
 
 enum HitTakeResult {
@@ -1153,12 +1151,14 @@ fn take_next_hit(
             text: output,
             first_range: None,
             last_range: None,
+            view_ranges: Vec::new(),
         });
     }
 
     let mut last_output_line = None;
     let mut first_range = None;
     let mut last_range = None;
+    let mut view_ranges = Vec::new();
     for idx in start_idx..=end_idx {
         let (line_start, line_end) = line_bounds_for_index(buffer, idx);
         if seen.covers(line_start, line_end) {
@@ -1172,6 +1172,9 @@ fn take_next_hit(
         last_output_line = Some(idx);
         first_range.get_or_insert((line_start, line_end));
         last_range = Some((line_start, line_end));
+        if let Some(visible_range) = visible_prefix_range(line_start, line_end, &line) {
+            view_ranges.push(visible_range);
+        }
     }
 
     if last_output_line.is_none() && match_line_already_shown {
@@ -1189,5 +1192,6 @@ fn take_next_hit(
         text: output,
         first_range,
         last_range,
+        view_ranges,
     })
 }
