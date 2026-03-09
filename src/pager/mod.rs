@@ -2952,6 +2952,38 @@ mod tests {
     }
 
     #[test]
+    fn goto_same_line_backward_hit_moves_cursor_to_line_start() {
+        let text = format!(
+            "{}HEAD-MARKER {} foo {}TAIL-MARKER {}\nomega\n",
+            "a".repeat(200),
+            "b".repeat(200),
+            "c".repeat(900),
+            "d".repeat(1400)
+        );
+        let mut pager = activate_pager_with_text(&text);
+        let cursor = text.find("TAIL-MARKER").expect("tail marker offset");
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(cursor as u64);
+
+        let _ = pager.handle_command(":matches foo\n");
+        let jumped = text_from_reply(pager.handle_command(":goto 1\n"));
+        assert!(
+            jumped.contains("HEAD-MARKER") || jumped.contains("[match]"),
+            "expected compact goto card for the earlier same-line hit, got: {jumped}"
+        );
+
+        let next_page = text_from_reply(pager.handle_command("\n"));
+        assert!(
+            next_page.contains("HEAD-MARKER"),
+            "expected paging after :goto to resume from the line start for same-line backward hits, got: {next_page}"
+        );
+    }
+
+    #[test]
     fn compact_search_on_long_later_line_keeps_unseen_tail_pageable() {
         let text = format!(
             "intro\n{} foo {}TAIL-MARKER {}\nomega\n",

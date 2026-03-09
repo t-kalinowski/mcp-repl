@@ -83,8 +83,9 @@ impl HeadingState {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct MatchLine {
+    match_start: u64,
     line_idx: usize,
     line_start: u64,
     line_end: u64,
@@ -101,6 +102,18 @@ enum MatchSearchResult {
 pub(super) enum SearchStepOutcome {
     Moved,
     Boundary,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WhereMatchKind {
+    Forward,
+    Earlier,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WhereMatch {
+    kind: WhereMatchKind,
+    matched: MatchLine,
 }
 
 fn all_matches_shown_message(pattern: &str) -> String {
@@ -160,6 +173,7 @@ fn find_next_unseen_match_line(
         let (line_start, line_end) = line_bounds_for_index(buffer, line_idx);
         if !seen.covers(line_start, line_end) {
             return MatchSearchResult::Found(MatchLine {
+                match_start: match_offset,
                 line_idx,
                 line_start,
                 line_end,
@@ -189,23 +203,18 @@ pub(super) fn where_in_buffer(
         format!(":/{}", pattern.pattern)
     };
 
-    let Some(session) = build_full_search_session(buffer, pattern, start_offset) else {
+    let Some(target) = find_where_match(buffer, pattern, start_offset) else {
         return plain_pattern_not_found_message(&pattern.pattern);
     };
 
-    let Some(line_start) = session
-        .hits
-        .get(session.current_index)
-        .map(|hit| hit.line_start)
-    else {
-        let Some(hit) = session.hits.last() else {
-            return plain_pattern_not_found_message(&pattern.pattern);
-        };
+    if matches!(target.kind, WhereMatchKind::Earlier) {
         return format!(
             "[pager] no later match; nearest earlier match is behind the cursor @{}: use {search_cmd}",
-            hit.match_start
+            target.matched.match_start
         );
-    };
+    }
+
+    let line_start = target.matched.line_start;
 
     let mut cursor = start_offset;
     let mut pages_to_skip = 0u64;
@@ -232,6 +241,73 @@ pub(super) fn where_in_buffer(
             "[pager] next match is ~{pages_to_skip} page(s) ahead: use {search_cmd} or `:skip {pages_to_skip}`"
         )
     }
+}
+
+fn find_where_match(
+    buffer: &PagerBuffer,
+    pattern: &SearchPattern,
+    start_offset: u64,
+) -> Option<WhereMatch> {
+    let end_offset = buffer.len();
+    let total_lines = line_count(buffer);
+    if end_offset == 0 || total_lines == 0 {
+        return None;
+    }
+
+    let pattern_bytes = pattern.pattern.as_bytes();
+    if start_offset < end_offset
+        && let Some(match_offset) = buffer.find_next_bytes_with_options(
+            start_offset,
+            end_offset,
+            pattern_bytes,
+            pattern.case_insensitive_ascii,
+        )
+    {
+        let line_idx = line_index_for_offset(buffer, match_offset);
+        if line_idx < total_lines {
+            let (line_start, line_end) = line_bounds_for_index(buffer, line_idx);
+            return Some(WhereMatch {
+                kind: WhereMatchKind::Forward,
+                matched: MatchLine {
+                    match_start: match_offset,
+                    line_idx,
+                    line_start,
+                    line_end,
+                },
+            });
+        }
+    }
+
+    let search_end = start_offset.min(end_offset);
+    let mut search_offset = 0u64;
+    let mut last = None;
+    while search_offset < search_end {
+        let Some(match_offset) = buffer.find_next_bytes_with_options(
+            search_offset,
+            search_end,
+            pattern_bytes,
+            pattern.case_insensitive_ascii,
+        ) else {
+            break;
+        };
+        let line_idx = line_index_for_offset(buffer, match_offset);
+        if line_idx >= total_lines {
+            break;
+        }
+        let (line_start, line_end) = line_bounds_for_index(buffer, line_idx);
+        last = Some(MatchLine {
+            match_start: match_offset,
+            line_idx,
+            line_start,
+            line_end,
+        });
+        search_offset = line_end.max(match_offset.saturating_add(1));
+    }
+
+    last.map(|matched| WhereMatch {
+        kind: WhereMatchKind::Earlier,
+        matched,
+    })
 }
 
 fn line_index_for_offset(buffer: &PagerBuffer, offset: u64) -> usize {
@@ -936,12 +1012,13 @@ pub(super) fn render_search_card(
         .match_start
         .saturating_add(match_char_len)
         .min(hit.line_end);
-    let (range, resume_offset) =
-        if hit.line_start <= current_offset && current_offset < hit.line_end {
-            (None, None)
-        } else {
-            (Some((hit.match_start, match_end)), Some(hit.line_start))
-        };
+    let on_current_line = hit.line_start <= current_offset && current_offset < hit.line_end;
+    let (range, resume_offset) = if on_current_line {
+        let resume_offset = (hit.match_start < current_offset).then_some(hit.line_start);
+        (None, resume_offset)
+    } else {
+        (Some((hit.match_start, match_end)), Some(hit.line_start))
+    };
     (contents, range, resume_offset)
 }
 
@@ -1248,6 +1325,30 @@ mod tests {
         assert!(
             !cleaned.contains("()"),
             "expected empty anchor breadcrumbs to be removed cleanly, got: {cleaned}"
+        );
+    }
+
+    #[test]
+    fn find_where_match_uses_nearest_earlier_matching_line() {
+        let text = "alpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut buffer = buffer_from_text(text);
+        buffer.advance_offset_to(text.len() as u64);
+        let pattern = SearchPattern {
+            pattern: "foo".to_string(),
+            case_insensitive_ascii: false,
+        };
+
+        let target = find_where_match(&buffer, &pattern, buffer.current_offset())
+            .expect("expected earlier fallback match");
+
+        assert!(matches!(target.kind, WhereMatchKind::Earlier));
+        assert_eq!(
+            target.matched.match_start,
+            text.rfind("foo").expect("last foo offset") as u64
+        );
+        assert_eq!(
+            target.matched.line_start,
+            text.find("beta foo").expect("beta foo line start") as u64
         );
     }
 }
