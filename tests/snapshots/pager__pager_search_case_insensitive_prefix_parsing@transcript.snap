@@ -15,7 +15,6 @@ expression: transcript
 
 3) r_repl timeout_ms=30000
 >>> :/i LINE01
-<<< [pager] elided output (already shown): @210..20790
 <<< [pager] search for `LINE01` @20790
 <<< [match] line0100 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...
 <<< --More-- (71p, 49.5%, @20790/42000)

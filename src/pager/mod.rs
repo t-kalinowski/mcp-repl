@@ -1223,7 +1223,6 @@ impl Pager {
                         &state.buffer,
                         page_bytes,
                         &pattern,
-                        &state.seen_ranges,
                     ))];
                     CommandOutcome::new(contents, pages_left, is_error, true, None, None, None)
                 }
@@ -1517,7 +1516,9 @@ impl Pager {
             } else if cursor_after != cursor_before {
                 state.search_session_needs_reseed = true;
             }
-            if let Some(marker) = gap_marker_if_needed(state.last_emitted, first_range) {
+            if let Some(marker) =
+                gap_marker_if_needed(state.last_emitted, first_range, &state.seen_ranges)
+            {
                 contents.insert(0, marker);
             }
             for range in view_ranges {
@@ -2286,8 +2287,11 @@ mod tests {
     }
 
     #[test]
-    fn gap_marker_emits_for_forward_jump() {
-        let marker = gap_marker_if_needed(Some((0, 5)), Some((10, 12))).expect("expected marker");
+    fn gap_marker_emits_for_seen_forward_jump() {
+        let mut seen = RangeSet::default();
+        seen.insert(0, 10);
+        let marker =
+            gap_marker_if_needed(Some((0, 5)), Some((10, 12)), &seen).expect("expected marker");
         let text = match marker {
             WorkerContent::ContentText { text, stream } => {
                 assert!(matches!(stream, TextStream::Stderr));
@@ -2296,6 +2300,15 @@ mod tests {
             _ => panic!("expected text marker"),
         };
         assert!(text.contains("@5..10"));
+    }
+
+    #[test]
+    fn gap_marker_skips_unseen_forward_jump() {
+        let seen = RangeSet::default();
+        assert!(
+            gap_marker_if_needed(Some((0, 5)), Some((10, 12)), &seen).is_none(),
+            "expected unseen forward jump not to be labeled as already shown"
+        );
     }
 
     #[test]
@@ -2675,6 +2688,29 @@ mod tests {
         assert!(
             listed.contains("#1 @12") && listed.contains("#2 @28"),
             "expected full search session to remain available after the miss, got: {listed}"
+        );
+    }
+
+    #[test]
+    fn where_reports_backward_search_fallback_after_last_hit() {
+        let text = "intro\nalpha foo\nmiddle\nbeta foo\nomega\n";
+        let mut pager = activate_pager_with_text(text);
+        pager
+            .state
+            .as_mut()
+            .expect("pager active")
+            .buffer
+            .advance_offset_to(40);
+
+        let reply = text_from_reply(pager.handle_command(":where foo\n"));
+
+        assert!(
+            reply.contains("nearest earlier match is behind the cursor @28: use :/foo"),
+            "expected :where to describe the backward slash-search fallback, got: {reply}"
+        );
+        assert!(
+            !reply.contains("pattern not found"),
+            "expected :where not to report a false miss when :/foo can recover an earlier hit, got: {reply}"
         );
     }
 
@@ -3317,6 +3353,41 @@ mod tests {
             pager.state.as_ref().expect("pager active").last_emitted,
             Some((0, 6)),
             "expected search-navigation cards to leave sequential emission marker unchanged"
+        );
+    }
+
+    #[test]
+    fn compact_search_jumps_do_not_emit_false_elision_markers() {
+        let text = (0..200)
+            .map(|idx| match idx {
+                100 => "foo first\n".to_string(),
+                150 => "foo second\n".to_string(),
+                _ => format!("line-{idx:04}\n"),
+            })
+            .collect::<String>();
+        let mut pager = activate_pager_with_text(&text);
+        let state = pager.state.as_mut().expect("pager active");
+        state.last_emitted = Some((0, 12));
+        state.seen_ranges.insert(0, 12);
+
+        let first = text_from_reply(pager.handle_command(":/foo\n"));
+        assert!(
+            first.contains("foo first"),
+            "expected slash search to land on the first later hit, got: {first}"
+        );
+        assert!(
+            !first.contains("[pager] elided output (already shown)"),
+            "expected compact search jump not to label unseen output as already shown, got: {first}"
+        );
+
+        let next = text_from_reply(pager.handle_command(":n\n"));
+        assert!(
+            next.contains("foo second"),
+            "expected :n to advance to the next hit, got: {next}"
+        );
+        assert!(
+            !next.contains("[pager] elided output (already shown)"),
+            "expected compact search navigation not to label unseen output as already shown, got: {next}"
         );
     }
 

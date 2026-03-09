@@ -172,20 +172,35 @@ pub(super) fn where_in_buffer(
     buffer: &PagerBuffer,
     page_bytes: u64,
     pattern: &SearchPattern,
-    seen: &RangeSet,
 ) -> String {
     let start_offset = buffer.current_offset();
     let end_offset = buffer.len();
-    if start_offset >= end_offset {
+    if end_offset == 0 {
         return "[pager] no remaining output".to_string();
     }
 
-    let line_start = match find_next_unseen_match_line(buffer, start_offset, pattern, seen) {
-        MatchSearchResult::Found(matched) => matched.line_start,
-        MatchSearchResult::SeenOnly => return all_matches_shown_message(&pattern.pattern),
-        MatchSearchResult::NotFound => {
+    let search_cmd = if pattern.case_insensitive_ascii {
+        format!(":/i {}", pattern.pattern)
+    } else {
+        format!(":/{}", pattern.pattern)
+    };
+
+    let Some(session) = build_full_search_session(buffer, pattern, start_offset) else {
+        return pattern_not_found_message(&pattern.pattern, start_offset);
+    };
+
+    let Some(line_start) = session
+        .hits
+        .get(session.current_index)
+        .map(|hit| hit.line_start)
+    else {
+        let Some(hit) = session.hits.last() else {
             return pattern_not_found_message(&pattern.pattern, start_offset);
-        }
+        };
+        return format!(
+            "[pager] no later match; nearest earlier match is behind the cursor @{}: use {search_cmd}",
+            hit.match_start
+        );
     };
 
     let mut cursor = start_offset;
@@ -205,12 +220,6 @@ pub(super) fn where_in_buffer(
             break;
         }
     }
-
-    let search_cmd = if pattern.case_insensitive_ascii {
-        format!(":/i {}", pattern.pattern)
-    } else {
-        format!(":/{}", pattern.pattern)
-    };
 
     if pages_to_skip == 0 {
         format!("[pager] match is on the current/next page: use {search_cmd}")

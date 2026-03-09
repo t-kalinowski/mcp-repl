@@ -1,6 +1,6 @@
 ---
 source: tests/write_stdin_batch.rs
-expression: snapshot.render_transcript()
+expression: transcript
 ---
 == session: pager_hits_queue ==
 1) r_repl timeout_ms=30000
@@ -10,7 +10,6 @@ expression: snapshot.render_transcript()
 
 2) r_repl timeout_ms=30000
 >>> :hits line0150
-<<< [pager] elided output (already shown): @210..31290
 <<< #1 @31290 root
 <<<   > line0150 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx...
 <<< --More-- (35p, 75.0%, @31290..31500/42000)

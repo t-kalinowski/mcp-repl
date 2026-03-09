@@ -43,10 +43,6 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] elided output (already shown): @210..20790"
-    },
-    {
-      "type": "text",
       "text": "[pager] search for `line01` @20790"
     },
     {
@@ -73,10 +69,6 @@ response:
   "type": "tool_result",
   "is_error": false,
   "content": [
-    {
-      "type": "text",
-      "text": "[pager] elided output (already shown): @210..21000"
-    },
     {
       "type": "text",
       "text": "[pager] search for `line01` @21000"
@@ -107,10 +99,6 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] elided output (already shown): @210..21000"
-    },
-    {
-      "type": "text",
       "text": "line0101 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
     },
     {
@@ -137,10 +125,6 @@ response:
   "type": "tool_result",
   "is_error": false,
   "content": [
-    {
-      "type": "text",
-      "text": "[pager] elided output (already shown): @21420..41580"
-    },
     {
       "type": "text",
       "text": "line0199 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nline0200 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"

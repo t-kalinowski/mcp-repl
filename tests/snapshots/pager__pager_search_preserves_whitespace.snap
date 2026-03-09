@@ -67,10 +67,6 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] elided output (already shown): @210..5249"
-    },
-    {
-      "type": "text",
       "text": "[pager] search for ` r` @5249"
     },
     {

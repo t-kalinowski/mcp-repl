@@ -1,6 +1,6 @@
 ---
 source: tests/write_stdin_batch.rs
-expression: snapshot.render()
+expression: rendered
 ---
 == session: pager_hits_queue ==
 -- step 1 --
@@ -41,10 +41,6 @@ response:
   "type": "tool_result",
   "is_error": false,
   "content": [
-    {
-      "type": "text",
-      "text": "[pager] elided output (already shown): @210..31290"
-    },
     {
       "type": "text",
       "text": "#1 @31290 root\n  > line0150 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx..."

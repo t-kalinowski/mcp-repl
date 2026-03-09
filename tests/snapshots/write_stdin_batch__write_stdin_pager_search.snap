@@ -43,10 +43,6 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "[pager] elided output (already shown): @210..10290"
-    },
-    {
-      "type": "text",
       "text": "[pager] search for `line0050` @10290"
     },
     {

@@ -15,7 +15,6 @@ expression: transcript
 
 3) r_repl timeout_ms=30000
 >>> :/ r
-<<< [pager] elided output (already shown): @210..5249
 <<< [pager] search for ` r` @5249
 <<< [match] ...xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx r
 <<< --More-- (124p, 11.9%, @5040/42004)

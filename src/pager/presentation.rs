@@ -1,5 +1,7 @@
 use crate::worker_protocol::WorkerContent;
 
+use super::RangeSet;
+
 pub(super) fn footer_min(pages_left: u64) -> String {
     if pages_left == 0 {
         "(END)".to_string()
@@ -82,10 +84,11 @@ pub(super) fn elision_marker(start: u64, end: u64) -> WorkerContent {
 pub(super) fn gap_marker_if_needed(
     last_range: Option<(u64, u64)>,
     first_range: Option<(u64, u64)>,
+    seen: &RangeSet,
 ) -> Option<WorkerContent> {
     let (_, last_end) = last_range?;
     let (first_start, _) = first_range?;
-    if first_start > last_end {
+    if first_start > last_end && seen.covers(last_end, first_start) {
         return Some(elision_marker(last_end, first_start));
     }
     None

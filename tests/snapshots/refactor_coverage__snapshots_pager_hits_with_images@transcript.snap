@@ -61,7 +61,6 @@ expression: transcript
 
 4) r_repl timeout_ms=10000
 >>> :hits beta
-<<< [pager] elided output (already shown): @600..978
 <<< #1 @978 Title
 <<<   > [repl] echoed input elided: 2 lines (79 bytes); head: > plot(1:5, type = "l"); tail: > for (i in 1:60) cat("beta line ", i, "\n", sep = "")
 <<< --More-- (Np, 39.0%, @978..1118/2861)

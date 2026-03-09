@@ -1,6 +1,6 @@
 ---
 source: tests/pager.rs
-expression: snapshot.render_transcript()
+expression: transcript
 ---
 == session: default ==
 1) r_repl timeout_ms=30000
@@ -17,7 +17,6 @@ expression: snapshot.render_transcript()
 
 2) r_repl timeout_ms=30000
 >>> :hits configure
-<<< [pager] elided output (already shown): @288..1617
 <<< #1 @1617 Title > Alpha
 <<<   > alpha configure 01
 <<< (END, 94.2%, @1617..1636/1736)
