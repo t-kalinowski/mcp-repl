@@ -217,7 +217,11 @@ fn handle_session_start(input: &HookInput) -> Result<(), Box<dyn std::error::Err
         fs::create_dir_all(parent)?;
     }
     let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-    writeln!(file, "{CLAUDE_SESSION_ID_ENV}={}", input.session_id.trim())?;
+    writeln!(
+        file,
+        "export {CLAUDE_SESSION_ID_ENV}={}",
+        input.session_id.trim()
+    )?;
     Ok(())
 }
 
@@ -417,7 +421,7 @@ mod tests {
         handle_session_start(&input).expect("handle session start");
 
         let raw = fs::read_to_string(&env_file).expect("read env file");
-        assert!(raw.contains("MCP_REPL_CLAUDE_SESSION_ID=sess-start"));
+        assert!(raw.contains("export MCP_REPL_CLAUDE_SESSION_ID=sess-start"));
 
         unsafe {
             env::remove_var(CLAUDE_ENV_FILE_ENV);
