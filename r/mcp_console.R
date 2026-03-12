@@ -39,13 +39,13 @@ local({
     invisible(NULL)
   }
 
-  # Redirect R's pager integration (e.g. file.show(), help()) into stdout so
-  # mcp-console can capture and page it with its built-in pager mode.
-  .mcp_console_pager <- function(files,
-                                header = NULL,
-                                title = NULL,
-                                delete.file = FALSE,
-                                ...) {
+  # Redirect R's help/file display hooks into stdout so mcp-console can
+  # surface the full text directly in-band.
+  .mcp_console_cat_files <- function(files,
+                                     header = NULL,
+                                     title = NULL,
+                                     delete.file = FALSE,
+                                     ...) {
     files <- as.character(files)
     if (length(files) == 0L) {
       return(invisible(NULL))
@@ -89,8 +89,8 @@ local({
     invisible(NULL)
   }
 
-  options(pager = .mcp_console_pager)
-  options(help.pager = .mcp_console_pager)
+  options(pager = .mcp_console_cat_files)
+  options(help.pager = .mcp_console_cat_files)
 })
 
 local({

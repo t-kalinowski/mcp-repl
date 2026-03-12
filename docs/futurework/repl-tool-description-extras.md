@@ -106,27 +106,11 @@ It should be treated as source material for:
 - Prefer typed interfaces plus small explicit assertions.
 - Avoid broad defensive fallback trees when a concrete error can clarify intent.
 
-## Recovered pager guidance
+## Recovered output guidance
 
-### Pager semantics
-
-- Pager activates when output exceeds page budget.
-- While pager is active, backend input is blocked.
-- Empty input advances one page.
-- Non-empty pager commands must be `:`-prefixed.
-- Non-empty non-command input is rejected while pager is active.
-- Backend prompt is suppressed during pager mode and restored after exit.
-- Pager output de-duplicates already shown content within a pager session.
-- Pager mode can emit compact input summaries such as `[mcp-console] input: ... [TRUNCATED]`; this is not a backend prompt.
-
-### Pager commands
-
-- next page: empty input
-- quit: `:q`
-- search: `:/pattern`
-- next match: `:n`
-- emit all remaining: `:a`
-- help: `:help`
+- Large outputs are returned directly from the REPL, subject to the bounded output ring.
+- Empty input still polls for additional output from long-running work.
+- Long or multi-line inputs can emit compact summaries such as `[repl] input: ... [TRUNCATED]`; this is not a backend prompt.
 
 ## Recovered image guidance
 

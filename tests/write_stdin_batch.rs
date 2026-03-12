@@ -126,40 +126,6 @@ async fn write_stdin_drives_browser() -> TestResult<()> {
     assert_snapshot_or_skip("write_stdin_drives_browser", &snapshot)
 }
 
-#[cfg(not(windows))]
-#[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_pager_search() -> TestResult<()> {
-    let mut snapshot = McpSnapshot::new();
-
-    snapshot
-        .session("pager_search_queue", mcp_script! {
-            write_stdin("line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))", timeout = 30.0);
-            write_stdin(":/line0050", timeout = 30.0);
-            write_stdin(":n", timeout = 30.0);
-            write_stdin(":q", timeout = 30.0);
-        })
-        .await?;
-
-    assert_snapshot_or_skip("write_stdin_pager_search", &snapshot)
-}
-
-#[cfg(not(windows))]
-#[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_pager_hits() -> TestResult<()> {
-    let mut snapshot = McpSnapshot::new();
-
-    snapshot
-        .session("pager_hits_queue", mcp_script! {
-            write_stdin("line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))", timeout = 30.0);
-            write_stdin(":hits line0150", timeout = 30.0);
-            write_stdin(":n", timeout = 30.0);
-            write_stdin(":q", timeout = 30.0);
-        })
-        .await?;
-
-    assert_snapshot_or_skip("write_stdin_pager_hits", &snapshot)
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_recovers_after_error() -> TestResult<()> {
     let mut session = common::spawn_server().await?;
@@ -192,8 +158,8 @@ async fn write_stdin_recovers_after_error() -> TestResult<()> {
 async fn write_stdin_drops_huge_echo_only_inputs() -> TestResult<()> {
     let mut session = common::spawn_server().await?;
 
-    // Large silent inputs should not be returned as echoed transcripts (which can trip pager mode
-    // and waste tokens). The backend prompt is still returned.
+    // Large silent inputs should not be returned as echoed transcripts that flood the reply.
+    // The backend prompt is still returned.
     let input = (1..=2_000)
         .map(|idx| format!("x{idx} <- {idx}\n"))
         .collect::<String>();
@@ -210,10 +176,6 @@ async fn write_stdin_drops_huge_echo_only_inputs() -> TestResult<()> {
         return Ok(());
     }
     session.cancel().await?;
-    assert!(
-        !text.contains("--More--"),
-        "expected no pager activation for echo-only input, got: {text:?}"
-    );
     assert!(
         text.trim_end().ends_with('>'),
         "expected backend prompt, got: {text:?}"
@@ -264,10 +226,6 @@ async fn write_stdin_collapses_huge_echo_with_output_attribution() -> TestResult
     assert!(
         !text.contains("x500 <- 500"),
         "expected large echoed transcript to be collapsed, got: {text:?}"
-    );
-    assert!(
-        !text.contains("--More--"),
-        "expected no pager activation for huge echo with small output, got: {text:?}"
     );
     assert!(
         text.len() < 8_000,

@@ -9,7 +9,7 @@ Session state persists across calls, so agents can iterate in place, inspect int
 ## Why use it
 
 - Stateful REPL execution in one long-lived process.
-- LLM-oriented output handling: prompt/echo cleanup and built-in pager mode.
+- LLM-oriented output handling: prompt/echo cleanup and bounded output buffering.
 - In-band docs for common help flows (`?`, `help()`, `vignette()`, `RShowDoc()`).
 - Plot images returned as MCP image content.
 - OS-level sandboxing by default, plus a memory resource guardrail.
@@ -23,20 +23,7 @@ Like a shell, R and Python are powerful. Without guardrails, an LLM can do real 
 `mcp-repl` can be substantially more token efficient for an LLM than a standard persistent shell call. It includes affordances tailored to common LLM workflow strengths and weaknesses. For example:
 - There is rarely a need to repeatedly poll, since the console is embedded in the backend and normally returns as soon as evaluation is complete.
 - Echoed inputs are automatically pruned or elided so output is easy to attribute.
-- A rich pager, purpose-built for an LLM, prevents context floods while supporting search and controlled navigation.
 - Documentation receives special handling. Built-in entry points like `?`, `help`, `vignette()`, and `RShowDoc()` are customized to present plain text or converted Markdown in-band, replacing the usual HTML browser flow.
-
-### Pager
-
-The pager activates only when output exceeds roughly one page, and scales from small multi-page outputs to hundreds of pages (for example, navigating the R manuals). It is designed to keep context focused for the model while still allowing deterministic navigation.
-
-Internally, the pager is backed by a bounded ring buffer with an event timeline, not a naive "dump and slice" stream. That gives it predictable memory usage while still supporting strong navigation semantics:
-- Output is tracked with stable offsets, so commands like `:seek` (offset/percent/line) and `:range` can jump deterministically.
-- Text and image events are merged into one timeline, so pagination decisions can account for both without duplicating content.
-- Already-shown ranges and images are tracked explicitly; when overlap occurs, the pager emits offset-based elision markers instead of replaying content.
-- UTF-8-aware indexing keeps search and cursor movement aligned to characters while preserving exact byte offsets internally.
-
-These affordances are all driven by observed LLM workflows and aim to reduce token waste while improving access to reference material.
 
 ### Plots
 

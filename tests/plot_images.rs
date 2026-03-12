@@ -3,7 +3,7 @@
 mod common;
 
 use base64::Engine as _;
-use common::{TestResult, spawn_server, spawn_server_with_pager_page_chars};
+use common::{TestResult, spawn_server};
 use rmcp::model::{CallToolResult, RawContent};
 use serde::Serialize;
 use tempfile::tempdir;
@@ -492,8 +492,8 @@ async fn multi_panel_plots_emit_single_image() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn plots_emit_images_when_paged_output() -> TestResult<()> {
-    let mut session = spawn_server_with_pager_page_chars(200).await?;
+async fn plots_emit_images_with_large_text_output() -> TestResult<()> {
+    let mut session = spawn_server().await?;
 
     let input = "line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:50) cat(line, \"\\n\"); plot(1:10)";
     let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
@@ -507,18 +507,14 @@ async fn plots_emit_images_when_paged_output() -> TestResult<()> {
     assert_ne!(
         result.is_error,
         Some(true),
-        "paged plot reported an error: {}",
+        "large-output plot reported an error: {}",
         result_text(&result)
     );
 
     let images = extract_images(&result);
     assert!(
         !images.is_empty(),
-        "expected paged output to still include plot image content"
-    );
-    assert!(
-        result_text(&result).contains("--More--"),
-        "expected pager footer in response"
+        "expected large output to still include plot image content"
     );
 
     Ok(())
@@ -727,7 +723,7 @@ async fn plot_updates_in_single_request_collapse() -> TestResult<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn plot_emitted_after_truncation() -> TestResult<()> {
-    let mut session = spawn_server_with_pager_page_chars(5_000_000).await?;
+    let mut session = spawn_server().await?;
 
     let input = r#"
 cat(paste(rep("x", 3000000), collapse = ""))

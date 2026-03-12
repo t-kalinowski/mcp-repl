@@ -57,7 +57,6 @@ fn debug_repl_prints_initial_prompt() -> TestResult<()> {
     }
     let mut child = cmd
         .env("MCP_CONSOLE_REPL_IMAGES", "0")
-        .env("MCP_CONSOLE_PAGER_PAGE_CHARS", "1000000")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

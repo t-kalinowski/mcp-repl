@@ -19,9 +19,6 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 
 pub type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
-
-const TEST_PAGER_PAGE_CHARS: u64 = 300;
-const PAGER_PAGE_CHARS_ENV: &str = "MCP_CONSOLE_PAGER_PAGE_CHARS";
 #[cfg(windows)]
 const WINDOWS_TEST_TIMEOUT_CAP_SECS: f64 = 60.0;
 
@@ -631,7 +628,7 @@ fn normalize_snapshot_text(text: &str) -> String {
     if text.starts_with("\n[repl] session ended") {
         return text.trim_start_matches('\n').to_string();
     }
-    let text = normalize_busy_timeout_elapsed_ms(&normalize_pager_elision(text));
+    let text = normalize_busy_timeout_elapsed_ms(text);
     if !text.contains("stderr:") {
         return text;
     }
@@ -691,34 +688,6 @@ fn normalize_busy_timeout_elapsed_ms(text: &str) -> String {
             end += 1;
         }
         if end > abs + marker.len() {
-            out.push('N');
-        }
-        idx = end;
-    }
-    out.push_str(&text[idx..]);
-    out
-}
-
-fn normalize_pager_elision(text: &str) -> String {
-    let marker = "[pager] elided output: @";
-    let mut out = String::with_capacity(text.len());
-    let mut idx = 0;
-    while let Some(pos) = text[idx..].find(marker) {
-        let abs = idx + pos;
-        out.push_str(&text[idx..abs]);
-        out.push_str(marker);
-        let mut end = abs + marker.len();
-        let bytes = text.as_bytes();
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
-            end += 1;
-        }
-        if end + 1 < bytes.len() && bytes[end] == b'.' && bytes[end + 1] == b'.' {
-            end += 2;
-            while end < bytes.len() && bytes[end].is_ascii_digit() {
-                end += 1;
-            }
-            out.push_str("N..N");
-        } else {
             out.push('N');
         }
         idx = end;
@@ -901,22 +870,17 @@ fn strip_prompt_prefix(line: &str) -> Option<&str> {
 }
 
 pub async fn spawn_server() -> TestResult<McpTestSession> {
-    spawn_server_with_pager_page_chars(TEST_PAGER_PAGE_CHARS).await
-}
-
-pub async fn spawn_server_with_pager_page_chars(page_bytes: u64) -> TestResult<McpTestSession> {
-    spawn_server_with_args_env_and_pager_page_chars(Vec::new(), Vec::new(), page_bytes).await
+    spawn_server_with_args_env(Vec::new(), Vec::new()).await
 }
 
 pub async fn spawn_server_with_env_vars(
     env_vars: Vec<(String, String)>,
 ) -> TestResult<McpTestSession> {
-    spawn_server_with_args_env_and_pager_page_chars(Vec::new(), env_vars, TEST_PAGER_PAGE_CHARS)
-        .await
+    spawn_server_with_args_env(Vec::new(), env_vars).await
 }
 
 pub async fn spawn_server_with_args(args: Vec<String>) -> TestResult<McpTestSession> {
-    spawn_server_with_args_env_and_pager_page_chars(args, Vec::new(), TEST_PAGER_PAGE_CHARS).await
+    spawn_server_with_args_env(args, Vec::new()).await
 }
 
 pub async fn spawn_python_server() -> TestResult<McpTestSession> {
@@ -958,10 +922,9 @@ pub fn python_program() -> Option<&'static str> {
     })
 }
 
-pub async fn spawn_server_with_args_env_and_pager_page_chars(
+pub async fn spawn_server_with_args_env(
     args: Vec<String>,
     env_vars: Vec<(String, String)>,
-    page_bytes: u64,
 ) -> TestResult<McpTestSession> {
     let exe = resolve_server_path()?;
     let env_vars = env_vars.clone();
@@ -981,7 +944,6 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
         cmd.env_remove("R_ENVIRON");
         cmd.env_remove("R_ENVIRON_USER");
         cmd.env_remove("MCP_CONSOLE_UPDATE_PLOT_IMAGES");
-        cmd.env(PAGER_PAGE_CHARS_ENV, page_bytes.to_string());
         cmd.args(&args);
         for (key, value) in &env_vars {
             cmd.env(key, value);

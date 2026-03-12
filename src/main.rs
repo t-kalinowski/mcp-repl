@@ -8,7 +8,6 @@ mod install;
 mod ipc;
 mod output_capture;
 mod output_stream;
-mod pager;
 mod r_controls;
 mod r_graphics;
 mod r_htmd;

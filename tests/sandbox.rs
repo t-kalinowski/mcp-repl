@@ -37,8 +37,6 @@ struct TempDirStatus {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 const SESSION_MARKER_FILE: &str = "mcp-console-session-marker.txt";
-const SANDBOX_PAGER_PAGE_CHARS: u64 = 2048;
-
 #[cfg(target_os = "macos")]
 fn sandbox_available() -> bool {
     common::sandbox_exec_available()
@@ -327,12 +325,7 @@ cat("MARKER_EXISTS=", file.exists({marker}), "\n", sep = "")
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 async fn spawn_server_with_sandbox_state(state: String) -> TestResult<common::McpTestSession> {
     let args = sandbox_args_from_state(&state)?;
-    common::spawn_server_with_args_env_and_pager_page_chars(
-        args,
-        Vec::new(),
-        SANDBOX_PAGER_PAGE_CHARS,
-    )
-    .await
+    common::spawn_server_with_args_env(args, Vec::new()).await
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -341,8 +334,7 @@ async fn spawn_server_with_sandbox_state_and_env(
     env: Vec<(String, String)>,
 ) -> TestResult<common::McpTestSession> {
     let args = sandbox_args_from_state(&state)?;
-    common::spawn_server_with_args_env_and_pager_page_chars(args, env, SANDBOX_PAGER_PAGE_CHARS)
-        .await
+    common::spawn_server_with_args_env(args, env).await
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -884,10 +876,9 @@ async fn sandbox_ignores_preexisting_r_session_tmpdir() -> TestResult<()> {
         .unwrap_or_default()
         .as_nanos();
     let sentinel = format!("/tmp/mcp-console-preexisting-{nanos}");
-    let mut session = common::spawn_server_with_args_env_and_pager_page_chars(
+    let mut session = common::spawn_server_with_args_env(
         Vec::new(),
         vec![("R_SESSION_TMPDIR".to_string(), sentinel.clone())],
-        SANDBOX_PAGER_PAGE_CHARS,
     )
     .await?;
 

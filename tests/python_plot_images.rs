@@ -312,22 +312,6 @@ fn python_plot_tests_enabled() -> bool {
     python_plotting_available()
 }
 
-async fn spawn_python_server_with_pager_page_chars(
-    page_bytes: u64,
-) -> TestResult<common::McpTestSession> {
-    common::spawn_server_with_args_env_and_pager_page_chars(
-        vec![
-            "--backend".to_string(),
-            "python".to_string(),
-            "--sandbox".to_string(),
-            "danger-full-access".to_string(),
-        ],
-        Vec::new(),
-        page_bytes,
-    )
-    .await
-}
-
 #[tokio::test(flavor = "multi_thread")]
 async fn python_plots_emit_images_and_updates() -> TestResult<()> {
     if !python_plot_tests_enabled() {
@@ -534,11 +518,11 @@ async fn python_multi_panel_plots_emit_single_image() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn python_plots_emit_images_when_paged_output() -> TestResult<()> {
+async fn python_plots_emit_images_with_large_text_output() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
-    let mut session = spawn_python_server_with_pager_page_chars(200).await?;
+    let mut session = common::spawn_python_server().await?;
 
     let input = format!(
         "{}; line = 'x' * 200; exec(\"for _ in range(50):\\\\n    print(line)\"); plt.figure(1); plt.clf(); plt.plot(list(range(1, 11))); plt.show()",
@@ -550,18 +534,14 @@ async fn python_plots_emit_images_when_paged_output() -> TestResult<()> {
     assert_ne!(
         result.is_error,
         Some(true),
-        "paged plot reported an error: {}",
+        "large-output plot reported an error: {}",
         result_text(&result)
     );
 
     let images = extract_images(&result);
     assert!(
         !images.is_empty(),
-        "expected paged output to still include plot image content"
-    );
-    assert!(
-        result_text(&result).contains("--More--"),
-        "expected pager footer in response"
+        "expected large output to still include plot image content"
     );
 
     Ok(())
@@ -763,7 +743,7 @@ async fn python_plot_emitted_after_truncation() -> TestResult<()> {
     if !python_plot_tests_enabled() {
         return Ok(());
     }
-    let mut session = spawn_python_server_with_pager_page_chars(5_000_000).await?;
+    let mut session = common::spawn_python_server().await?;
 
     let input = format!(
         "{}; print('x' * 3000000); print('END'); plt.figure(1); plt.clf(); plt.plot(list(range(1, 11))); plt.show()",

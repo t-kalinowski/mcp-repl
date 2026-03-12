@@ -16,8 +16,8 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn reticulate_py_help_is_paged_or_skipped() -> TestResult<()> {
-    let mut session = common::spawn_server_with_pager_page_chars(2_000).await?;
+async fn reticulate_py_help_prints_or_skips() -> TestResult<()> {
+    let mut session = common::spawn_server().await?;
 
     let result = session
         .write_stdin_raw_with(
@@ -58,18 +58,9 @@ async fn reticulate_py_help_is_paged_or_skipped() -> TestResult<()> {
     }
 
     assert!(
-        text.contains("--More--") || text.to_ascii_lowercase().contains("help"),
+        text.to_ascii_lowercase().contains("help"),
         "expected reticulate::py_help() output, got: {text:?}"
     );
-
-    if text.contains("--More--") {
-        let result = session.write_stdin_raw_with("Next", Some(30.0)).await?;
-        let next_text = result_text(&result);
-        assert!(
-            next_text.contains("--More--") || next_text.contains("(END") || !next_text.is_empty(),
-            "expected subsequent pager output, got: {next_text:?}"
-        );
-    }
 
     session.cancel().await?;
     Ok(())

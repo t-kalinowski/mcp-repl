@@ -22,7 +22,7 @@ To isolate the value of `mcp-repl`, run the same tasks under controlled conditio
 - **Console enabled**: the agent can call `mcp-repl` with the default tool description.
 - **Console + description variants**: keep code identical, but swap the tool description text:
   - **Minimal**: “stateful R REPL; send code; state persists.”
-  - **Operational**: include pager semantics, docs commands, debugger tips.
+  - **Operational**: include docs commands, debugger tips, and large-output handling.
   - **Behavioral**: explicitly encourage “inspect-first”, browser-driven development, and private iteration before reporting.
 
 This is effectively an ablation over *capability* (tool present) and *policy* (how well the agent knows to use it).
@@ -150,13 +150,13 @@ If you build concrete task stubs, place them in a directory like `eval/tasks/`.
 - Verifies the plot exists and matches basic properties (dimensions, number of panels, presence of labels).
 - If you want stronger grading, compare against a reference image using an image-diff metric with tolerance.
 
-### 6) “Manual lookup in huge docs” (pager navigation + targeted extraction)
+### 6) “Manual lookup in huge docs” (large-output extraction)
 
 **Prompt**: Use `RShowDoc("R-exts")` (or another large local manual), find specific technical facts (for example, exact API names, required flags, and caveats), and write a short answer with references to the matched sections.
 
 **Why `mcp-repl` helps**:
-- The agent can traverse very large output incrementally instead of reloading docs repeatedly.
-- Pager navigation commands (`:/`, `:n`, `:seek`, `:skip`, `:where`) reduce search latency in long manuals.
+- The agent can inspect very large local manuals in-band instead of bouncing through external viewers.
+- Persistent session state makes iterative lookup and extraction cheaper than restarting fresh commands.
 
 **Grader**:
 - Checks that required facts are present and correct.

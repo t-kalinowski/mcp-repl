@@ -75,7 +75,7 @@ impl SharedServer {
         let server_timeout = apply_safety_margin(timeout);
         let result = self
             .run_worker(move |worker| {
-                worker.write_stdin(input, worker_timeout, server_timeout, None, false)
+                worker.write_stdin(input, worker_timeout, server_timeout, false)
             })
             .await?;
         worker_result_to_call_tool_result(result)
