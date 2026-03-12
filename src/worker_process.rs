@@ -624,7 +624,6 @@ impl WorkerManager {
             let reply = self.build_reply_from_worker_error(&err, input_context, page_bytes);
             let _ = self.reset();
             let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
             return Ok(reply);
         }
         let page_bytes = pager::resolve_page_bytes(page_bytes_override);
@@ -632,7 +631,6 @@ impl WorkerManager {
             let input_context = self.prepare_input_context(&text, echo_input);
             let reply = self.build_reply_from_worker_error(&err, input_context, page_bytes);
             let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
             return Ok(reply);
         }
         self.output.start_capture();
@@ -642,12 +640,10 @@ impl WorkerManager {
             if self.pending_request || self.output.has_pending_output() {
                 let reply = self.poll_pending_output(worker_timeout, page_bytes)?;
                 let reply = self.finalize_reply(reply);
-                self.maybe_reset_after_session_end();
                 return Ok(reply);
             }
             let reply = self.build_idle_poll_reply();
             let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
             return Ok(reply);
         }
         if !text.is_empty() && self.pending_request {
@@ -669,7 +665,6 @@ impl WorkerManager {
                 *error_code = Some(WorkerErrorCode::Busy);
             }
             let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
             return Ok(reply);
         }
 
@@ -686,7 +681,6 @@ impl WorkerManager {
         };
         let reply = self.build_reply_from_request(request, input_context, page_bytes)?;
         let reply = self.finalize_reply(reply);
-        self.maybe_reset_after_session_end();
         Ok(reply)
     }
 
@@ -778,9 +772,6 @@ impl WorkerManager {
         };
         self.remember_prompt(resolved_prompt.clone());
         if !timed_out && !session_end {
-            if let Some(prompt_text) = resolved_prompt.as_deref() {
-                strip_prompt_from_contents(&mut contents, prompt_text);
-            }
             append_prompt_if_missing(&mut contents, resolved_prompt.clone());
         }
 
@@ -959,9 +950,6 @@ impl WorkerManager {
                 };
                 self.remember_prompt(resolved_prompt.clone());
                 if !session_end {
-                    if let Some(prompt_text) = resolved_prompt.as_deref() {
-                        strip_prompt_from_contents(&mut contents, prompt_text);
-                    }
                     append_prompt_if_missing(&mut contents, resolved_prompt.clone());
                 }
                 self.guardrail.busy.store(false, Ordering::Relaxed);
@@ -1192,13 +1180,6 @@ impl WorkerManager {
         }
     }
 
-    fn maybe_reset_after_session_end(&mut self) {
-        if self.session_end_seen {
-            let _ = self.reset();
-            self.session_end_seen = false;
-        }
-    }
-
     pub fn interrupt(&mut self, timeout: Duration) -> Result<WorkerReply, WorkerError> {
         crate::event_log::log(
             "worker_interrupt_begin",
@@ -1226,7 +1207,6 @@ impl WorkerManager {
         if self.pending_request {
             let reply = self.poll_pending_output(timeout, page_bytes)?;
             let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
             return Ok(reply);
         }
 
@@ -1278,13 +1258,8 @@ impl WorkerManager {
             resolved_prompt
         };
         self.remember_prompt(resolved_prompt.clone());
-        if !session_end {
-            if let Some(prompt_text) = resolved_prompt.as_deref() {
-                strip_prompt_from_contents(&mut contents, prompt_text);
-            }
-            if !timed_out {
-                append_prompt_if_missing(&mut contents, resolved_prompt.clone());
-            }
+        if !session_end && !timed_out {
+            append_prompt_if_missing(&mut contents, resolved_prompt.clone());
         }
 
         let reply = WorkerReply::Output {
@@ -1471,16 +1446,27 @@ impl WorkerManager {
         _target_bytes: u64,
     ) -> SnapshotWithImages {
         let start_offset = self.output.current_offset().unwrap_or(end_offset);
-        let range = self
-            .output_timeline
-            .read_archive_range(start_offset, end_offset);
+        let range = match self.reply_overflow_current.behavior {
+            crate::reply_overflow::ReplyOverflowBehavior::Pager => {
+                self.output.read_range(start_offset, end_offset)
+            }
+            crate::reply_overflow::ReplyOverflowBehavior::Files => self
+                .output_timeline
+                .read_archive_range(start_offset, end_offset),
+        };
         self.output.advance_offset_to(end_offset);
-        self.render_files_snapshot_from_range(range, None)
+        self.render_snapshot_from_range(range)
     }
 
     fn saw_stderr_for_reply_range(&mut self, start_offset: u64, end_offset: u64) -> bool {
-        self.output_timeline
-            .archive_saw_stderr_in_range(start_offset.min(end_offset), end_offset)
+        match self.reply_overflow_current.behavior {
+            crate::reply_overflow::ReplyOverflowBehavior::Pager => self
+                .output
+                .saw_stderr_in_range(start_offset.min(end_offset), end_offset),
+            crate::reply_overflow::ReplyOverflowBehavior::Files => self
+                .output_timeline
+                .archive_saw_stderr_in_range(start_offset.min(end_offset), end_offset),
+        }
     }
 
     fn snapshot_after_completion_for_reply(
@@ -1492,20 +1478,21 @@ impl WorkerManager {
     ) -> CompletionSnapshot {
         let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
         if !trim_enabled {
-            let saw_stderr = self
-                .output_timeline
-                .archive_saw_stderr_in_range(start_offset.min(end_offset), end_offset);
-            let range = self
-                .output_timeline
-                .read_archive_range(start_offset, end_offset);
+            let saw_stderr = self.saw_stderr_for_reply_range(start_offset, end_offset);
+            let range = match self.reply_overflow_current.behavior {
+                crate::reply_overflow::ReplyOverflowBehavior::Pager => {
+                    self.output.read_range(start_offset, end_offset)
+                }
+                crate::reply_overflow::ReplyOverflowBehavior::Files => self
+                    .output_timeline
+                    .read_archive_range(start_offset, end_offset),
+            };
             self.output.advance_offset_to(end_offset);
             let prompt_variants = completion.prompt_variants.clone().unwrap_or_default();
             let (bytes, events, text_spans) =
                 collapse_echo_with_attribution(range, &completion.echo_events, &prompt_variants);
-            let snapshot = self.render_files_snapshot_from_range(
-                output_range_from_collapsed(bytes, events, text_spans),
-                completion.prompt.as_deref(),
-            );
+            let snapshot = self
+                .render_snapshot_from_range(output_range_from_collapsed(bytes, events, text_spans));
             return CompletionSnapshot {
                 snapshot,
                 saw_stderr,
@@ -1519,15 +1506,17 @@ impl WorkerManager {
 
         let _ = trim_echo_prefix_in_output(&self.output, echo_transcript.as_deref(), trim_enabled);
         let effective_start = self.output.current_offset().unwrap_or(start_offset);
-        let saw_stderr = self
-            .output_timeline
-            .archive_saw_stderr_in_range(effective_start.min(end_offset), end_offset);
-        let range = self
-            .output_timeline
-            .read_archive_range(effective_start, end_offset);
+        let saw_stderr = self.saw_stderr_for_reply_range(effective_start, end_offset);
+        let range = match self.reply_overflow_current.behavior {
+            crate::reply_overflow::ReplyOverflowBehavior::Pager => {
+                self.output.read_range(effective_start, end_offset)
+            }
+            crate::reply_overflow::ReplyOverflowBehavior::Files => self
+                .output_timeline
+                .read_archive_range(effective_start, end_offset),
+        };
         self.output.advance_offset_to(end_offset);
-        let mut snapshot =
-            self.render_files_snapshot_from_range(range, completion.prompt.as_deref());
+        let mut snapshot = self.render_snapshot_from_range(range);
         maybe_trim_echo_prefix(&mut snapshot.contents, echo_transcript.as_deref(), true);
         CompletionSnapshot {
             snapshot,
@@ -1535,12 +1524,8 @@ impl WorkerManager {
         }
     }
 
-    fn render_files_snapshot_from_range(
-        &mut self,
-        range: OutputRange,
-        prompt_to_strip: Option<&str>,
-    ) -> SnapshotWithImages {
-        render_files_snapshot_from_range(self, range, prompt_to_strip)
+    fn render_snapshot_from_range(&mut self, range: OutputRange) -> SnapshotWithImages {
+        render_snapshot_from_range(self, range)
     }
 
     fn remember_prompt(&mut self, prompt: Option<String>) {
@@ -1747,15 +1732,11 @@ impl WorkerManager {
     }
 }
 
-fn render_files_snapshot_from_range(
+fn render_snapshot_from_range(
     _manager: &mut WorkerManager,
     range: OutputRange,
-    prompt_to_strip: Option<&str>,
 ) -> SnapshotWithImages {
-    let mut full_contents = collapse_image_updates(pager::contents_from_output_range(range));
-    if let Some(prompt) = prompt_to_strip {
-        strip_prompt_from_contents(&mut full_contents, prompt);
-    }
+    let full_contents = collapse_image_updates(pager::contents_from_output_range(range));
     SnapshotWithImages {
         contents: full_contents,
     }
@@ -2366,42 +2347,6 @@ fn append_prompt_if_missing(contents: &mut Vec<WorkerContent>, prompt: Option<St
         return;
     }
     contents.push(WorkerContent::stdout(prompt));
-}
-
-fn strip_prompt_from_contents(contents: &mut Vec<WorkerContent>, prompt: &str) {
-    if prompt.is_empty() {
-        return;
-    }
-    let mut idx = 0usize;
-    while idx < contents.len() {
-        let remove = match &contents[idx] {
-            WorkerContent::ContentText { text, stream } => {
-                if !matches!(stream, crate::worker_protocol::TextStream::Stdout) {
-                    false
-                } else if text == prompt {
-                    true
-                } else if let Some(prefix) = text.strip_suffix(prompt) {
-                    if prefix.is_empty() {
-                        true
-                    } else {
-                        contents[idx] = WorkerContent::ContentText {
-                            text: prefix.to_string(),
-                            stream: *stream,
-                        };
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            _ => false,
-        };
-        if remove {
-            contents.remove(idx);
-        } else {
-            idx = idx.saturating_add(1);
-        }
-    }
 }
 
 struct WorkerProcess {

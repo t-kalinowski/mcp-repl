@@ -303,6 +303,41 @@ async fn pager_commands_refresh_live_output_after_timeout() -> TestResult<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_search_reaches_start_of_large_output_beyond_archive_tail() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = common::spawn_server_with_pager_page_chars(256).await?;
+
+    let initial = session
+        .write_stdin_raw_with(
+            "for (i in 1:1800) cat(sprintf('line%04d %s\\n', i, strrep('x', 700)))",
+            Some(30.0),
+        )
+        .await?;
+    let initial_text = result_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        initial_text.contains("--More--"),
+        "expected pager activation on large reply, got: {initial_text:?}"
+    );
+
+    let matches = session
+        .write_stdin_raw_with(":matches line0001", Some(30.0))
+        .await?;
+    let matches_text = result_text(&matches);
+    assert!(
+        matches_text.contains("line0001"),
+        "expected pager search to find the beginning of large output, got: {matches_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
 #[test]
 fn lock_mutex_handles_poisoned_mutex() {
     let mutex = Mutex::new(());

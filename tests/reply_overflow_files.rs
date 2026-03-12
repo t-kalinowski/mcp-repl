@@ -243,6 +243,52 @@ async fn reply_text_file_captures_output_larger_than_ring() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn large_session_ending_reply_uses_server_managed_overflow_files() -> TestResult<()> {
+    let mut session = common::spawn_server_with_args(small_overflow_args()).await?;
+
+    let result = session
+        .write_stdin_raw_with(
+            "cat(rawToChar(as.raw(c(66, 69, 71, 73, 78, 10))), strrep('x', 1100000), rawToChar(as.raw(c(10, 69, 78, 68, 10))), sep = ''); quit('no')",
+            Some(60.0),
+        )
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("reply overflow backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let text_path =
+        extract_written_output_path(&text).ok_or("missing full output file annotation")?;
+    assert!(
+        text_path
+            .to_string_lossy()
+            .contains("mcp-repl-reply-files-"),
+        "expected server-managed overflow file path, got {}",
+        text_path.display()
+    );
+    let saved = fs::read_to_string(&text_path)?;
+    assert!(saved.contains("BEGIN\n"), "missing BEGIN marker");
+    assert!(saved.contains("\nEND\n"), "missing END marker");
+
+    let follow_up = session.write_stdin_raw_with("1+1", Some(10.0)).await?;
+    let follow_text = result_text(&follow_up);
+    assert!(
+        !backend_unavailable(&follow_text),
+        "expected worker respawn after session end, got: {follow_text}"
+    );
+    assert!(
+        text_path.exists(),
+        "server-managed overflow file should survive worker respawn: {}",
+        text_path.display()
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn r_options_update_behavior_and_reset_restores_launch_defaults() -> TestResult<()> {
     let mut session = common::spawn_server_with_args(small_overflow_args()).await?;
 

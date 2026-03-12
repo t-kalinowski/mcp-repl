@@ -215,10 +215,10 @@ impl ReplyPresentation {
             } => {
                 contents = collapse_image_updates(contents);
                 let prompt = prompt.filter(|value| !value.is_empty());
+                let mut pager_source = truncate_contents_for_pager(contents);
                 if let Some(prompt_text) = prompt.as_deref() {
-                    strip_prompt_from_contents(&mut contents, prompt_text);
+                    strip_trailing_prompt(&mut pager_source, prompt_text);
                 }
-                let pager_source = truncate_contents_for_pager(contents);
                 let original_images = pager_source
                     .iter()
                     .filter(|content| matches!(content, WorkerContent::ContentImage { .. }))
@@ -413,9 +413,31 @@ fn render_existing_text_overflow_contents(
         images.len()
     };
 
+    let saved_files = write_reply_files_from_existing_text(
+        files,
+        Path::new(&text_overflow.path),
+        TextPreviewSummary {
+            total_lines: text_overflow.total_lines,
+        },
+        (images.len() > inline_image_limit).then(|| {
+            images
+                .iter()
+                .skip(inline_image_limit)
+                .cloned()
+                .collect::<Vec<_>>()
+        }),
+        inline_image_limit,
+        images.len(),
+        settings.retention.max_dirs,
+    );
+    let preview_path = saved_files
+        .text_path
+        .as_deref()
+        .unwrap_or_else(|| Path::new(&text_overflow.path));
+
     let mut rendered = Vec::new();
     let preview = read_text_preview_from_path(
-        Path::new(&text_overflow.path),
+        preview_path,
         usize::try_from(settings.text.preview_bytes).unwrap_or(usize::MAX),
         text_overflow.total_chars,
     );
@@ -437,33 +459,7 @@ fn render_existing_text_overflow_contents(
         }
     }
 
-    let mut annotations = format!(
-        "[full output ({} {}) written to {}]",
-        text_overflow.total_lines,
-        pluralize(text_overflow.total_lines, "line", "lines"),
-        text_overflow.path
-    );
-    if images.len() > inline_image_limit {
-        let extra = write_reply_files(
-            files,
-            None,
-            Some(
-                images
-                    .iter()
-                    .skip(inline_image_limit)
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            ),
-            None,
-            inline_image_limit,
-            images.len(),
-            settings.retention.max_dirs,
-        );
-        if !extra.is_empty() {
-            annotations.push('\n');
-            annotations.push_str(extra.trim_end_matches('\n'));
-        }
-    }
+    let annotations = saved_files.annotation.trim_end_matches('\n').to_string();
 
     if !annotations.is_empty() {
         if !preview.is_empty() {
@@ -631,39 +627,29 @@ fn append_prompt_if_missing(contents: &mut Vec<WorkerContent>, prompt: Option<St
     contents.push(WorkerContent::stdout(prompt));
 }
 
-fn strip_prompt_from_contents(contents: &mut Vec<WorkerContent>, prompt: &str) {
+fn strip_trailing_prompt(contents: &mut Vec<WorkerContent>, prompt: &str) {
     if prompt.is_empty() {
         return;
     }
-    let mut idx = 0usize;
-    while idx < contents.len() {
-        let remove = match &contents[idx] {
-            WorkerContent::ContentText { text, stream } => {
-                if !matches!(stream, TextStream::Stdout) {
-                    false
-                } else if text == prompt {
-                    true
-                } else if let Some(prefix) = text.strip_suffix(prompt) {
-                    if prefix.is_empty() {
-                        true
-                    } else {
-                        contents[idx] = WorkerContent::ContentText {
-                            text: prefix.to_string(),
-                            stream: *stream,
-                        };
-                        false
-                    }
-                } else {
-                    false
-                }
-            }
-            _ => false,
+    let idx = contents
+        .iter()
+        .rposition(|content| matches!(content, WorkerContent::ContentText { .. }));
+    let Some(idx) = idx else {
+        return;
+    };
+    let WorkerContent::ContentText { text, stream } = &contents[idx] else {
+        return;
+    };
+    let Some(prefix) = text.strip_suffix(prompt) else {
+        return;
+    };
+    if prefix.is_empty() {
+        contents.remove(idx);
+    } else {
+        contents[idx] = WorkerContent::ContentText {
+            text: prefix.to_string(),
+            stream: *stream,
         };
-        if remove {
-            contents.remove(idx);
-        } else {
-            idx = idx.saturating_add(1);
-        }
     }
 }
 
@@ -675,6 +661,11 @@ struct TextPreview {
 #[derive(Clone, Copy)]
 struct TextPreviewSummary {
     total_lines: usize,
+}
+
+struct SavedReplyFiles {
+    annotation: String,
+    text_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -728,6 +719,88 @@ fn write_reply_files(
         }
     }
 
+    lines.extend(write_omitted_images(
+        &dir,
+        omitted_images,
+        inline_images,
+        total_images,
+    ));
+
+    format_annotation_lines(lines)
+}
+
+fn write_reply_files_from_existing_text(
+    files: &mut ReplyFilesManager,
+    source_path: &Path,
+    text_preview: TextPreviewSummary,
+    omitted_images: Option<Vec<WorkerContent>>,
+    inline_images: usize,
+    total_images: usize,
+    retention_max_dirs: usize,
+) -> SavedReplyFiles {
+    let need_text = true;
+    let need_images = omitted_images
+        .as_ref()
+        .is_some_and(|images| !images.is_empty());
+    if !need_text && !need_images {
+        return SavedReplyFiles {
+            annotation: String::new(),
+            text_path: None,
+        };
+    }
+
+    let dir = match files.next_reply_dir(retention_max_dirs) {
+        Ok(path) => path,
+        Err(err) => {
+            return SavedReplyFiles {
+                annotation: format!("[repl] failed to write reply files: {err}\n"),
+                text_path: None,
+            };
+        }
+    };
+
+    let mut lines = Vec::new();
+    let mut text_path = None;
+    if need_text {
+        let copied_path = dir.join("output.log");
+        match std::fs::copy(source_path, &copied_path) {
+            Ok(_) => {
+                lines.push(format!(
+                    "[full output ({} {}) written to {}]",
+                    text_preview.total_lines,
+                    pluralize(text_preview.total_lines, "line", "lines"),
+                    copied_path.display()
+                ));
+                text_path = Some(copied_path);
+            }
+            Err(err) => lines.push(format!(
+                "[repl] failed to copy full text file {}: {err}]",
+                source_path.display()
+            )),
+        }
+    }
+
+    lines.extend(write_omitted_images(
+        &dir,
+        omitted_images,
+        inline_images,
+        total_images,
+    ));
+
+    SavedReplyFiles {
+        annotation: format_annotation_lines(lines),
+        text_path,
+    }
+}
+
+fn write_omitted_images(
+    dir: &Path,
+    omitted_images: Option<Vec<WorkerContent>>,
+    inline_images: usize,
+    total_images: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+
     if let Some(images) = omitted_images
         && !images.is_empty()
     {
@@ -761,11 +834,19 @@ fn write_reply_files(
             }
         }
         for range in saved_ranges {
-            lines.push(format_saved_image_range_line(&dir, &range));
+            lines.push(format_saved_image_range_line(dir, &range));
         }
     }
 
-    format!("{}\n", lines.join("\n"))
+    lines
+}
+
+fn format_annotation_lines(lines: Vec<String>) -> String {
+    if lines.is_empty() {
+        String::new()
+    } else {
+        format!("{}\n", lines.join("\n"))
+    }
 }
 
 fn build_reply_files_root() -> std::io::Result<PathBuf> {
