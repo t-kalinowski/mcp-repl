@@ -29,11 +29,22 @@ fn backend_unavailable(text: &str) -> bool {
         )
 }
 
-fn extract_bracketed_path(text: &str, marker: &str) -> Option<PathBuf> {
+fn extract_written_output_path(text: &str) -> Option<PathBuf> {
     text.lines().find_map(|line| {
+        let marker = "written to ";
         let start = line.find(marker)?;
         let rest = &line[start + marker.len()..];
         let end = rest.find(']').unwrap_or(rest.len());
+        Some(PathBuf::from(&rest[..end]))
+    })
+}
+
+fn extract_saved_images_pattern_path(text: &str) -> Option<PathBuf> {
+    text.lines().find_map(|line| {
+        let marker = "[saved images: ";
+        let start = line.find(marker)?;
+        let rest = &line[start + marker.len()..];
+        let end = rest.find(" where ").unwrap_or(rest.len());
         Some(PathBuf::from(&rest[..end]))
     })
 }
@@ -62,16 +73,20 @@ async fn oversized_output_defaults_to_files_and_reset_clears_reply_files() -> Te
     }
 
     assert!(
-        text.contains("[reply files: "),
-        "expected files reply annotation, got: {text}"
+        text.contains("[full output ("),
+        "expected full output annotation, got: {text}"
     );
     assert!(
         !text.contains("--More--"),
         "files mode should not activate pager, got: {text}"
     );
+    assert!(
+        !text.contains("[reply files: "),
+        "expected no duplicate reply directory annotation, got: {text}"
+    );
 
-    let text_path = extract_bracketed_path(&text, "[full text saved to ")
-        .ok_or("missing full text file annotation")?;
+    let text_path =
+        extract_written_output_path(&text).ok_or("missing full output file annotation")?;
     assert!(
         text_path.exists(),
         "expected saved file at {}",
@@ -119,8 +134,6 @@ async fn images_overflow_to_files_when_preview_limit_is_exceeded() -> TestResult
         .iter()
         .filter(|item| matches!(&item.raw, RawContent::Image(_)))
         .count();
-    let reply_dir = extract_bracketed_path(&text, "[reply files: ")
-        .ok_or("missing reply files directory annotation")?;
     assert_eq!(
         inline_images, 1,
         "expected one inline image preview, got: {text}"
@@ -133,7 +146,12 @@ async fn images_overflow_to_files_when_preview_limit_is_exceeded() -> TestResult
         text.contains("image-NNNN.png where NNNN=0001..0002"),
         "expected numbered image range annotation, got: {text}"
     );
-    let saved_image_paths = fs::read_dir(&reply_dir)?
+    let saved_image_pattern = extract_saved_images_pattern_path(&text)
+        .ok_or("missing saved images pattern annotation")?;
+    let reply_dir = saved_image_pattern
+        .parent()
+        .ok_or("saved image pattern should have a parent directory")?;
+    let saved_image_paths = fs::read_dir(reply_dir)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| {
             path.file_name()
@@ -165,8 +183,8 @@ async fn reply_files_survive_worker_respawn() -> TestResult<()> {
         return Ok(());
     }
 
-    let text_path = extract_bracketed_path(&text, "[full text saved to ")
-        .ok_or("missing full text file annotation")?;
+    let text_path =
+        extract_written_output_path(&text).ok_or("missing full output file annotation")?;
     assert!(
         text_path.exists(),
         "expected saved file at {}",
@@ -209,8 +227,8 @@ async fn reply_text_file_captures_output_larger_than_ring() -> TestResult<()> {
         return Ok(());
     }
 
-    let text_path = extract_bracketed_path(&text, "[full text saved to ")
-        .ok_or("missing full text file annotation")?;
+    let text_path =
+        extract_written_output_path(&text).ok_or("missing full output file annotation")?;
     let saved = fs::read_to_string(&text_path)?;
     assert!(saved.contains("BEGIN\n"), "missing BEGIN marker");
     assert!(saved.contains("\nEND\n"), "missing END marker");
@@ -264,7 +282,7 @@ async fn r_options_update_behavior_and_reset_restores_launch_defaults() -> TestR
         .await?;
     let files_text = result_text(&files_result);
     assert!(
-        files_text.contains("[reply files: "),
+        files_text.contains("[full output ("),
         "expected files mode after repl_reset restored defaults, got: {files_text}"
     );
     assert!(

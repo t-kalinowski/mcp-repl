@@ -37,8 +37,15 @@ pub(crate) fn run(
 
     let mut worker = WorkerManager::new(backend, sandbox_plan, reply_overflow)?;
     worker.warm_start()?;
+    let mut last_prompt = None;
     let reply = wait_for_initial_prompt(&mut worker, server_timeout)?;
-    render_reply(reply, &mut stdout, &mut stderr, image_support)?;
+    render_reply(
+        reply,
+        &mut stdout,
+        &mut stderr,
+        image_support,
+        &mut last_prompt,
+    )?;
 
     let stdin = io::stdin();
     let mut stdin = stdin.lock();
@@ -50,12 +57,24 @@ pub(crate) fn run(
 
         if is_exact_command(&line, "INTERRUPT") {
             let reply = worker.interrupt(DEFAULT_WRITE_STDIN_TIMEOUT)?;
-            render_reply(reply, &mut stdout, &mut stderr, image_support)?;
+            render_reply(
+                reply,
+                &mut stdout,
+                &mut stderr,
+                image_support,
+                &mut last_prompt,
+            )?;
             continue;
         }
         if is_exact_command(&line, "RESTART") {
             let reply = worker.restart(DEFAULT_WRITE_STDIN_TIMEOUT)?;
-            render_reply(reply, &mut stdout, &mut stderr, image_support)?;
+            render_reply(
+                reply,
+                &mut stdout,
+                &mut stderr,
+                image_support,
+                &mut last_prompt,
+            )?;
             continue;
         }
         if is_exact_command(&line, "END") {
@@ -66,7 +85,13 @@ pub(crate) fn run(
                 None,
                 false,
             )?;
-            render_reply(reply, &mut stdout, &mut stderr, image_support)?;
+            render_reply(
+                reply,
+                &mut stdout,
+                &mut stderr,
+                image_support,
+                &mut last_prompt,
+            )?;
             continue;
         }
 
@@ -92,7 +117,13 @@ pub(crate) fn run(
             None,
             false,
         )?;
-        render_reply(reply, &mut stdout, &mut stderr, image_support)?;
+        render_reply(
+            reply,
+            &mut stdout,
+            &mut stderr,
+            image_support,
+            &mut last_prompt,
+        )?;
     }
 
     Ok(())
@@ -175,25 +206,51 @@ fn render_reply(
     stdout: &mut impl Write,
     stderr: &mut impl Write,
     image_support: bool,
+    last_prompt: &mut Option<String>,
 ) -> io::Result<()> {
     match reply {
         WorkerReply::Output {
             contents,
             is_error,
             error_code,
+            prompt,
             ..
         } => {
+            let prompt = prompt.filter(|value| !value.is_empty());
+            if let Some(prompt) = prompt.clone() {
+                *last_prompt = Some(prompt);
+            }
+            let fallback_prompt = if is_error && prompt.is_none() {
+                last_prompt.clone()
+            } else {
+                None
+            };
             if let Some(code) = error_code {
                 writeln!(stderr, "[repl] error: {code:?}")?;
             } else if is_error {
                 writeln!(stderr, "[repl] error")?;
             }
+            let mut line_start = true;
             for content in contents {
                 match content {
-                    WorkerContent::ContentText { text, stream } => match stream {
-                        TextStream::Stdout => stdout.write_all(text.as_bytes())?,
-                        TextStream::Stderr => stderr.write_all(text.as_bytes())?,
-                    },
+                    WorkerContent::ContentText { text, stream } => {
+                        let is_prompt_chunk = prompt
+                            .as_deref()
+                            .is_some_and(|prompt| text.as_str() == prompt);
+                        match stream {
+                            TextStream::Stdout => {
+                                if is_prompt_chunk && !line_start {
+                                    stdout.write_all(b"\n")?;
+                                }
+                                stdout.write_all(text.as_bytes())?;
+                                line_start = text.ends_with('\n') || text.ends_with('\r');
+                            }
+                            TextStream::Stderr => {
+                                stderr.write_all(text.as_bytes())?;
+                                line_start = text.ends_with('\n') || text.ends_with('\r');
+                            }
+                        }
+                    }
                     WorkerContent::ContentImage {
                         data,
                         mime_type,
@@ -209,14 +266,73 @@ fn render_reply(
                                 data.len()
                             )?;
                         }
+                        line_start = true;
                     }
                 }
+            }
+            if let Some(prompt) = fallback_prompt {
+                if !line_start {
+                    stdout.write_all(b"\n")?;
+                }
+                stdout.write_all(prompt.as_bytes())?;
             }
         }
     }
     stdout.flush()?;
     stderr.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_chunk_starts_on_new_line_after_idle_status() {
+        let reply = WorkerReply::Output {
+            contents: vec![
+                WorkerContent::stdout("<<console status: idle>>"),
+                WorkerContent::stdout("> "),
+            ],
+            is_error: false,
+            error_code: None,
+            prompt: Some("> ".to_string()),
+            prompt_variants: None,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut last_prompt = None;
+
+        render_reply(reply, &mut stdout, &mut stderr, false, &mut last_prompt).expect("render");
+
+        assert_eq!(
+            String::from_utf8(stdout).expect("utf8"),
+            "<<console status: idle>>\n> "
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn error_reply_uses_last_prompt_when_backend_omits_one() {
+        let reply = WorkerReply::Output {
+            contents: vec![WorkerContent::stderr("stderr: Error: boom\n")],
+            is_error: true,
+            error_code: None,
+            prompt: None,
+            prompt_variants: None,
+        };
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut last_prompt = Some("> ".to_string());
+
+        render_reply(reply, &mut stdout, &mut stderr, false, &mut last_prompt).expect("render");
+
+        assert_eq!(String::from_utf8(stdout).expect("utf8"), "> ");
+        assert_eq!(
+            String::from_utf8(stderr).expect("utf8"),
+            "[repl] error\nstderr: Error: boom\n"
+        );
+    }
 }
 
 fn detect_image_support() -> bool {

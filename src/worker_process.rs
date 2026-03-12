@@ -1995,7 +1995,12 @@ impl WorkerManager {
 
 struct TextPreview {
     text: String,
-    shown_summary: String,
+    total_lines: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextPreviewSummary {
+    total_lines: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2051,13 +2056,20 @@ fn render_files_snapshot_from_range(
 
     if text_spills {
         let preview = build_text_preview(&full_text, text_budget);
-        if !preview.text.is_empty() {
-            contents.push(WorkerContent::stdout(preview.text));
+        let preview_summary = TextPreviewSummary {
+            total_lines: preview.total_lines,
+        };
+        let preview_text = preview.text;
+        let has_preview = !preview_text.is_empty();
+        let preview_ends_with_newline =
+            preview_text.ends_with('\n') || preview_text.ends_with('\r');
+        if !preview_text.is_empty() {
+            contents.push(WorkerContent::stdout(preview_text));
         }
         for image in images.iter().take(inline_image_limit) {
             contents.push(image.clone());
         }
-        let annotations = write_reply_files(
+        let mut annotations = write_reply_files(
             manager,
             text_spills.then_some(full_text.as_str()),
             image_spills.then(|| {
@@ -2067,10 +2079,17 @@ fn render_files_snapshot_from_range(
                     .cloned()
                     .collect::<Vec<_>>()
             }),
-            Some(preview.shown_summary),
+            Some(preview_summary),
             inline_image_limit,
             images.len(),
         );
+        if has_preview && !annotations.is_empty() {
+            if preview_ends_with_newline {
+                annotations.insert(0, '\n');
+            } else {
+                annotations.insert_str(0, "\n\n");
+            }
+        }
         if !annotations.is_empty() {
             contents.push(WorkerContent::stderr(annotations));
         }
@@ -2118,7 +2137,7 @@ fn write_reply_files(
     manager: &mut WorkerManager,
     full_text: Option<&str>,
     omitted_images: Option<Vec<WorkerContent>>,
-    shown_summary: Option<String>,
+    text_preview: Option<TextPreviewSummary>,
     inline_images: usize,
     total_images: usize,
 ) -> String {
@@ -2137,16 +2156,20 @@ fn write_reply_files(
         }
     };
 
-    let mut lines = vec![format!("[reply files: {}]", dir.display())];
+    let mut lines = Vec::new();
 
     if let Some(text) = full_text {
-        let text_path = dir.join("text.txt");
+        let text_path = dir.join("output.log");
         match std::fs::write(&text_path, text) {
             Ok(()) => {
-                lines.push(format!("[full text saved to {}]", text_path.display()));
-                if let Some(shown_summary) = shown_summary {
-                    lines.push(shown_summary);
-                }
+                let summary =
+                    text_preview.expect("text preview should be present when text spills");
+                lines.push(format!(
+                    "[full output ({} {}) written to {}]",
+                    summary.total_lines,
+                    pluralize(summary.total_lines, "line", "lines"),
+                    text_path.display()
+                ));
             }
             Err(err) => {
                 lines.push(format!(
@@ -2280,42 +2303,43 @@ fn build_text_preview(text: &str, preview_bytes: usize) -> TextPreview {
 }
 
 fn build_byte_text_preview(text: &str, preview_bytes: usize) -> TextPreview {
-    let total_bytes = text.len();
+    let total_chars = text.chars().count();
+    let total_lines = count_text_lines(text);
     if preview_bytes == 0 {
         return TextPreview {
             text: String::new(),
-            shown_summary: format!("[shown bytes=0 of {total_bytes}]"),
+            total_lines,
         };
     }
-    let head_budget = ((preview_bytes * 2) / 3).max(1).min(preview_bytes);
-    let tail_budget = preview_bytes.saturating_sub(head_budget);
-    let head = take_prefix_chars(text, head_budget);
-    let tail = take_suffix_chars(text, tail_budget);
-    let head_bytes = head.len();
-    let tail_bytes = tail.len();
-    let tail_start = total_bytes.saturating_sub(tail_bytes);
-    let mut preview = String::new();
-    preview.push_str(&head);
-    if !preview.ends_with('\n') {
-        preview.push('\n');
-    }
-    preview.push_str(&format!(
-        "...[middle truncated, total {} bytes]...\n",
-        total_bytes
-    ));
-    preview.push_str(&tail);
-    let shown_summary = if tail_bytes == 0 {
-        format!("[shown bytes=0..{} of {}]", head_bytes, total_bytes)
-    } else {
-        format!(
-            "[shown bytes=0..{},{}..{} of {}]",
-            head_bytes, tail_start, total_bytes, total_bytes
-        )
+    let mut preview = take_prefix_chars(text, preview_bytes);
+    if total_chars > preview.chars().count() {
+        if preview.ends_with('\n') {
+            while preview.ends_with('\n') || preview.ends_with('\r') {
+                preview.pop();
+            }
+        }
+        preview.push_str(&format!("...[truncated, total {total_chars} chars]"));
     };
     TextPreview {
         text: preview,
-        shown_summary,
+        total_lines,
     }
+}
+
+fn count_text_lines(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    let newline_count = text.bytes().filter(|byte| *byte == b'\n').count();
+    if text.ends_with('\n') {
+        newline_count
+    } else {
+        newline_count.saturating_add(1)
+    }
+}
+
+fn pluralize<'a>(count: usize, singular: &'a str, plural: &'a str) -> &'a str {
+    if count == 1 { singular } else { plural }
 }
 
 fn push_saved_image_range(ranges: &mut Vec<SavedImageRange>, index: usize, extension: &str) {
@@ -2359,17 +2383,6 @@ fn take_prefix_chars(text: &str, max_bytes: usize) -> String {
         out.push(ch);
     }
     out
-}
-
-fn take_suffix_chars(text: &str, max_bytes: usize) -> String {
-    if text.len() <= max_bytes {
-        return text.to_string();
-    }
-    let mut start = text.len().saturating_sub(max_bytes);
-    while start < text.len() && !text.is_char_boundary(start) {
-        start = start.saturating_add(1);
-    }
-    text[start..].to_string()
 }
 
 fn image_extension(mime_type: &str) -> &'static str {
@@ -4300,15 +4313,23 @@ mod tests {
         let text = format!("{}\nOK\n", "x".repeat(8_192));
         let preview = build_text_preview(&text, 64);
         assert!(preview.text.len() < 256, "preview was too large");
-        assert!(preview.text.contains("total 8196 bytes"));
-        assert!(preview.shown_summary.contains("shown bytes="));
+        assert!(preview.text.contains("[truncated, total 8196 chars]"));
+        assert_eq!(preview.total_lines, 2);
     }
 
     #[test]
     fn zero_byte_preview_shows_only_file_annotation_summary() {
         let preview = build_text_preview("abcdef", 0);
         assert!(preview.text.is_empty());
-        assert_eq!(preview.shown_summary, "[shown bytes=0 of 6]");
+        assert_eq!(preview.total_lines, 1);
+    }
+
+    #[test]
+    fn count_text_lines_handles_trailing_newline() {
+        assert_eq!(count_text_lines(""), 0);
+        assert_eq!(count_text_lines("abc"), 1);
+        assert_eq!(count_text_lines("abc\n"), 1);
+        assert_eq!(count_text_lines("a\nb\n"), 2);
     }
 
     #[test]
