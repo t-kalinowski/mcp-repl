@@ -38,17 +38,6 @@ fn extract_bracketed_path(text: &str, marker: &str) -> Option<PathBuf> {
     })
 }
 
-fn extract_bracketed_paths(text: &str, marker: &str) -> Vec<PathBuf> {
-    text.lines()
-        .filter_map(|line| {
-            let start = line.find(marker)?;
-            let rest = &line[start + marker.len()..];
-            let end = rest.find(']').unwrap_or(rest.len());
-            Some(PathBuf::from(&rest[..end]))
-        })
-        .collect()
-}
-
 fn small_overflow_args() -> Vec<String> {
     vec![
         "--config".to_string(),
@@ -130,22 +119,33 @@ async fn images_overflow_to_files_when_preview_limit_is_exceeded() -> TestResult
         .iter()
         .filter(|item| matches!(&item.raw, RawContent::Image(_)))
         .count();
-    let image_paths = extract_bracketed_paths(&text, "[saved image: ");
+    let reply_dir = extract_bracketed_path(&text, "[reply files: ")
+        .ok_or("missing reply files directory annotation")?;
     assert_eq!(
         inline_images, 1,
         "expected one inline image preview, got: {text}"
     );
     assert!(
-        image_paths.len() >= 2,
-        "expected omitted images to be written to files, got: {text}"
+        text.contains("[saved images: "),
+        "expected concise saved image range annotation, got: {text}"
     );
-    for path in image_paths {
-        assert!(
-            path.exists(),
-            "expected saved image file at {}",
-            path.display()
-        );
-    }
+    assert!(
+        text.contains("image-NNNN.png where NNNN=0001..0002"),
+        "expected numbered image range annotation, got: {text}"
+    );
+    let saved_image_paths = fs::read_dir(&reply_dir)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("image-"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        saved_image_paths.len(),
+        2,
+        "expected two saved image files, got: {saved_image_paths:?}"
+    );
 
     session.cancel().await?;
     Ok(())

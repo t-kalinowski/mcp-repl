@@ -1998,6 +1998,13 @@ struct TextPreview {
     shown_summary: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SavedImageRange {
+    extension: String,
+    start_index: usize,
+    end_index: usize,
+}
+
 fn render_files_snapshot_from_range(
     manager: &mut WorkerManager,
     range: OutputRange,
@@ -2043,7 +2050,7 @@ fn render_files_snapshot_from_range(
     };
 
     if text_spills {
-        let preview = build_text_preview(&full_text, text_budget.max(1));
+        let preview = build_text_preview(&full_text, text_budget);
         if !preview.text.is_empty() {
             contents.push(WorkerContent::stdout(preview.text));
         }
@@ -2158,6 +2165,7 @@ fn write_reply_files(
             inline_images,
             total_images.saturating_sub(inline_images)
         ));
+        let mut saved_ranges = Vec::new();
         for (idx, image) in images.into_iter().enumerate() {
             let WorkerContent::ContentImage {
                 data, mime_type, ..
@@ -2169,7 +2177,7 @@ fn write_reply_files(
             let path = dir.join(format!("image-{:04}.{}", idx + 1, extension));
             match base64::engine::general_purpose::STANDARD.decode(data.as_bytes()) {
                 Ok(bytes) => match std::fs::write(&path, bytes) {
-                    Ok(()) => lines.push(format!("[saved image: {}]", path.display())),
+                    Ok(()) => push_saved_image_range(&mut saved_ranges, idx + 1, extension),
                     Err(err) => lines.push(format!(
                         "[repl] failed to write image file {}: {err}]",
                         path.display()
@@ -2180,6 +2188,9 @@ fn write_reply_files(
                     path.display()
                 )),
             }
+        }
+        for range in saved_ranges {
+            lines.push(format_saved_image_range_line(&dir, &range));
         }
     }
 
@@ -2265,83 +2276,19 @@ fn collapse_image_updates(contents: Vec<WorkerContent>) -> Vec<WorkerContent> {
 }
 
 fn build_text_preview(text: &str, preview_bytes: usize) -> TextPreview {
-    if text.contains('\n') {
-        let lines: Vec<&str> = text.split_inclusive('\n').collect();
-        if lines.len() > 1 {
-            return build_line_text_preview(&lines, preview_bytes.max(1));
-        }
-    }
-    build_byte_text_preview(text, preview_bytes.max(1))
-}
-
-fn build_line_text_preview(lines: &[&str], preview_bytes: usize) -> TextPreview {
-    let total_lines = lines.len();
-    let head_budget = ((preview_bytes * 2) / 3).max(1);
-    let tail_budget = preview_bytes.saturating_sub(head_budget).max(1);
-
-    let mut head_count = 0usize;
-    let mut head_bytes = 0usize;
-    while head_count < total_lines {
-        let next = head_bytes.saturating_add(lines[head_count].len());
-        if head_count > 0 && next > head_budget {
-            break;
-        }
-        head_count += 1;
-        head_bytes = next;
-        if head_bytes >= head_budget {
-            break;
-        }
-    }
-    if head_count == 0 {
-        head_count = 1;
-    }
-
-    let mut tail_count = 0usize;
-    let mut tail_bytes = 0usize;
-    while tail_count < total_lines.saturating_sub(head_count) {
-        let line = lines[total_lines - 1 - tail_count];
-        let next = tail_bytes.saturating_add(line.len());
-        if tail_count > 0 && next > tail_budget {
-            break;
-        }
-        tail_count += 1;
-        tail_bytes = next;
-        if tail_bytes >= tail_budget {
-            break;
-        }
-    }
-    if tail_count == 0 && head_count < total_lines {
-        tail_count = 1;
-    }
-    while head_count + tail_count > total_lines && head_count > 1 {
-        head_count -= 1;
-    }
-
-    let tail_start = total_lines.saturating_sub(tail_count).saturating_add(1);
-    let head_text = lines[..head_count].concat();
-    let tail_text = lines[total_lines - tail_count..].concat();
-    let mut text = head_text;
-    if !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text.push_str(&format!(
-        "...[middle truncated, total {} lines]...\n",
-        total_lines
-    ));
-    text.push_str(&tail_text);
-    TextPreview {
-        text,
-        shown_summary: format!(
-            "[shown lines=1..{},{}..{} of {}]",
-            head_count, tail_start, total_lines, total_lines
-        ),
-    }
+    build_byte_text_preview(text, preview_bytes)
 }
 
 fn build_byte_text_preview(text: &str, preview_bytes: usize) -> TextPreview {
     let total_bytes = text.len();
-    let head_budget = ((preview_bytes * 2) / 3).max(1);
-    let tail_budget = preview_bytes.saturating_sub(head_budget).max(1);
+    if preview_bytes == 0 {
+        return TextPreview {
+            text: String::new(),
+            shown_summary: format!("[shown bytes=0 of {total_bytes}]"),
+        };
+    }
+    let head_budget = ((preview_bytes * 2) / 3).max(1).min(preview_bytes);
+    let tail_budget = preview_bytes.saturating_sub(head_budget);
     let head = take_prefix_chars(text, head_budget);
     let tail = take_suffix_chars(text, tail_budget);
     let head_bytes = head.len();
@@ -2357,13 +2304,47 @@ fn build_byte_text_preview(text: &str, preview_bytes: usize) -> TextPreview {
         total_bytes
     ));
     preview.push_str(&tail);
-    TextPreview {
-        text: preview,
-        shown_summary: format!(
+    let shown_summary = if tail_bytes == 0 {
+        format!("[shown bytes=0..{} of {}]", head_bytes, total_bytes)
+    } else {
+        format!(
             "[shown bytes=0..{},{}..{} of {}]",
             head_bytes, tail_start, total_bytes, total_bytes
-        ),
+        )
+    };
+    TextPreview {
+        text: preview,
+        shown_summary,
     }
+}
+
+fn push_saved_image_range(ranges: &mut Vec<SavedImageRange>, index: usize, extension: &str) {
+    if let Some(last) = ranges.last_mut()
+        && last.extension == extension
+        && last.end_index.saturating_add(1) == index
+    {
+        last.end_index = index;
+        return;
+    }
+    ranges.push(SavedImageRange {
+        extension: extension.to_string(),
+        start_index: index,
+        end_index: index,
+    });
+}
+
+fn format_saved_image_range_line(dir: &Path, range: &SavedImageRange) -> String {
+    let pattern = dir.join(format!("image-NNNN.{}", range.extension));
+    let numbers = if range.start_index == range.end_index {
+        format!("{:04}", range.start_index)
+    } else {
+        format!("{:04}..{:04}", range.start_index, range.end_index)
+    };
+    format!(
+        "[saved images: {} where NNNN={}]",
+        pattern.display(),
+        numbers
+    )
 }
 
 fn take_prefix_chars(text: &str, max_bytes: usize) -> String {
@@ -4311,6 +4292,56 @@ mod tests {
             _ => "",
         };
         assert_eq!(text, "stderr: boom\n");
+    }
+
+    #[test]
+    fn byte_preview_caps_large_multiline_output() {
+        let text = format!("{}\nOK\n", "x".repeat(8_192));
+        let preview = build_text_preview(&text, 64);
+        assert!(preview.text.len() < 256, "preview was too large");
+        assert!(preview.text.contains("total 8196 bytes"));
+        assert!(preview.shown_summary.contains("shown bytes="));
+    }
+
+    #[test]
+    fn zero_byte_preview_shows_only_file_annotation_summary() {
+        let preview = build_text_preview("abcdef", 0);
+        assert!(preview.text.is_empty());
+        assert_eq!(preview.shown_summary, "[shown bytes=0 of 6]");
+    }
+
+    #[test]
+    fn saved_image_ranges_are_reported_compactly() {
+        let dir = Path::new("/tmp/reply-files");
+        let mut ranges = Vec::new();
+        push_saved_image_range(&mut ranges, 1, "png");
+        push_saved_image_range(&mut ranges, 2, "png");
+        push_saved_image_range(&mut ranges, 4, "png");
+        push_saved_image_range(&mut ranges, 5, "jpg");
+        assert_eq!(
+            ranges,
+            vec![
+                SavedImageRange {
+                    extension: "png".to_string(),
+                    start_index: 1,
+                    end_index: 2,
+                },
+                SavedImageRange {
+                    extension: "png".to_string(),
+                    start_index: 4,
+                    end_index: 4,
+                },
+                SavedImageRange {
+                    extension: "jpg".to_string(),
+                    start_index: 5,
+                    end_index: 5,
+                },
+            ]
+        );
+        assert_eq!(
+            format_saved_image_range_line(dir, &ranges[0]),
+            "[saved images: /tmp/reply-files/image-NNNN.png where NNNN=0001..0002]"
+        );
     }
 
     #[test]
