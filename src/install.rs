@@ -832,10 +832,23 @@ fn shell_escape_windows(raw: &str) -> String {
     if raw.is_empty() {
         return "\"\"".to_string();
     }
-    if raw
-        .bytes()
-        .all(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'"'))
-    {
+    if raw.bytes().all(|byte| {
+        !matches!(
+            byte,
+            b' ' | b'\t'
+                | b'\n'
+                | b'\r'
+                | b'"'
+                | b'&'
+                | b'|'
+                | b'('
+                | b')'
+                | b'^'
+                | b'%'
+                | b'<'
+                | b'>'
+        )
+    }) {
         return raw.to_string();
     }
 
@@ -1673,6 +1686,18 @@ name="demo"
         assert_eq!(
             shell_escape_windows("C:\\Program Files\\"),
             "\"C:\\Program Files\\\\\"".to_string()
+        );
+    }
+
+    #[test]
+    fn shell_escape_windows_quotes_cmd_metacharacters_without_whitespace() {
+        assert_eq!(
+            shell_escape_windows(r"C:\Users\A&B\mcp-repl.exe"),
+            "\"C:\\Users\\A&B\\mcp-repl.exe\"".to_string()
+        );
+        assert_eq!(
+            shell_escape_windows("value%USERPROFILE%"),
+            "\"value%USERPROFILE%\"".to_string()
         );
     }
 }

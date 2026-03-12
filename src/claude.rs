@@ -163,17 +163,26 @@ impl ClaudeClearBinding {
         let next_seq = read_control_request(&self.inner.control_path)
             .map(|request| request.seq)
             .unwrap_or(0);
-        let mut last_seq = self
-            .inner
-            .last_control_seq
-            .lock()
-            .expect("claude control seq mutex poisoned");
-        if next_seq > *last_seq {
-            *last_seq = next_seq;
+        let should_restart = {
+            let last_seq = self
+                .inner
+                .last_control_seq
+                .lock()
+                .expect("claude control seq mutex poisoned");
+            next_seq > *last_seq
+        };
+        if should_restart {
             let _ = worker.restart(CONTROL_REQUEST_TIMEOUT)?;
+            let mut last_seq = self
+                .inner
+                .last_control_seq
+                .lock()
+                .expect("claude control seq mutex poisoned");
+            if next_seq > *last_seq {
+                *last_seq = next_seq;
+            }
             restart_observed = true;
         }
-        drop(last_seq);
 
         if let Some(session_id) = self.resolve_current_session_id() {
             let mut current = self
@@ -549,6 +558,7 @@ fn unix_ms_now() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sandbox_cli::{SandboxCliOperation, SandboxCliPlan, SandboxModeArg};
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -813,6 +823,52 @@ mod tests {
         env::set_current_dir(previous_cwd).expect("restore current dir");
         unsafe {
             env::remove_var("XDG_STATE_HOME");
+        }
+    }
+
+    #[test]
+    fn sync_does_not_consume_control_seq_when_restart_fails() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let temp_root = env::current_dir().expect("current dir");
+        let temp = tempfile::Builder::new()
+            .prefix("claude-sync-")
+            .tempdir_in(temp_root)
+            .expect("tempdir");
+
+        unsafe {
+            env::set_var("XDG_STATE_HOME", temp.path());
+            env::set_var(CLAUDE_SESSION_ID_ENV, "sess-current");
+            env::remove_var(CLAUDE_PROJECT_DIR_ENV);
+            env::remove_var(CLAUDE_ENV_FILE_ENV);
+        }
+
+        let binding = ClaudeClearBinding::maybe_register(Backend::Python)
+            .expect("maybe register")
+            .expect("expected claude binding");
+        request_restart(&binding.inner.control_path).expect("queue restart request");
+
+        let inherit_plan = SandboxCliPlan {
+            operations: vec![SandboxCliOperation::SetMode(SandboxModeArg::Inherit)],
+        };
+        let mut failing_worker =
+            WorkerManager::new(Backend::Python, inherit_plan).expect("worker manager");
+        let restart_err = binding
+            .sync(&mut failing_worker)
+            .expect_err("restart should fail without inherited sandbox state");
+        assert!(
+            matches!(restart_err, WorkerError::Sandbox(_)),
+            "expected sandbox restart error, got {restart_err:?}"
+        );
+        let last_seq = *binding
+            .inner
+            .last_control_seq
+            .lock()
+            .expect("claude control seq mutex poisoned");
+        assert_eq!(last_seq, 0, "failed restart should not consume control seq");
+
+        unsafe {
+            env::remove_var("XDG_STATE_HOME");
+            env::remove_var(CLAUDE_SESSION_ID_ENV);
         }
     }
 
