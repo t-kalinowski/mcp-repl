@@ -68,13 +68,26 @@ fn read_reply_overflow_settings(
 }
 
 fn read_u64(label: &str, value: SEXP) -> std::result::Result<u64, String> {
-    let value =
-        i64::try_from(RObject::view(value)).map_err(|err| format!("invalid {label}: {err}"))?;
-    u64::try_from(value).map_err(|_| format!("{label} must be non-negative"))
+    read_integerish_count(label, value)
 }
 
 fn read_usize(label: &str, value: SEXP) -> std::result::Result<usize, String> {
+    read_integerish_count(label, value).map(|value| value as usize)
+}
+
+fn read_integerish_count(label: &str, value: SEXP) -> std::result::Result<u64, String> {
+    let object = RObject::view(value);
+    if let Ok(value) = i64::try_from(object) {
+        return u64::try_from(value).map_err(|_| format!("{label} must be non-negative"));
+    }
+
     let value =
-        i64::try_from(RObject::view(value)).map_err(|err| format!("invalid {label}: {err}"))?;
-    usize::try_from(value).map_err(|_| format!("{label} must be non-negative"))
+        f64::try_from(RObject::view(value)).map_err(|err| format!("invalid {label}: {err}"))?;
+    if !value.is_finite() || value < 0.0 || value.fract() != 0.0 {
+        return Err(format!("{label} must be a non-negative integer"));
+    }
+    if value > u64::MAX as f64 {
+        return Err(format!("{label} is too large"));
+    }
+    Ok(value as u64)
 }

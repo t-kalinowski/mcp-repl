@@ -26,9 +26,9 @@ use crate::ipc::{
 #[cfg(any(target_family = "unix", target_family = "windows"))]
 use crate::ipc::{IpcHandlers, IpcPlotImage};
 use crate::output_capture::{
-    OUTPUT_RING_CAPACITY_BYTES, OutputArchive, OutputBuffer, OutputEventKind, OutputRange,
-    OutputTextSpan, OutputTimeline, ensure_output_ring, reset_last_reply_marker_offset,
-    reset_output_ring,
+    OUTPUT_ARCHIVE_TAIL_CAPACITY_BYTES, OUTPUT_RING_CAPACITY_BYTES, OutputArchive, OutputBuffer,
+    OutputEventKind, OutputRange, OutputTextSpan, OutputTimeline, ensure_output_ring,
+    reset_last_reply_marker_offset, reset_output_ring,
 };
 use crate::pager;
 use crate::reply_overflow::ReplyOverflowSettings;
@@ -41,7 +41,7 @@ use crate::sandbox_cli::{
     sandbox_plan_requests_inherited_state,
 };
 use crate::worker_protocol::{
-    TextStream, WORKER_MODE_ARG, WorkerContent, WorkerErrorCode, WorkerReply,
+    TextStream, WORKER_MODE_ARG, WorkerContent, WorkerErrorCode, WorkerReply, WorkerTextOverflow,
 };
 #[cfg(target_family = "unix")]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
@@ -472,6 +472,7 @@ pub struct WorkerManager {
     sandbox_state: SandboxState,
     output: OutputBuffer,
     reply_overflow_defaults: ReplyOverflowSettings,
+    reply_overflow_current: ReplyOverflowSettings,
     output_timeline: OutputTimeline,
     driver: Box<dyn BackendDriver>,
     pending_request: bool,
@@ -527,6 +528,7 @@ impl WorkerManager {
         reset_output_ring();
         reset_last_reply_marker_offset();
         let output_timeline = OutputTimeline::new(output_ring, output_archive);
+        let reply_overflow_current = reply_overflow_defaults.clone();
         Ok(Self {
             exe_path,
             backend,
@@ -538,6 +540,7 @@ impl WorkerManager {
             sandbox_state,
             output: OutputBuffer::default(),
             reply_overflow_defaults,
+            reply_overflow_current,
             output_timeline,
             driver: match backend {
                 Backend::R => Box::new(RBackendDriver::new()),
@@ -763,6 +766,10 @@ impl WorkerManager {
         }
 
         let session_end = completion.session_end_seen;
+        let text_overflow = self.live_text_overflow_for_reply(start_offset, end_offset);
+        if text_overflow.is_some() {
+            strip_captured_text_for_live_files_overflow(&mut contents);
+        }
         let resolved_prompt = normalize_prompt(completion.prompt.clone());
         let resolved_prompt = if session_end || timed_out {
             None
@@ -777,6 +784,9 @@ impl WorkerManager {
             append_prompt_if_missing(&mut contents, resolved_prompt.clone());
         }
 
+        if completed_request && !timed_out {
+            self.output_timeline.end_live_text_overflow();
+        }
         Ok(ReplyWithOffset {
             reply: WorkerReply::Output {
                 contents,
@@ -784,6 +794,7 @@ impl WorkerManager {
                 error_code: timed_out.then_some(WorkerErrorCode::Timeout),
                 prompt: (!session_end).then_some(()).and(resolved_prompt),
                 prompt_variants: completion.prompt_variants.clone(),
+                text_overflow,
             },
             end_offset,
         })
@@ -853,6 +864,10 @@ impl WorkerManager {
             return Err(WorkerError::Timeout(server_timeout));
         }
         let payload = self.driver.prepare_input_payload(&text);
+        self.output_timeline.begin_live_text_overflow(
+            &self.sandbox_state.session_temp_dir,
+            &self.reply_overflow_current,
+        );
         self.guardrail.busy.store(true, Ordering::Relaxed);
         self.process
             .as_mut()
@@ -889,6 +904,7 @@ impl WorkerManager {
                 error_code: worker_error_code(err),
                 prompt: None,
                 prompt_variants: None,
+                text_overflow: None,
             },
             end_offset,
         }
@@ -931,6 +947,11 @@ impl WorkerManager {
                     ..
                 } = completion_snapshot.snapshot;
                 contents.append(&mut page_contents);
+                let text_overflow =
+                    self.live_text_overflow_for_reply(context.start_offset, end_offset);
+                if text_overflow.is_some() {
+                    strip_captured_text_for_live_files_overflow(&mut contents);
+                }
                 let resolved_prompt = if session_end {
                     None
                 } else {
@@ -944,6 +965,7 @@ impl WorkerManager {
                     append_prompt_if_missing(&mut contents, resolved_prompt.clone());
                 }
                 self.guardrail.busy.store(false, Ordering::Relaxed);
+                self.output_timeline.end_live_text_overflow();
                 Ok(ReplyWithOffset {
                     reply: WorkerReply::Output {
                         contents,
@@ -951,6 +973,7 @@ impl WorkerManager {
                         error_code: None,
                         prompt: (!session_end).then_some(()).and(resolved_prompt),
                         prompt_variants: completion.prompt_variants.clone(),
+                        text_overflow,
                     },
                     end_offset,
                 })
@@ -983,6 +1006,11 @@ impl WorkerManager {
                     ..
                 } = self.snapshot_page_for_reply(end_offset, first_page_budget);
                 contents.append(&mut page_contents);
+                let text_overflow =
+                    self.live_text_overflow_for_reply(context.start_offset, end_offset);
+                if text_overflow.is_some() {
+                    strip_captured_text_for_live_files_overflow(&mut contents);
+                }
 
                 contents.push(timeout_status_content(request.started_at.elapsed()));
 
@@ -996,6 +1024,7 @@ impl WorkerManager {
                         error_code: Some(WorkerErrorCode::Timeout),
                         prompt: None,
                         prompt_variants: None,
+                        text_overflow,
                     },
                     end_offset,
                 })
@@ -1238,6 +1267,10 @@ impl WorkerManager {
         }
 
         let session_end = self.session_end_seen;
+        let text_overflow = self.live_text_overflow_for_reply(start_offset, end_offset);
+        if text_overflow.is_some() {
+            strip_captured_text_for_live_files_overflow(&mut contents);
+        }
         let resolved_prompt = normalize_prompt(prompt.clone());
         let resolved_prompt = if session_end || timed_out {
             None
@@ -1260,7 +1293,11 @@ impl WorkerManager {
             error_code: timed_out.then_some(WorkerErrorCode::Timeout),
             prompt: (!session_end).then_some(()).and(resolved_prompt),
             prompt_variants: None,
+            text_overflow,
         };
+        if !timed_out {
+            self.output_timeline.end_live_text_overflow();
+        }
         crate::event_log::log(
             "worker_interrupt_end",
             serde_json::json!({
@@ -1287,6 +1324,7 @@ impl WorkerManager {
             let _ = process.shutdown_graceful(timeout);
         }
         self.guardrail.busy.store(false, Ordering::Relaxed);
+        self.output_timeline.clear_live_text_overflow_files();
         let page_bytes = pager::resolve_page_bytes(None);
         let reply = self.build_session_reset_reply(page_bytes, "new session started");
         self.reset_output_state();
@@ -1392,11 +1430,13 @@ impl WorkerManager {
         reset_output_ring();
         reset_last_reply_marker_offset();
         self.output_timeline.reset_archive();
+        self.output_timeline.end_live_text_overflow();
         self.output = OutputBuffer::default();
         self.pending_request = false;
         self.pending_request_started_at = None;
         self.session_end_seen = false;
         self.last_prompt = None;
+        self.reply_overflow_current = self.reply_overflow_defaults.clone();
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
@@ -1418,7 +1458,11 @@ impl WorkerManager {
                 latest = Some(settings);
             }
         }
-        latest.filter(|settings| settings.validate().is_ok())
+        let latest = latest.filter(|settings| settings.validate().is_ok());
+        if let Some(settings) = latest.clone() {
+            self.reply_overflow_current = settings;
+        }
+        latest
     }
 
     fn snapshot_page_for_reply(
@@ -1505,6 +1549,23 @@ impl WorkerManager {
         }
     }
 
+    fn current_text_overflow(&self) -> Option<WorkerTextOverflow> {
+        self.output_timeline.current_live_text_overflow()
+    }
+
+    fn live_text_overflow_for_reply(
+        &self,
+        start_offset: u64,
+        end_offset: u64,
+    ) -> Option<WorkerTextOverflow> {
+        let text_overflow = self.current_text_overflow()?;
+        (end_offset.saturating_sub(start_offset)
+            > OUTPUT_ARCHIVE_TAIL_CAPACITY_BYTES
+                .try_into()
+                .unwrap_or(u64::MAX))
+        .then_some(text_overflow)
+    }
+
     fn current_prompt_hint(&self) -> Option<String> {
         let prompt = self
             .process
@@ -1527,6 +1588,7 @@ impl WorkerManager {
                 error_code: None,
                 prompt,
                 prompt_variants: None,
+                text_overflow: None,
             },
             end_offset: self.output.end_offset().unwrap_or(0),
         }
@@ -1678,6 +1740,7 @@ impl WorkerManager {
                 error_code: None,
                 prompt: None,
                 prompt_variants: None,
+                text_overflow: None,
             },
             end_offset,
         }
@@ -2275,6 +2338,17 @@ fn idle_status_content() -> WorkerContent {
 }
 
 const TIMEOUT_STATUS_GRANULARITY_MS: u64 = 100;
+
+fn strip_captured_text_for_live_files_overflow(contents: &mut Vec<WorkerContent>) {
+    contents.retain(|content| match content {
+        WorkerContent::ContentImage { .. } => true,
+        WorkerContent::ContentText { text, .. } => {
+            text.starts_with("<<console status:")
+                || text.starts_with("[repl]")
+                || text.starts_with("worker error:")
+        }
+    });
+}
 
 fn append_prompt_if_missing(contents: &mut Vec<WorkerContent>, prompt: Option<String>) {
     let Some(prompt) = prompt else {

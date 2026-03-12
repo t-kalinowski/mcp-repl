@@ -160,6 +160,7 @@ impl SharedServer {
                     error_code: None,
                     prompt: None,
                     prompt_variants: None,
+                    text_overflow: None,
                 })
             }
         }

@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -53,15 +54,22 @@ impl ReplyFilesManager {
                 error_code,
                 prompt,
                 prompt_variants,
+                text_overflow,
             } => {
-                let contents =
-                    render_files_reply_contents(self, contents, prompt.as_deref(), settings);
+                let contents = render_files_reply_contents(
+                    self,
+                    contents,
+                    prompt.as_deref(),
+                    settings,
+                    text_overflow.as_ref(),
+                );
                 WorkerReply::Output {
                     contents,
                     is_error,
                     error_code,
                     prompt,
                     prompt_variants,
+                    text_overflow,
                 }
             }
         }
@@ -203,6 +211,7 @@ impl ReplyPresentation {
                 error_code,
                 prompt,
                 prompt_variants,
+                text_overflow,
             } => {
                 contents = collapse_image_updates(contents);
                 let prompt = prompt.filter(|value| !value.is_empty());
@@ -238,6 +247,7 @@ impl ReplyPresentation {
                         error_code,
                         prompt: None,
                         prompt_variants,
+                        text_overflow,
                     }
                 } else {
                     append_prompt_if_missing(&mut contents, prompt.clone());
@@ -247,6 +257,7 @@ impl ReplyPresentation {
                         error_code,
                         prompt,
                         prompt_variants,
+                        text_overflow,
                     }
                 }
             }
@@ -259,9 +270,29 @@ fn render_files_reply_contents(
     contents: Vec<WorkerContent>,
     prompt: Option<&str>,
     settings: &ReplyOverflowSettings,
+    text_overflow: Option<&crate::worker_protocol::WorkerTextOverflow>,
 ) -> Vec<WorkerContent> {
     let contents = collapse_image_updates(contents);
     let (body_contents, prompt_chunk) = split_prompt_chunk(contents, prompt);
+    let body_has_text = body_contents.iter().any(|content| match content {
+        WorkerContent::ContentText { text, .. } => {
+            !text.starts_with("<<console status:")
+                && !text.starts_with("[repl]")
+                && !text.starts_with("worker error:")
+        }
+        WorkerContent::ContentImage { .. } => false,
+    });
+    if let Some(text_overflow) = text_overflow
+        && !body_has_text
+    {
+        return render_existing_text_overflow_contents(
+            files,
+            body_contents,
+            prompt_chunk,
+            settings,
+            text_overflow,
+        );
+    }
 
     let text_spans = body_contents
         .iter()
@@ -358,6 +389,91 @@ fn render_files_reply_contents(
         );
         if !annotations.is_empty() {
             rendered.push(WorkerContent::stderr(annotations));
+        }
+    }
+
+    reattach_prompt(rendered, prompt_chunk)
+}
+
+fn render_existing_text_overflow_contents(
+    files: &mut ReplyFilesManager,
+    body_contents: Vec<WorkerContent>,
+    prompt_chunk: Option<WorkerContent>,
+    settings: &ReplyOverflowSettings,
+    text_overflow: &crate::worker_protocol::WorkerTextOverflow,
+) -> Vec<WorkerContent> {
+    let images = body_contents
+        .iter()
+        .filter(|content| matches!(content, WorkerContent::ContentImage { .. }))
+        .cloned()
+        .collect::<Vec<_>>();
+    let inline_image_limit = if images.len() > settings.images.spill_count {
+        settings.images.preview_count.min(images.len())
+    } else {
+        images.len()
+    };
+
+    let mut rendered = Vec::new();
+    let preview = read_text_preview_from_path(
+        Path::new(&text_overflow.path),
+        usize::try_from(settings.text.preview_bytes).unwrap_or(usize::MAX),
+        text_overflow.total_chars,
+    );
+    let preview_ends_with_newline = preview.ends_with('\n') || preview.ends_with('\r');
+    if !preview.is_empty() {
+        rendered.push(WorkerContent::stdout(preview.clone()));
+    }
+
+    let mut seen_images = 0usize;
+    for content in body_contents {
+        match content {
+            WorkerContent::ContentText { .. } => rendered.push(content),
+            WorkerContent::ContentImage { .. } => {
+                if seen_images < inline_image_limit {
+                    rendered.push(content);
+                }
+                seen_images = seen_images.saturating_add(1);
+            }
+        }
+    }
+
+    let mut annotations = format!(
+        "[full output ({} {}) written to {}]",
+        text_overflow.total_lines,
+        pluralize(text_overflow.total_lines, "line", "lines"),
+        text_overflow.path
+    );
+    if images.len() > inline_image_limit {
+        let extra = write_reply_files(
+            files,
+            None,
+            Some(
+                images
+                    .iter()
+                    .skip(inline_image_limit)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            ),
+            None,
+            inline_image_limit,
+            images.len(),
+            settings.retention.max_dirs,
+        );
+        if !extra.is_empty() {
+            annotations.push('\n');
+            annotations.push_str(extra.trim_end_matches('\n'));
+        }
+    }
+
+    if !annotations.is_empty() {
+        if !preview.is_empty() {
+            if preview_ends_with_newline {
+                rendered.push(WorkerContent::stderr(format!("\n{annotations}\n")));
+            } else {
+                rendered.push(WorkerContent::stderr(format!("\n\n{annotations}\n")));
+            }
+        } else {
+            rendered.push(WorkerContent::stderr(format!("{annotations}\n")));
         }
     }
 
@@ -695,6 +811,31 @@ fn build_text_preview(text: &str, preview_bytes: usize) -> TextPreview {
     }
 }
 
+fn read_text_preview_from_path(path: &Path, preview_bytes: usize, total_chars: usize) -> String {
+    if preview_bytes == 0 {
+        return String::new();
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return String::new();
+    };
+    let mut bytes = Vec::with_capacity(preview_bytes.saturating_add(4));
+    if std::io::Read::by_ref(&mut file)
+        .take(preview_bytes.saturating_add(4) as u64)
+        .read_to_end(&mut bytes)
+        .is_err()
+    {
+        return String::new();
+    }
+    let mut preview = take_prefix_chars(&String::from_utf8_lossy(&bytes), preview_bytes);
+    if total_chars > preview.chars().count() {
+        while preview.ends_with('\n') || preview.ends_with('\r') {
+            preview.pop();
+        }
+        preview.push_str(&format!("...[truncated, total {total_chars} chars]"));
+    }
+    preview
+}
+
 fn count_text_lines(text: &str) -> usize {
     if text.is_empty() {
         return 0;
@@ -841,6 +982,7 @@ mod tests {
             error_code: None,
             prompt: Some("> ".to_string()),
             prompt_variants: None,
+            text_overflow: None,
         };
 
         let WorkerReply::Output { contents, .. } = files.apply_to_reply(reply, &settings);

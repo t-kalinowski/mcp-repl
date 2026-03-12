@@ -1,14 +1,21 @@
 #![cfg_attr(not(target_family = "unix"), allow(dead_code))]
 
 use std::collections::VecDeque;
+use std::fs::File;
+use std::io::Write;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+
+use crate::reply_overflow::{ReplyOverflowBehavior, ReplyOverflowSettings};
+use crate::worker_protocol::WorkerTextOverflow;
 
 static OUTPUT_RING: OnceLock<Arc<OutputRing>> = OnceLock::new();
 static LAST_REPLY_MARKER_OFFSET: AtomicU64 = AtomicU64::new(u64::MAX);
 
 pub(crate) const OUTPUT_RING_CAPACITY_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const OUTPUT_ARCHIVE_TAIL_CAPACITY_BYTES: usize = 1024 * 1024;
 const STDERR_PREFIX: &[u8] = b"stderr: ";
 
 pub(crate) fn ensure_output_ring(capacity_bytes: usize) -> Arc<OutputRing> {
@@ -62,11 +69,16 @@ pub(crate) fn reset_last_reply_marker_offset() {
 pub(crate) struct OutputTimeline {
     ring: Arc<OutputRing>,
     archive: Arc<OutputArchive>,
+    live_text_overflow: Arc<Mutex<LiveTextOverflowManager>>,
 }
 
 impl OutputTimeline {
     pub(crate) fn new(ring: Arc<OutputRing>, archive: Arc<OutputArchive>) -> Self {
-        Self { ring, archive }
+        Self {
+            ring,
+            archive,
+            live_text_overflow: Arc::new(Mutex::new(LiveTextOverflowManager::default())),
+        }
     }
 
     pub(crate) fn append_text(&self, bytes: &[u8], is_stderr: bool) {
@@ -76,6 +88,7 @@ impl OutputTimeline {
         if !is_stderr {
             self.ring.append_bytes(bytes, false);
             self.archive.append_bytes(bytes, false);
+            self.live_text_overflow.lock().unwrap().append_bytes(bytes);
             return;
         }
 
@@ -94,6 +107,10 @@ impl OutputTimeline {
         payload.extend_from_slice(bytes);
         self.ring.append_bytes(&payload, true);
         self.archive.append_bytes(&payload, true);
+        self.live_text_overflow
+            .lock()
+            .unwrap()
+            .append_bytes(&payload);
     }
 
     pub(crate) fn append_image(&self, id: String, mime_type: String, data: String, is_new: bool) {
@@ -133,10 +150,186 @@ impl OutputTimeline {
     pub(crate) fn archive_saw_stderr_in_range(&self, start_offset: u64, end_offset: u64) -> bool {
         self.archive.saw_stderr_in_range(start_offset, end_offset)
     }
+
+    pub(crate) fn begin_live_text_overflow(
+        &self,
+        session_temp_dir: &Path,
+        settings: &ReplyOverflowSettings,
+    ) {
+        self.live_text_overflow
+            .lock()
+            .unwrap()
+            .begin_request(session_temp_dir, settings);
+    }
+
+    pub(crate) fn current_live_text_overflow(&self) -> Option<WorkerTextOverflow> {
+        self.live_text_overflow.lock().unwrap().current_snapshot()
+    }
+
+    pub(crate) fn end_live_text_overflow(&self) {
+        self.live_text_overflow.lock().unwrap().end_request();
+    }
+
+    pub(crate) fn clear_live_text_overflow_files(&self) {
+        self.live_text_overflow.lock().unwrap().clear_files();
+    }
+}
+
+#[derive(Default)]
+struct LiveTextOverflowManager {
+    next_sequence: u64,
+    retained_files: VecDeque<PathBuf>,
+    active: Option<ActiveLiveTextOverflow>,
+}
+
+struct ActiveLiveTextOverflow {
+    spill_bytes: usize,
+    retention_max_files: usize,
+    session_temp_dir: PathBuf,
+    buffered_prefix: Vec<u8>,
+    file: Option<File>,
+    path: Option<PathBuf>,
+    newline_count: usize,
+    ends_with_newline: bool,
+    total_chars: usize,
+    total_bytes: usize,
+}
+
+impl LiveTextOverflowManager {
+    fn begin_request(&mut self, session_temp_dir: &Path, settings: &ReplyOverflowSettings) {
+        self.end_request();
+        if settings.behavior != ReplyOverflowBehavior::Files {
+            self.active = None;
+            return;
+        }
+        self.active = Some(ActiveLiveTextOverflow {
+            spill_bytes: usize::try_from(settings.text.spill_bytes).unwrap_or(usize::MAX),
+            retention_max_files: settings.retention.max_dirs,
+            session_temp_dir: session_temp_dir.to_path_buf(),
+            buffered_prefix: Vec::new(),
+            file: None,
+            path: None,
+            newline_count: 0,
+            ends_with_newline: false,
+            total_chars: 0,
+            total_bytes: 0,
+        });
+    }
+
+    fn append_bytes(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        active.total_bytes = active.total_bytes.saturating_add(bytes.len());
+        active.newline_count = active
+            .newline_count
+            .saturating_add(bytes.iter().filter(|byte| **byte == b'\n').count());
+        active.ends_with_newline = bytes.last().copied() == Some(b'\n');
+        active.total_chars = active
+            .total_chars
+            .saturating_add(String::from_utf8_lossy(bytes).chars().count());
+
+        if let Some(file) = active.file.as_mut() {
+            if let Err(err) = file.write_all(bytes).and_then(|_| file.flush()) {
+                eprintln!("failed to append reply overflow text spill: {err}");
+                active.file = None;
+            }
+            return;
+        }
+
+        if active.total_bytes <= active.spill_bytes {
+            active.buffered_prefix.extend_from_slice(bytes);
+            return;
+        }
+
+        let (session_temp_dir, retention_max_files, buffered_prefix) = (
+            active.session_temp_dir.clone(),
+            active.retention_max_files,
+            active.buffered_prefix.clone(),
+        );
+        let _ = active;
+        let Ok(path) = self.next_spill_path(&session_temp_dir) else {
+            return;
+        };
+        let mut file = match File::create(&path) {
+            Ok(file) => file,
+            Err(err) => {
+                eprintln!("failed to create reply overflow text spill: {err}");
+                return;
+            }
+        };
+        if let Err(err) = file
+            .write_all(&buffered_prefix)
+            .and_then(|_| file.write_all(bytes))
+            .and_then(|_| file.flush())
+        {
+            eprintln!("failed to initialize reply overflow text spill: {err}");
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        let active = self.active.as_mut().expect("active spill state");
+        active.buffered_prefix.clear();
+        active.path = Some(path.clone());
+        active.file = Some(file);
+        self.retained_files.push_back(path);
+        while self.retained_files.len() > retention_max_files {
+            if let Some(old_path) = self.retained_files.pop_front() {
+                let _ = std::fs::remove_file(old_path);
+            }
+        }
+    }
+
+    fn current_snapshot(&self) -> Option<WorkerTextOverflow> {
+        let active = self.active.as_ref()?;
+        let path = active.path.as_ref()?;
+        Some(WorkerTextOverflow {
+            path: path.to_string_lossy().to_string(),
+            total_lines: if active.total_bytes == 0 {
+                0
+            } else if active.ends_with_newline {
+                active.newline_count
+            } else {
+                active.newline_count.saturating_add(1)
+            },
+            total_chars: active.total_chars,
+        })
+    }
+
+    fn end_request(&mut self) {
+        if let Some(active) = self.active.as_mut() {
+            active.file = None;
+        }
+        self.active = None;
+    }
+
+    fn clear_files(&mut self) {
+        if let Some(active) = self.active.as_mut() {
+            active.file = None;
+            if let Some(path) = active.path.take() {
+                let _ = std::fs::remove_file(path);
+            }
+            active.buffered_prefix.clear();
+        }
+        self.active = None;
+        while let Some(path) = self.retained_files.pop_front() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    fn next_spill_path(&mut self, session_temp_dir: &Path) -> std::io::Result<PathBuf> {
+        let base = session_temp_dir.join("mcp-repl-overflow-text");
+        std::fs::create_dir_all(&base)?;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        Ok(base.join(format!("reply-overflow-{:04}.log", self.next_sequence)))
+    }
 }
 
 pub(crate) struct OutputArchive {
     inner: Mutex<OutputArchiveInner>,
+    capacity_bytes: usize,
 }
 
 struct OutputArchiveInner {
@@ -145,17 +338,22 @@ struct OutputArchiveInner {
     events: VecDeque<OutputEvent>,
     start_offset: u64,
     end_offset: u64,
+    buffered_bytes: usize,
+    buffered_event_bytes: usize,
 }
 
 impl OutputArchive {
     pub(crate) fn new() -> Self {
         Self {
+            capacity_bytes: OUTPUT_ARCHIVE_TAIL_CAPACITY_BYTES,
             inner: Mutex::new(OutputArchiveInner {
                 chunks: VecDeque::new(),
                 line_ends: VecDeque::new(),
                 events: VecDeque::new(),
                 start_offset: 0,
                 end_offset: 0,
+                buffered_bytes: 0,
+                buffered_event_bytes: 0,
             }),
         }
     }
@@ -173,10 +371,12 @@ impl OutputArchive {
         let bytes_len = bytes.len();
 
         let mut guard = self.inner.lock().unwrap();
+        let dropped = guard.make_room_for(bytes_len, self.capacity_bytes);
         let start_offset = guard.end_offset;
         guard.end_offset = guard
             .end_offset
             .saturating_add(bytes_len.try_into().unwrap_or(u64::MAX));
+        guard.buffered_bytes = guard.buffered_bytes.saturating_add(bytes_len);
         for idx in newline_indices {
             let offset = start_offset.saturating_add((idx + 1) as u64);
             guard.line_ends.push_back(offset);
@@ -187,11 +387,25 @@ impl OutputArchive {
             range: 0..bytes_len,
             is_stderr,
         });
+        if dropped.dropped_any() {
+            let notice_offset = guard.start_offset;
+            self.append_truncation_notice_locked(&mut guard, notice_offset, 0);
+        }
     }
 
     pub(crate) fn append_event(&self, offset: u64, kind: OutputEventKind) {
         let mut guard = self.inner.lock().unwrap();
+        let event_bytes = event_size_bytes(&kind);
+        if event_bytes > self.capacity_bytes {
+            return;
+        }
+        let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
+        if dropped.dropped_any() {
+            let notice_offset = guard.start_offset;
+            self.append_truncation_notice_locked(&mut guard, notice_offset, event_bytes);
+        }
         let event_offset = offset.max(guard.start_offset);
+        guard.buffered_event_bytes = guard.buffered_event_bytes.saturating_add(event_bytes);
         guard.events.push_back(OutputEvent {
             offset: event_offset,
             kind,
@@ -210,22 +424,7 @@ impl OutputArchive {
 
     pub(crate) fn consume_to(&self, offset: u64) {
         let mut guard = self.inner.lock().unwrap();
-        let OutputArchiveInner {
-            chunks,
-            line_ends,
-            events,
-            start_offset,
-            end_offset,
-        } = &mut *guard;
-        let current_end_offset = *end_offset;
-        trim_chunks_and_events(
-            chunks,
-            line_ends,
-            events,
-            start_offset,
-            current_end_offset,
-            offset,
-        );
+        guard.trim_to_offset(offset);
     }
 
     pub(crate) fn reset(&self) {
@@ -235,6 +434,8 @@ impl OutputArchive {
         guard.events.clear();
         guard.start_offset = 0;
         guard.end_offset = 0;
+        guard.buffered_bytes = 0;
+        guard.buffered_event_bytes = 0;
     }
 
     fn collect_range(&self, start_offset: u64, end_offset: Option<u64>) -> CollectedRange {
@@ -247,6 +448,142 @@ impl OutputArchive {
             start_offset,
             end_offset,
         )
+    }
+
+    fn append_truncation_notice_locked(
+        &self,
+        guard: &mut OutputArchiveInner,
+        offset: u64,
+        extra_bytes: usize,
+    ) {
+        let notice_kind = OutputEventKind::Text {
+            text: "[repl] output truncated (older output dropped)\n".to_string(),
+            is_stderr: false,
+        };
+        let notice_bytes = event_size_bytes(&notice_kind);
+        if notice_bytes.saturating_add(extra_bytes) > self.capacity_bytes {
+            return;
+        }
+        let _ = guard.make_room_for(
+            notice_bytes.saturating_add(extra_bytes),
+            self.capacity_bytes,
+        );
+        let notice_offset = offset.max(guard.start_offset);
+        guard.buffered_event_bytes = guard.buffered_event_bytes.saturating_add(notice_bytes);
+        guard.events.push_back(OutputEvent {
+            offset: notice_offset,
+            kind: notice_kind,
+        });
+    }
+}
+
+impl OutputArchiveInner {
+    fn total_buffered_bytes(&self) -> usize {
+        self.buffered_bytes
+            .saturating_add(self.buffered_event_bytes)
+    }
+
+    fn pop_front_event(&mut self) -> bool {
+        if let Some(event) = self.events.pop_front() {
+            self.buffered_event_bytes = self
+                .buffered_event_bytes
+                .saturating_sub(event_size_bytes(&event.kind));
+            return true;
+        }
+        false
+    }
+
+    fn make_room_for(&mut self, needed_bytes: usize, capacity_bytes: usize) -> DropStats {
+        let mut dropped = DropStats::default();
+        if needed_bytes >= capacity_bytes {
+            dropped.dropped_bytes = self.end_offset.saturating_sub(self.start_offset);
+            dropped.dropped_events = self.events.len();
+            self.chunks.clear();
+            self.line_ends.clear();
+            self.events.clear();
+            self.start_offset = self.end_offset;
+            self.buffered_bytes = 0;
+            self.buffered_event_bytes = 0;
+            return dropped;
+        }
+
+        while self.total_buffered_bytes().saturating_add(needed_bytes) > capacity_bytes {
+            if !self.chunks.is_empty() {
+                let before = self.start_offset;
+                let Some(front) = self.chunks.front() else {
+                    break;
+                };
+                let front_len: u64 = front.range.len().try_into().unwrap_or(u64::MAX);
+                let front_end = front.start_offset.saturating_add(front_len);
+                let target = front_end.max(self.start_offset.saturating_add(1));
+                self.trim_to_offset(target);
+                dropped.dropped_bytes = dropped
+                    .dropped_bytes
+                    .saturating_add(self.start_offset.saturating_sub(before));
+                continue;
+            }
+
+            if !self.events.is_empty() {
+                if self.pop_front_event() {
+                    dropped.dropped_events = dropped.dropped_events.saturating_add(1);
+                }
+                continue;
+            }
+
+            break;
+        }
+
+        dropped
+    }
+
+    fn trim_to_offset(&mut self, offset: u64) {
+        let offset = offset.min(self.end_offset);
+        if offset <= self.start_offset {
+            return;
+        }
+
+        while let Some(front) = self.chunks.front_mut() {
+            let front_len: u64 = front.range.len().try_into().unwrap_or(u64::MAX);
+            let front_end = front.start_offset.saturating_add(front_len);
+
+            if front_end <= offset {
+                let consumed = self.chunks.pop_front().unwrap();
+                let consumed_len = consumed.range.len();
+                self.start_offset = front_end;
+                self.buffered_bytes = self.buffered_bytes.saturating_sub(consumed_len);
+            } else if front.start_offset < offset {
+                let delta_u64 = offset.saturating_sub(front.start_offset);
+                let delta: usize = (delta_u64 as usize).min(front.range.len());
+                front.start_offset = front.start_offset.saturating_add(delta as u64);
+                front.range.start = front.range.start.saturating_add(delta);
+                self.start_offset = offset;
+                self.buffered_bytes = self.buffered_bytes.saturating_sub(delta);
+            } else {
+                self.start_offset = offset;
+            }
+
+            self.cleanup_front();
+
+            if self.start_offset >= offset {
+                break;
+            }
+        }
+
+        if self.chunks.is_empty() {
+            self.start_offset = offset;
+            self.cleanup_front();
+        }
+    }
+
+    fn cleanup_front(&mut self) {
+        while matches!(self.line_ends.front(), Some(line_end) if *line_end <= self.start_offset) {
+            let _ = self.line_ends.pop_front();
+        }
+        while matches!(self.events.front(), Some(event) if event.offset <= self.start_offset) {
+            if self.pop_front_event() {
+                // tail archive drop
+            }
+        }
     }
 }
 
@@ -553,59 +890,6 @@ fn collect_range_from_chunks(
     }
 }
 
-fn trim_chunks_and_events(
-    chunks: &mut VecDeque<OutputChunk>,
-    line_ends: &mut VecDeque<u64>,
-    events: &mut VecDeque<OutputEvent>,
-    start_offset: &mut u64,
-    end_offset: u64,
-    offset: u64,
-) {
-    let offset = offset.min(end_offset);
-    if offset <= *start_offset {
-        return;
-    }
-
-    while let Some(front) = chunks.front_mut() {
-        let front_len: u64 = front.range.len().try_into().unwrap_or(u64::MAX);
-        let front_end = front.start_offset.saturating_add(front_len);
-
-        if front_end <= offset {
-            chunks.pop_front();
-            *start_offset = front_end;
-        } else if front.start_offset < offset {
-            let delta_u64 = offset.saturating_sub(front.start_offset);
-            let delta: usize = (delta_u64 as usize).min(front.range.len());
-            front.start_offset = front.start_offset.saturating_add(delta as u64);
-            front.range.start = front.range.start.saturating_add(delta);
-            *start_offset = offset;
-        } else {
-            *start_offset = offset;
-        }
-
-        while matches!(line_ends.front(), Some(line_end) if *line_end <= *start_offset) {
-            let _ = line_ends.pop_front();
-        }
-        while matches!(events.front(), Some(event) if event.offset <= *start_offset) {
-            let _ = events.pop_front();
-        }
-
-        if *start_offset >= offset {
-            break;
-        }
-    }
-
-    if chunks.is_empty() {
-        *start_offset = offset;
-        while matches!(line_ends.front(), Some(line_end) if *line_end <= *start_offset) {
-            let _ = line_ends.pop_front();
-        }
-        while matches!(events.front(), Some(event) if event.offset <= *start_offset) {
-            let _ = events.pop_front();
-        }
-    }
-}
-
 impl OutputRing {
     fn new(capacity_bytes: usize) -> Self {
         Self {
@@ -675,7 +959,7 @@ impl OutputRing {
         }
 
         if dropped_any {
-            self.append_truncation_notice(self.end_offset(), 0);
+            self.append_truncation_notice(self.start_offset(), 0);
         }
     }
 
@@ -698,7 +982,8 @@ impl OutputRing {
         let dropped = guard.make_room_for(event_bytes, self.capacity_bytes);
         let mut event_offset = offset.max(guard.start_offset);
         if dropped.dropped_any() {
-            self.append_truncation_notice_locked(&mut guard, event_offset, event_bytes);
+            let notice_offset = guard.start_offset;
+            self.append_truncation_notice_locked(&mut guard, notice_offset, event_bytes);
             event_offset = event_offset.max(guard.start_offset);
         }
         guard.buffered_event_bytes = guard.buffered_event_bytes.saturating_add(event_bytes);

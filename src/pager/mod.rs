@@ -828,6 +828,7 @@ fn pager_reply(
         error_code,
         prompt: None,
         prompt_variants: None,
+        text_overflow: None,
     }
 }
 

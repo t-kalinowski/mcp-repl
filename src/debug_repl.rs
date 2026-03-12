@@ -355,6 +355,7 @@ mod tests {
             error_code: None,
             prompt: Some("> ".to_string()),
             prompt_variants: None,
+            text_overflow: None,
         };
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -377,6 +378,7 @@ mod tests {
             error_code: None,
             prompt: None,
             prompt_variants: None,
+            text_overflow: None,
         };
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();

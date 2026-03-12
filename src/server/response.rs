@@ -11,6 +11,7 @@ pub(crate) fn worker_reply_to_contents(reply: WorkerReply) -> (Vec<Content>, boo
             error_code: _,
             prompt: _,
             prompt_variants: _,
+            text_overflow: _,
         } => (contents, is_error),
     };
     let contents = collapse_image_updates(contents);

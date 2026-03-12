@@ -34,6 +34,17 @@ use std::mem::MaybeUninit;
 use windows_sys::Win32::Globalization::{GetACP, MultiByteToWideChar};
 
 const MCP_CONSOLE_R_SCRIPT: &str = include_str!("../r/mcp_console.R");
+const MCP_CONSOLE_EMIT_REPLY_OVERFLOW_SETTINGS_SCRIPT: &str = r#"
+invisible(.Call(
+  "mcp_console_reply_overflow_update",
+  getOption("mcp.reply_overflow.behavior", "files"),
+  getOption("mcp.reply_overflow.text.preview_bytes", 3500L),
+  getOption("mcp.reply_overflow.text.spill_bytes", 3500L),
+  getOption("mcp.reply_overflow.images.preview_count", 2L),
+  getOption("mcp.reply_overflow.images.spill_count", 2L),
+  getOption("mcp.reply_overflow.retention.max_dirs", 30L)
+))
+"#;
 
 #[derive(Debug)]
 pub struct SessionReply;
@@ -379,6 +390,10 @@ fn eval_in_global_env(code: &str) -> Result<(), String> {
     eval.call()
         .map_err(|err| format!("failed to eval R startup code: {err}"))?;
     Ok(())
+}
+
+fn emit_current_reply_overflow_settings() -> Result<(), String> {
+    eval_in_global_env(MCP_CONSOLE_EMIT_REPLY_OVERFLOW_SETTINGS_SCRIPT)
 }
 
 fn configure_r_env_vars(r_home: &Path) {
@@ -809,6 +824,9 @@ fn complete_active_request(
     emit_session_end: bool,
 ) {
     if let Some(active) = active {
+        if let Err(err) = emit_current_reply_overflow_settings() {
+            eprintln!("failed to emit reply overflow settings: {err}");
+        }
         let _ = active.reply.send(SessionReply);
         state.cvar.notify_all();
     }
