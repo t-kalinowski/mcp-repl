@@ -282,6 +282,7 @@ fn stage_claude_env(mcp_console: &Path) -> TestResult<Option<StagedClaudeEnv>> {
             return Ok(None);
         };
         for (key, value) in bedrock_env {
+            child_env.push((key.clone(), value.clone()));
             settings_env.insert(key, JsonValue::String(value));
         }
     }
@@ -371,18 +372,26 @@ fn load_host_claude_settings_env() -> TestResult<std::collections::BTreeMap<Stri
         return Ok(std::collections::BTreeMap::new());
     }
 
-    let raw = fs::read_to_string(&settings_path).map_err(|err| {
-        format!(
-            "failed to read host Claude settings {}: {err}",
-            settings_path.display()
-        )
-    })?;
-    let root: JsonValue = serde_json::from_str(&raw).map_err(|err| {
-        format!(
-            "failed to parse host Claude settings {}: {err}",
-            settings_path.display()
-        )
-    })?;
+    let raw = match fs::read_to_string(&settings_path) {
+        Ok(raw) => raw,
+        Err(err) => {
+            eprintln!(
+                "failed to read host Claude settings {}; skipping host Claude settings: {err}",
+                settings_path.display()
+            );
+            return Ok(std::collections::BTreeMap::new());
+        }
+    };
+    let root: JsonValue = match serde_json::from_str(&raw) {
+        Ok(root) => root,
+        Err(err) => {
+            eprintln!(
+                "failed to parse host Claude settings {}; skipping host Claude settings: {err}",
+                settings_path.display()
+            );
+            return Ok(std::collections::BTreeMap::new());
+        }
+    };
 
     let env_vars = root
         .get("env")
