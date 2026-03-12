@@ -1,16 +1,18 @@
 use base64::Engine as _;
 use rmcp::model::{AnnotateAble, CallToolResult, Content, Meta, RawContent, RawImageContent};
 use serde_json::json;
+use std::collections::VecDeque;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tempfile::{Builder, TempDir};
 
 use crate::worker_protocol::{WorkerContent, WorkerReply};
 
 const INLINE_TEXT_LIMIT_BYTES: usize = 10 * 1024;
 const INLINE_IMAGE_LIMIT: usize = 4;
+const DEFAULT_MAX_OVERFLOW_FILES: usize = 64;
 const TOOL_NAME_COMPONENT_MAX_BYTES: usize = 24;
 const REQUEST_ID_COMPONENT_MAX_BYTES: usize = 48;
 const OVERFLOW_ROOT_PREFIX: &str = "mcp-console-overflow-";
@@ -20,9 +22,33 @@ pub(crate) struct OverflowFileStore {
     inner: Arc<OverflowFileStoreInner>,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct OverflowResponseKey {
+    tool_name: String,
+    turn_number: u64,
+    request_id: String,
+}
+
+impl OverflowResponseKey {
+    fn from_metadata(metadata: &OverflowMetadata) -> Self {
+        Self {
+            tool_name: metadata.tool_name.clone(),
+            turn_number: metadata.turn_number,
+            request_id: metadata.request_id.clone(),
+        }
+    }
+}
+
+struct RetainedOverflowFile {
+    path: PathBuf,
+    response_key: OverflowResponseKey,
+}
+
 struct OverflowFileStoreInner {
     root_path: PathBuf,
     cleanup_root_on_drop: bool,
+    max_overflow_files: usize,
+    retained_files: Mutex<VecDeque<RetainedOverflowFile>>,
     _temp_dir: Option<TempDir>,
 }
 
@@ -50,6 +76,8 @@ impl OverflowFileStore {
                     inner: Arc::new(OverflowFileStoreInner {
                         root_path,
                         cleanup_root_on_drop: false,
+                        max_overflow_files: DEFAULT_MAX_OVERFLOW_FILES,
+                        retained_files: Mutex::new(VecDeque::new()),
                         _temp_dir: Some(temp_dir),
                     }),
                 })
@@ -61,6 +89,8 @@ impl OverflowFileStore {
                     inner: Arc::new(OverflowFileStoreInner {
                         root_path,
                         cleanup_root_on_drop: true,
+                        max_overflow_files: DEFAULT_MAX_OVERFLOW_FILES,
+                        retained_files: Mutex::new(VecDeque::new()),
                         _temp_dir: None,
                     }),
                 })
@@ -78,13 +108,53 @@ impl OverflowFileStore {
 
     #[cfg(test)]
     fn from_root_for_tests(root_path: PathBuf) -> Self {
+        Self::from_root_with_limit_for_tests(root_path, DEFAULT_MAX_OVERFLOW_FILES)
+    }
+
+    #[cfg(test)]
+    fn from_root_with_limit_for_tests(root_path: PathBuf, max_overflow_files: usize) -> Self {
         Self {
             inner: Arc::new(OverflowFileStoreInner {
                 root_path,
                 cleanup_root_on_drop: false,
+                max_overflow_files: max_overflow_files.max(1),
+                retained_files: Mutex::new(VecDeque::new()),
                 _temp_dir: None,
             }),
         }
+    }
+
+    fn retain_written_file(&self, path: PathBuf, metadata: &OverflowMetadata) -> io::Result<()> {
+        let protected_response = OverflowResponseKey::from_metadata(metadata);
+        let mut retained = self.inner.retained_files.lock().unwrap();
+        retained.push_back(RetainedOverflowFile {
+            path,
+            response_key: protected_response.clone(),
+        });
+        let mut evicted = Vec::new();
+        while retained.len() > self.inner.max_overflow_files {
+            let Some(eviction_idx) = retained
+                .iter()
+                .position(|entry| entry.response_key != protected_response)
+            else {
+                break;
+            };
+            let file = retained
+                .remove(eviction_idx)
+                .expect("eviction index must exist");
+            evicted.push(file.path);
+        }
+        drop(retained);
+
+        for path in evicted {
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -159,12 +229,23 @@ fn maybe_overflow_text_contents(
         return contents;
     };
 
-    let full_text = collect_text_contents(&contents);
     let overflow_notice = match overflow_store {
         Some(store) => {
             let overflow_path = store.overflow_path(overflow_metadata);
-            match write_text_file(&overflow_path, &full_text) {
-                Ok(()) => overflow_notice_prefix(Some(&overflow_path)),
+            match write_text_file(&overflow_path, &contents) {
+                Ok(()) => {
+                    if let Err(err) =
+                        store.retain_written_file(overflow_path.clone(), overflow_metadata)
+                    {
+                        log_overflow_retention_failure(
+                            Some(store.root_path()),
+                            overflow_metadata,
+                            &overflow_path,
+                            &err,
+                        );
+                    }
+                    overflow_notice_prefix(Some(&overflow_path))
+                }
                 Err(err) => {
                     log_overflow_write_failure(Some(store.root_path()), overflow_metadata, &err);
                     overflow_notice_prefix(None)
@@ -236,10 +317,21 @@ fn maybe_overflow_image_contents(
         }
 
         match write_image_file(overflow_store, overflow_metadata, inline_images_seen, image) {
-            Ok(path) => rewritten.push(Content::text(image_overflow_notice(
-                inline_images_seen,
-                &path,
-            ))),
+            Ok(path) => {
+                if let Err(err) = overflow_store.retain_written_file(path.clone(), overflow_metadata)
+                {
+                    log_overflow_retention_failure(
+                        Some(overflow_store.root_path()),
+                        overflow_metadata,
+                        &path,
+                        &err,
+                    );
+                }
+                rewritten.push(Content::text(image_overflow_notice(
+                    inline_images_seen,
+                    &path,
+                )));
+            }
             Err(err) => {
                 log_overflow_image_write_failure(
                     Some(overflow_store.root_path()),
@@ -255,9 +347,9 @@ fn maybe_overflow_image_contents(
     rewritten
 }
 
-fn write_text_file(path: &Path, text: &str) -> io::Result<()> {
+fn write_text_file(path: &Path, contents: &[Content]) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
-    file.write_all(text.as_bytes())
+    write_text_contents(&mut file, contents)
 }
 
 fn write_image_file(
@@ -282,19 +374,13 @@ fn write_image_file(
     Ok(path)
 }
 
-fn collect_text_contents(contents: &[Content]) -> String {
-    let total_bytes: usize = contents
-        .iter()
-        .filter_map(content_text)
-        .map(|text| text.len())
-        .sum();
-    let mut out = String::with_capacity(total_bytes);
+fn write_text_contents<W: Write>(writer: &mut W, contents: &[Content]) -> io::Result<()> {
     for content in contents {
         if let Some(text) = content_text(content) {
-            out.push_str(text);
+            writer.write_all(text.as_bytes())?;
         }
     }
-    out
+    Ok(())
 }
 
 fn content_text(content: &Content) -> Option<&str> {
@@ -485,6 +571,25 @@ fn log_overflow_image_write_failure(
     );
 }
 
+fn log_overflow_retention_failure(
+    root_path: Option<&Path>,
+    metadata: &OverflowMetadata,
+    file_path: &Path,
+    err: &io::Error,
+) {
+    crate::event_log::log(
+        "tool_response_overflow_retention_failed",
+        json!({
+            "root_path": root_path.map(|path| path.to_string_lossy().to_string()),
+            "tool_name": metadata.tool_name,
+            "turn_number": metadata.turn_number,
+            "request_id": metadata.request_id,
+            "file_path": file_path.to_string_lossy().to_string(),
+            "error": err.to_string(),
+        }),
+    );
+}
+
 fn collapse_image_updates(contents: Vec<WorkerContent>) -> Vec<WorkerContent> {
     let mut group_for_index: Vec<Option<usize>> = vec![None; contents.len()];
     let mut last_in_group: Vec<usize> = Vec::new();
@@ -581,11 +686,12 @@ mod tests {
     use super::{
         INLINE_IMAGE_LIMIT, INLINE_TEXT_LIMIT_BYTES, OverflowFileStore, OverflowMetadata,
         content_image_with_meta, finalize_batch, normalize_error_prompt, overflow_filename,
-        overflow_image_filename,
+        overflow_image_filename, write_text_contents,
     };
     use base64::Engine as _;
     use rmcp::model::RawContent;
     use std::fs;
+    use std::io::{self, Write};
     use std::path::PathBuf;
     use tempfile::{NamedTempFile, tempdir};
 
@@ -831,6 +937,29 @@ mod tests {
     }
 
     #[test]
+    fn image_overflow_does_not_evict_paths_referenced_by_same_response() {
+        let temp = tempdir().expect("tempdir");
+        let store = OverflowFileStore::from_root_with_limit_for_tests(temp.path().to_path_buf(), 2);
+        let contents = (1..=7).map(image_content).collect();
+        let result = finalize_batch(
+            contents,
+            false,
+            Some(&store),
+            overflow_metadata("repl", 13, "call_many_images"),
+        );
+
+        let text = result_text(&result);
+        let paths = extract_all_paths(&text, "full image at ");
+        assert_eq!(paths.len(), 3, "expected three overflow image notices");
+        for path in paths {
+            assert!(
+                path.exists(),
+                "expected referenced overflow image file to exist: {path:?}"
+            );
+        }
+    }
+
+    #[test]
     fn image_overflow_notice_stays_in_original_order() {
         let store = OverflowFileStore::new().expect("overflow store");
         let result = finalize_batch(
@@ -966,6 +1095,68 @@ mod tests {
         assert!(text.contains("could not be persisted"));
         assert!(!text.contains("full response at "));
         assert!(text.len() <= INLINE_TEXT_LIMIT_BYTES);
+    }
+
+    #[test]
+    fn write_text_contents_streams_each_text_fragment_in_order() {
+        #[derive(Default)]
+        struct RecordingWriter {
+            writes: Vec<String>,
+        }
+
+        impl Write for RecordingWriter {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.writes
+                    .push(String::from_utf8(buf.to_vec()).expect("utf8 text chunk"));
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let mut writer = RecordingWriter::default();
+        let contents = vec![
+            rmcp::model::Content::text("head\n".to_string()),
+            image_content(1),
+            rmcp::model::Content::text("tail\n".to_string()),
+        ];
+
+        write_text_contents(&mut writer, &contents).expect("stream text contents");
+
+        assert_eq!(
+            writer.writes,
+            vec!["head\n".to_string(), "tail\n".to_string()]
+        );
+    }
+
+    #[test]
+    fn overflow_store_evicts_oldest_file_when_limit_is_exceeded() {
+        let temp = tempdir().expect("tempdir");
+        let store = OverflowFileStore::from_root_with_limit_for_tests(temp.path().to_path_buf(), 2);
+        let mut paths = Vec::new();
+
+        for turn in 1..=3 {
+            let result = finalize_batch(
+                vec![rmcp::model::Content::text(
+                    "x".repeat(INLINE_TEXT_LIMIT_BYTES + 128),
+                )],
+                false,
+                Some(&store),
+                overflow_metadata("repl", turn, &format!("call_{turn}")),
+            );
+            let path = extract_overflow_path(&result_text(&result)).expect("overflow path");
+            paths.push(path);
+        }
+
+        assert!(
+            !paths[0].exists(),
+            "expected oldest overflow file to be evicted: {:?}",
+            paths[0]
+        );
+        assert!(paths[1].exists(), "expected second overflow file to remain");
+        assert!(paths[2].exists(), "expected newest overflow file to remain");
     }
 
     #[test]
