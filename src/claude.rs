@@ -380,7 +380,9 @@ fn read_session_id_from_env_file(path: Option<&Path>) -> Option<String> {
             continue;
         }
         let line = line.strip_prefix("export ").unwrap_or(line);
-        let (key, value) = line.split_once('=')?;
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
         if key.trim() != CLAUDE_SESSION_ID_ENV {
             continue;
         }
@@ -739,6 +741,37 @@ mod tests {
             env::remove_var("XDG_STATE_HOME");
             env::remove_var(CLAUDE_PROJECT_DIR_ENV);
             env::remove_var(CLAUDE_SESSION_ID_ENV);
+        }
+    }
+
+    #[test]
+    fn maybe_register_ignores_malformed_env_file_lines_after_valid_session_export() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let env_file = temp.path().join("claude.env");
+        fs::write(
+            &env_file,
+            "export MCP_REPL_CLAUDE_SESSION_ID=sess-valid\nsource ~/.profile\n",
+        )
+        .expect("write env file");
+
+        unsafe {
+            env::set_var("XDG_STATE_HOME", temp.path());
+            env::set_var(CLAUDE_ENV_FILE_ENV, &env_file);
+            env::remove_var(CLAUDE_PROJECT_DIR_ENV);
+            env::remove_var(CLAUDE_SESSION_ID_ENV);
+        }
+
+        let binding = ClaudeClearBinding::maybe_register(Backend::R).expect("maybe register");
+        assert!(
+            binding.is_some(),
+            "expected claude binding to load session id from env file"
+        );
+
+        drop(binding);
+        unsafe {
+            env::remove_var("XDG_STATE_HOME");
+            env::remove_var(CLAUDE_ENV_FILE_ENV);
         }
     }
 

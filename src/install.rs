@@ -778,15 +778,44 @@ fn new_hook_command(command: &str) -> JsonValue {
 }
 
 fn claude_hook_command(command: &str, args: &[String], hook: &str) -> String {
+    claude_hook_command_for_shell(command, args, hook, current_hook_shell())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookCommandShell {
+    Posix,
+    Windows,
+}
+
+fn current_hook_shell() -> HookCommandShell {
+    if cfg!(windows) {
+        return HookCommandShell::Windows;
+    }
+    HookCommandShell::Posix
+}
+
+fn claude_hook_command_for_shell(
+    command: &str,
+    args: &[String],
+    hook: &str,
+    shell: HookCommandShell,
+) -> String {
     std::iter::once(command)
         .chain(args.iter().map(String::as_str))
         .chain(["claude-hook", hook])
-        .map(shell_escape)
+        .map(|value| shell_escape(value, shell))
         .collect::<Vec<_>>()
         .join(" ")
 }
 
-fn shell_escape(raw: &str) -> String {
+fn shell_escape(raw: &str, shell: HookCommandShell) -> String {
+    match shell {
+        HookCommandShell::Posix => shell_escape_posix(raw),
+        HookCommandShell::Windows => shell_escape_windows(raw),
+    }
+}
+
+fn shell_escape_posix(raw: &str) -> String {
     if raw.is_empty() {
         return "''".to_string();
     }
@@ -797,6 +826,45 @@ fn shell_escape(raw: &str) -> String {
         return raw.to_string();
     }
     format!("'{}'", raw.replace('\'', "'\"'\"'"))
+}
+
+fn shell_escape_windows(raw: &str) -> String {
+    if raw.is_empty() {
+        return "\"\"".to_string();
+    }
+    if raw
+        .bytes()
+        .all(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | b'"'))
+    {
+        return raw.to_string();
+    }
+
+    let mut escaped = String::from("\"");
+    let mut backslashes = 0usize;
+    for ch in raw.chars() {
+        match ch {
+            '\\' => {
+                backslashes += 1;
+            }
+            '"' => {
+                escaped.push_str(&"\\".repeat(backslashes.saturating_mul(2).saturating_add(1)));
+                escaped.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                if backslashes > 0 {
+                    escaped.push_str(&"\\".repeat(backslashes));
+                    backslashes = 0;
+                }
+                escaped.push(ch);
+            }
+        }
+    }
+    if backslashes > 0 {
+        escaped.push_str(&"\\".repeat(backslashes.saturating_mul(2)));
+    }
+    escaped.push('"');
+    escaped
 }
 
 fn serialize_json_pretty_with_paired_args(
@@ -1576,6 +1644,35 @@ name="demo"
         assert_eq!(
             command,
             "cargo run --bin mcp-repl -- claude-hook session-start"
+        );
+    }
+
+    #[test]
+    fn claude_hook_command_windows_shell_quotes_spaced_paths() {
+        let command = claude_hook_command_for_shell(
+            r"C:\Program Files\repltool.exe",
+            &[
+                "--config".to_string(),
+                r"C:\Users\alice\my config.toml".to_string(),
+            ],
+            "session-start",
+            HookCommandShell::Windows,
+        );
+        assert_eq!(
+            command,
+            "\"C:\\Program Files\\repltool.exe\" --config \"C:\\Users\\alice\\my config.toml\" claude-hook session-start"
+        );
+    }
+
+    #[test]
+    fn shell_escape_windows_escapes_embedded_quotes_and_trailing_backslashes() {
+        assert_eq!(
+            shell_escape_windows("say \"hi\""),
+            "\"say \\\"hi\\\"\"".to_string()
+        );
+        assert_eq!(
+            shell_escape_windows("C:\\Program Files\\"),
+            "\"C:\\Program Files\\\\\"".to_string()
         );
     }
 }
