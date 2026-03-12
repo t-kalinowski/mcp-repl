@@ -133,6 +133,7 @@ impl OverflowFileStore {
         });
         let mut evicted = Vec::new();
         while retained.len() > self.inner.max_overflow_files {
+            // Keep files referenced by the in-flight response available to the caller.
             let Some(eviction_idx) = retained
                 .iter()
                 .position(|entry| entry.response_key != protected_response)
@@ -318,7 +319,8 @@ fn maybe_overflow_image_contents(
 
         match write_image_file(overflow_store, overflow_metadata, inline_images_seen, image) {
             Ok(path) => {
-                if let Err(err) = overflow_store.retain_written_file(path.clone(), overflow_metadata)
+                if let Err(err) =
+                    overflow_store.retain_written_file(path.clone(), overflow_metadata)
                 {
                     log_overflow_retention_failure(
                         Some(overflow_store.root_path()),
@@ -955,6 +957,41 @@ mod tests {
             assert!(
                 path.exists(),
                 "expected referenced overflow image file to exist: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_overflow_does_not_evict_any_path_referenced_by_same_response() {
+        let temp = tempdir().expect("tempdir");
+        let store = OverflowFileStore::from_root_with_limit_for_tests(temp.path().to_path_buf(), 2);
+        let mut contents: Vec<_> = (1..=7).map(image_content).collect();
+        contents.push(rmcp::model::Content::text(
+            "x".repeat(INLINE_TEXT_LIMIT_BYTES + 256),
+        ));
+
+        let result = finalize_batch(
+            contents,
+            false,
+            Some(&store),
+            overflow_metadata("repl", 14, "call_mixed_many"),
+        );
+
+        let text = result_text(&result);
+        let response_path = extract_overflow_path(&text).expect("overflow response path");
+        let image_paths = extract_all_paths(&text, "full image at ");
+        assert_eq!(
+            image_paths.len(),
+            3,
+            "expected three overflow image notices"
+        );
+        for path in image_paths
+            .into_iter()
+            .chain(std::iter::once(response_path))
+        {
+            assert!(
+                path.exists(),
+                "expected referenced overflow file to exist: {path:?}"
             );
         }
     }
