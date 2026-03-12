@@ -1,3 +1,4 @@
+use base64::Engine as _;
 use rmcp::model::{AnnotateAble, CallToolResult, Content, Meta, RawContent, RawImageContent};
 use serde_json::json;
 use std::fs::{self, OpenOptions};
@@ -9,6 +10,7 @@ use tempfile::{Builder, TempDir};
 use crate::worker_protocol::{WorkerContent, WorkerReply};
 
 const INLINE_TEXT_LIMIT_BYTES: usize = 10 * 1024;
+const INLINE_IMAGE_LIMIT: usize = 4;
 const TOOL_NAME_COMPONENT_MAX_BYTES: usize = 24;
 const REQUEST_ID_COMPONENT_MAX_BYTES: usize = 48;
 const OVERFLOW_ROOT_PREFIX: &str = "mcp-console-overflow-";
@@ -122,6 +124,7 @@ pub(crate) fn finalize_batch(
     overflow_metadata: OverflowMetadata,
 ) -> CallToolResult {
     contents = maybe_overflow_text_contents(contents, overflow_store, &overflow_metadata);
+    contents = maybe_overflow_image_contents(contents, overflow_store, &overflow_metadata);
     ensure_nonempty_contents(&mut contents);
     // Preserve backend error detection (for prompt normalization, paging decisions, etc.) but
     // do not map it to MCP tool errors.
@@ -184,9 +187,84 @@ fn maybe_overflow_text_contents(
     rewritten
 }
 
+fn maybe_overflow_image_contents(
+    contents: Vec<Content>,
+    overflow_store: &OverflowFileStore,
+    overflow_metadata: &OverflowMetadata,
+) -> Vec<Content> {
+    let total_images = contents
+        .iter()
+        .filter(|content| matches!(&content.raw, RawContent::Image(_)))
+        .count();
+    if total_images <= INLINE_IMAGE_LIMIT {
+        return contents;
+    }
+
+    let mut rewritten = Vec::with_capacity(contents.len() + 1);
+    let mut inline_images_seen = 0usize;
+    let mut overflow_lines = Vec::new();
+
+    for content in contents {
+        let Some(image) = raw_image(&content) else {
+            rewritten.push(content);
+            continue;
+        };
+
+        inline_images_seen += 1;
+        if inline_images_seen <= INLINE_IMAGE_LIMIT {
+            rewritten.push(content);
+            continue;
+        }
+
+        match write_image_file(overflow_store, overflow_metadata, inline_images_seen, image) {
+            Ok(path) => overflow_lines.push(format!(
+                "[repl] image {inline_images_seen} omitted from inline response; full image at {}",
+                path.display()
+            )),
+            Err(err) => {
+                log_overflow_image_write_failure(
+                    overflow_store.root_path(),
+                    overflow_metadata,
+                    inline_images_seen,
+                    &err,
+                );
+                rewritten.push(content);
+            }
+        }
+    }
+
+    if !overflow_lines.is_empty() {
+        rewritten.push(Content::text(format!("{}\n", overflow_lines.join("\n"))));
+    }
+
+    rewritten
+}
+
 fn write_text_file(path: &Path, text: &str) -> io::Result<()> {
     let mut file = OpenOptions::new().write(true).create_new(true).open(path)?;
     file.write_all(text.as_bytes())
+}
+
+fn write_image_file(
+    overflow_store: &OverflowFileStore,
+    metadata: &OverflowMetadata,
+    image_index: usize,
+    image: &rmcp::model::RawImageContent,
+) -> io::Result<PathBuf> {
+    let path = overflow_store.root_path().join(overflow_image_filename(
+        metadata,
+        image_index,
+        &image.mime_type,
+    ));
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(image.data.as_bytes())
+        .map_err(|err| io::Error::other(err.to_string()))?;
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
+    file.write_all(&bytes)?;
+    Ok(path)
 }
 
 fn collect_text_contents(contents: &[Content]) -> String {
@@ -207,6 +285,13 @@ fn collect_text_contents(contents: &[Content]) -> String {
 fn content_text(content: &Content) -> Option<&str> {
     match &content.raw {
         RawContent::Text(text) => Some(text.text.as_str()),
+        _ => None,
+    }
+}
+
+fn raw_image(content: &Content) -> Option<&rmcp::model::RawImageContent> {
+    match &content.raw {
+        RawContent::Image(image) => Some(image),
         _ => None,
     }
 }
@@ -264,6 +349,33 @@ fn overflow_filename(metadata: &OverflowMetadata) -> String {
     }
 }
 
+fn overflow_image_filename(
+    metadata: &OverflowMetadata,
+    image_index: usize,
+    mime_type: &str,
+) -> String {
+    let tool_name = sanitize_filename_component(&metadata.tool_name, TOOL_NAME_COMPONENT_MAX_BYTES);
+    let tool_name = if tool_name.is_empty() {
+        "tool".to_string()
+    } else {
+        tool_name
+    };
+    let request_id =
+        sanitize_filename_component(&metadata.request_id, REQUEST_ID_COMPONENT_MAX_BYTES);
+    let extension = image_extension_for_mime(mime_type);
+    if request_id.is_empty() {
+        format!(
+            "{tool_name}-response-{:03}-image-{image_index:02}.{extension}",
+            metadata.turn_number
+        )
+    } else {
+        format!(
+            "{tool_name}-response-{:03}-{request_id}-image-{image_index:02}.{extension}",
+            metadata.turn_number
+        )
+    }
+}
+
 fn sanitize_filename_component(raw: &str, max_len: usize) -> String {
     if max_len == 0 {
         return String::new();
@@ -301,6 +413,18 @@ fn sanitize_filename_component(raw: &str, max_len: usize) -> String {
     sanitized
 }
 
+fn image_extension_for_mime(mime_type: &str) -> &'static str {
+    match mime_type.trim().to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "application/pdf" => "pdf",
+        _ => "bin",
+    }
+}
+
 fn fallback_overflow_root() -> PathBuf {
     let mut root = std::env::temp_dir();
     let pid = std::process::id();
@@ -320,6 +444,25 @@ fn log_overflow_write_failure(root_path: &Path, metadata: &OverflowMetadata, err
             "tool_name": metadata.tool_name,
             "turn_number": metadata.turn_number,
             "request_id": metadata.request_id,
+            "error": err.to_string(),
+        }),
+    );
+}
+
+fn log_overflow_image_write_failure(
+    root_path: &Path,
+    metadata: &OverflowMetadata,
+    image_index: usize,
+    err: &io::Error,
+) {
+    crate::event_log::log(
+        "tool_response_image_overflow_write_failed",
+        json!({
+            "root_path": root_path.to_string_lossy().to_string(),
+            "tool_name": metadata.tool_name,
+            "turn_number": metadata.turn_number,
+            "request_id": metadata.request_id,
+            "image_index": image_index,
             "error": err.to_string(),
         }),
     );
@@ -419,9 +562,11 @@ fn normalize_plot_id(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        INLINE_TEXT_LIMIT_BYTES, OverflowFileStore, OverflowMetadata, content_image_with_meta,
-        finalize_batch, normalize_error_prompt, overflow_filename,
+        INLINE_IMAGE_LIMIT, INLINE_TEXT_LIMIT_BYTES, OverflowFileStore, OverflowMetadata,
+        content_image_with_meta, finalize_batch, normalize_error_prompt, overflow_filename,
+        overflow_image_filename,
     };
+    use base64::Engine as _;
     use rmcp::model::RawContent;
     use std::fs;
     use std::path::PathBuf;
@@ -455,6 +600,26 @@ mod tests {
             .map(|idx| start + idx)
             .unwrap_or(text.len());
         Some(PathBuf::from(text[start..end].trim()))
+    }
+
+    fn extract_all_paths(text: &str, marker: &str) -> Vec<PathBuf> {
+        text.lines()
+            .filter_map(|line| {
+                let start = line.find(marker)? + marker.len();
+                Some(PathBuf::from(line[start..].trim()))
+            })
+            .collect()
+    }
+
+    fn image_content(seed: u8) -> rmcp::model::Content {
+        let bytes = vec![seed; 8];
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        content_image_with_meta(
+            data,
+            "image/png".to_string(),
+            format!("plot-{seed}-1"),
+            true,
+        )
     }
 
     #[test]
@@ -525,6 +690,13 @@ mod tests {
     }
 
     #[test]
+    fn overflow_image_filename_uses_index_and_extension() {
+        let filename =
+            overflow_image_filename(&overflow_metadata("repl", 5, "call_123"), 6, "image/png");
+        assert_eq!(filename, "repl-response-005-call_123-image-06.png");
+    }
+
+    #[test]
     fn overflow_preview_trims_on_utf8_boundary() {
         let store = OverflowFileStore::new().expect("overflow store");
         let full_text = "😀".repeat((INLINE_TEXT_LIMIT_BYTES / 4) + 32);
@@ -570,6 +742,65 @@ mod tests {
             .count();
         assert_eq!(image_count, 1);
         assert!(result_text(&result).contains("output truncated"));
+    }
+
+    #[test]
+    fn image_overflow_keeps_first_four_inline_and_writes_remaining_files() {
+        let store = OverflowFileStore::new().expect("overflow store");
+        let contents = (1..=6).map(image_content).collect();
+        let result = finalize_batch(
+            contents,
+            false,
+            &store,
+            overflow_metadata("repl", 8, "call_images"),
+        );
+
+        let inline_image_count = result
+            .content
+            .iter()
+            .filter(|content| matches!(content.raw, RawContent::Image(_)))
+            .count();
+        assert_eq!(inline_image_count, INLINE_IMAGE_LIMIT);
+
+        let text = result_text(&result);
+        assert!(text.contains("image 5 omitted from inline response"));
+        assert!(text.contains("image 6 omitted from inline response"));
+        let paths = extract_all_paths(&text, "full image at ");
+        assert_eq!(paths.len(), 2);
+        for path in paths {
+            assert!(
+                path.exists(),
+                "expected overflow image file to exist: {path:?}"
+            );
+            assert_eq!(
+                path.extension().and_then(|ext| ext.to_str()),
+                Some("png"),
+                "expected png overflow image extension: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_overflow_falls_back_to_inline_images_when_write_fails() {
+        let temp = tempdir().expect("tempdir");
+        let blocked_root = temp.path().join("not-a-directory");
+        fs::write(&blocked_root, b"blocked").expect("blocked root file");
+        let store = OverflowFileStore::from_root_for_tests(blocked_root);
+        let contents = (1..=5).map(image_content).collect();
+        let result = finalize_batch(
+            contents,
+            false,
+            &store,
+            overflow_metadata("repl", 9, "call_image_fail"),
+        );
+
+        let inline_image_count = result
+            .content
+            .iter()
+            .filter(|content| matches!(content.raw, RawContent::Image(_)))
+            .count();
+        assert_eq!(inline_image_count, 5);
+        assert!(!result_text(&result).contains("full image at "));
     }
 
     #[test]
