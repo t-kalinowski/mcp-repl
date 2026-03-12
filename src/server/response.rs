@@ -1,7 +1,7 @@
 use base64::Engine as _;
 use rmcp::model::{AnnotateAble, CallToolResult, Content, Meta, RawContent, RawImageContent};
 use serde_json::json;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -22,7 +22,7 @@ pub(crate) struct OverflowFileStore {
     inner: Arc<OverflowFileStoreInner>,
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 struct OverflowResponseKey {
     tool_name: String,
     turn_number: u64,
@@ -49,7 +49,24 @@ struct OverflowFileStoreInner {
     cleanup_root_on_drop: bool,
     max_overflow_files: usize,
     retained_files: Mutex<VecDeque<RetainedOverflowFile>>,
+    active_responses: Mutex<HashMap<OverflowResponseKey, usize>>,
+    #[cfg(test)]
+    retain_hook: Mutex<Option<RetainHook>>,
     _temp_dir: Option<TempDir>,
+}
+
+#[cfg(test)]
+type RetainHook = Box<dyn FnMut(&OverflowMetadata, &Path) + Send>;
+
+struct ActiveOverflowResponseGuard {
+    store: OverflowFileStore,
+    response_key: OverflowResponseKey,
+}
+
+impl Drop for ActiveOverflowResponseGuard {
+    fn drop(&mut self) {
+        self.store.deactivate_response(&self.response_key);
+    }
 }
 
 impl Drop for OverflowFileStoreInner {
@@ -78,6 +95,9 @@ impl OverflowFileStore {
                         cleanup_root_on_drop: false,
                         max_overflow_files: DEFAULT_MAX_OVERFLOW_FILES,
                         retained_files: Mutex::new(VecDeque::new()),
+                        active_responses: Mutex::new(HashMap::new()),
+                        #[cfg(test)]
+                        retain_hook: Mutex::new(None),
                         _temp_dir: Some(temp_dir),
                     }),
                 })
@@ -91,6 +111,9 @@ impl OverflowFileStore {
                         cleanup_root_on_drop: true,
                         max_overflow_files: DEFAULT_MAX_OVERFLOW_FILES,
                         retained_files: Mutex::new(VecDeque::new()),
+                        active_responses: Mutex::new(HashMap::new()),
+                        #[cfg(test)]
+                        retain_hook: Mutex::new(None),
                         _temp_dir: None,
                     }),
                 })
@@ -119,13 +142,48 @@ impl OverflowFileStore {
                 cleanup_root_on_drop: false,
                 max_overflow_files: max_overflow_files.max(1),
                 retained_files: Mutex::new(VecDeque::new()),
+                active_responses: Mutex::new(HashMap::new()),
+                retain_hook: Mutex::new(None),
                 _temp_dir: None,
             }),
         }
     }
 
+    #[cfg(test)]
+    fn set_retain_hook_for_tests<F>(&self, hook: F)
+    where
+        F: FnMut(&OverflowMetadata, &Path) + Send + 'static,
+    {
+        *self.inner.retain_hook.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    fn activate_response(&self, metadata: &OverflowMetadata) -> ActiveOverflowResponseGuard {
+        let response_key = OverflowResponseKey::from_metadata(metadata);
+        let mut active_responses = self.inner.active_responses.lock().unwrap();
+        let count = active_responses.entry(response_key.clone()).or_insert(0);
+        *count += 1;
+        drop(active_responses);
+        ActiveOverflowResponseGuard {
+            store: self.clone(),
+            response_key,
+        }
+    }
+
+    fn deactivate_response(&self, response_key: &OverflowResponseKey) {
+        let mut active_responses = self.inner.active_responses.lock().unwrap();
+        let Some(count) = active_responses.get_mut(response_key) else {
+            return;
+        };
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            active_responses.remove(response_key);
+        }
+    }
+
     fn retain_written_file(&self, path: PathBuf, metadata: &OverflowMetadata) -> io::Result<()> {
         let protected_response = OverflowResponseKey::from_metadata(metadata);
+        #[cfg(test)]
+        let retained_path = path.clone();
         let mut retained = self.inner.retained_files.lock().unwrap();
         retained.push_back(RetainedOverflowFile {
             path,
@@ -133,13 +191,14 @@ impl OverflowFileStore {
         });
         let mut evicted = Vec::new();
         while retained.len() > self.inner.max_overflow_files {
-            // Keep files referenced by the in-flight response available to the caller.
+            let active_responses = self.inner.active_responses.lock().unwrap();
             let Some(eviction_idx) = retained
                 .iter()
-                .position(|entry| entry.response_key != protected_response)
+                .position(|entry| !active_responses.contains_key(&entry.response_key))
             else {
                 break;
             };
+            drop(active_responses);
             let file = retained
                 .remove(eviction_idx)
                 .expect("eviction index must exist");
@@ -153,6 +212,15 @@ impl OverflowFileStore {
                 Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err),
             }
+        }
+
+        #[cfg(test)]
+        {
+            let mut maybe_hook = self.inner.retain_hook.lock().unwrap().take();
+            if let Some(hook) = maybe_hook.as_mut() {
+                hook(metadata, &retained_path);
+            }
+            *self.inner.retain_hook.lock().unwrap() = maybe_hook;
         }
 
         Ok(())
@@ -194,6 +262,8 @@ pub(crate) fn finalize_batch(
     overflow_store: Option<&OverflowFileStore>,
     overflow_metadata: OverflowMetadata,
 ) -> CallToolResult {
+    let _active_response_guard =
+        overflow_store.map(|store| store.activate_response(&overflow_metadata));
     contents = maybe_overflow_image_contents(contents, overflow_store, &overflow_metadata);
     contents = maybe_overflow_text_contents(contents, overflow_store, &overflow_metadata);
     ensure_nonempty_contents(&mut contents);
@@ -695,6 +765,9 @@ mod tests {
     use std::fs;
     use std::io::{self, Write};
     use std::path::PathBuf;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
     use tempfile::{NamedTempFile, tempdir};
 
     fn overflow_metadata(tool_name: &str, turn_number: u64, request_id: &str) -> OverflowMetadata {
@@ -992,6 +1065,65 @@ mod tests {
             assert!(
                 path.exists(),
                 "expected referenced overflow file to exist: {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_inflight_response_paths_are_not_evicted() {
+        let temp = tempdir().expect("tempdir");
+        let store = OverflowFileStore::from_root_with_limit_for_tests(temp.path().to_path_buf(), 3);
+        let (a_first_write_tx, a_first_write_rx) = mpsc::channel();
+        let (release_a_tx, release_a_rx) = mpsc::channel();
+        let mut release_a_rx = Some(release_a_rx);
+
+        store.set_retain_hook_for_tests(move |metadata, path| {
+            if metadata.request_id != "call_a" || !path.to_string_lossy().contains("image-05") {
+                return;
+            }
+            let Some(release_a_rx) = release_a_rx.take() else {
+                return;
+            };
+            a_first_write_tx
+                .send(())
+                .expect("signal first call_a overflow write");
+            release_a_rx
+                .recv()
+                .expect("release blocked call_a overflow write");
+        });
+
+        let store_for_a = store.clone();
+        let a_handle = thread::spawn(move || {
+            let result = finalize_batch(
+                (1..=7).map(image_content).collect(),
+                false,
+                Some(&store_for_a),
+                overflow_metadata("repl", 21, "call_a"),
+            );
+            result_text(&result)
+        });
+
+        a_first_write_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("wait for first call_a overflow write");
+
+        let _result_b = finalize_batch(
+            (1..=7).map(image_content).collect(),
+            false,
+            Some(&store),
+            overflow_metadata("repl", 22, "call_b"),
+        );
+
+        release_a_tx
+            .send(())
+            .expect("release blocked call_a overflow write");
+        let text_a = a_handle.join().expect("join call_a");
+        let paths_a = extract_all_paths(&text_a, "full image at ");
+        assert_eq!(paths_a.len(), 3, "expected three overflow image notices");
+        for path in paths_a {
+            assert!(
+                path.exists(),
+                "expected in-flight call_a path to survive concurrent call_b: {path:?}"
             );
         }
     }
