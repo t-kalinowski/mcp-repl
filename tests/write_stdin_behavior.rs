@@ -266,6 +266,43 @@ async fn write_stdin_auto_dismisses_pager_for_backend_input() -> TestResult<()> 
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_commands_refresh_live_output_after_timeout() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = common::spawn_server_with_pager_page_chars(120).await?;
+
+    let initial = session
+        .write_stdin_raw_with(
+            "for (i in 1:40) cat(sprintf('early%04d %s\\n', i, strrep('x', 40))); flush.console(); Sys.sleep(1); for (i in 41:80) cat(sprintf('late%04d %s\\n', i, strrep('y', 40)))",
+            Some(0.2),
+        )
+        .await?;
+    let initial_text = result_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        initial_text.contains("--More--"),
+        "expected pager activation on timed-out reply, got: {initial_text:?}"
+    );
+
+    sleep(Duration::from_millis(1500)).await;
+
+    let refreshed = session
+        .write_stdin_raw_with(":matches late0080", Some(10.0))
+        .await?;
+    let refreshed_text = result_text(&refreshed);
+    assert!(
+        refreshed_text.contains("late0080"),
+        "expected pager search to see live output appended after timeout, got: {refreshed_text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
 #[test]
 fn lock_mutex_handles_poisoned_mutex() {
     let mutex = Mutex::new(());

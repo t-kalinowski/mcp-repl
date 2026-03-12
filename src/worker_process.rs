@@ -567,6 +567,18 @@ impl WorkerManager {
         self.reply_overflow_defaults.clone()
     }
 
+    pub(crate) fn spawn_count(&self) -> u64 {
+        self.spawn_count
+    }
+
+    pub(crate) fn refresh_pager_from_output(&mut self, pager: &mut crate::pager::Pager) {
+        pager.refresh_from_output(&self.output);
+    }
+
+    pub(crate) fn output_end_offset(&self) -> u64 {
+        self.output.end_offset().unwrap_or(0)
+    }
+
     pub fn write_stdin(
         &mut self,
         text: String,

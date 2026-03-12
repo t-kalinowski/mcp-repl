@@ -1672,14 +1672,21 @@ pub(crate) fn take_snapshot_page_from_buffer(
     }
 }
 
-pub(crate) fn snapshot_page_from_contents(
+pub(crate) fn snapshot_page_from_contents_with_source_end(
     contents: Vec<WorkerContent>,
     target_bytes: u64,
+    source_end: Option<u64>,
 ) -> SnapshotPage {
-    take_snapshot_page_from_buffer(pager_buffer_from_contents(contents), target_bytes)
+    take_snapshot_page_from_buffer(
+        pager_buffer_from_contents(contents, source_end),
+        target_bytes,
+    )
 }
 
-fn pager_buffer_from_contents(contents: Vec<WorkerContent>) -> PagerBuffer {
+fn pager_buffer_from_contents(
+    contents: Vec<WorkerContent>,
+    source_end: Option<u64>,
+) -> PagerBuffer {
     let mut bytes = Vec::new();
     let mut events = Vec::new();
     let mut text_spans: Vec<OutputTextSpan> = Vec::new();
@@ -1726,7 +1733,7 @@ fn pager_buffer_from_contents(contents: Vec<WorkerContent>) -> PagerBuffer {
 
     PagerBuffer::from_range(OutputRange {
         start_offset: 0,
-        end_offset: bytes.len() as u64,
+        end_offset: source_end.unwrap_or(bytes.len() as u64),
         bytes,
         events,
         text_spans,

@@ -132,11 +132,11 @@ if (nzchar(Sys.getenv("CODEX_SANDBOX_NETWORK_DISABLED"))) {
   .Call(
     "mcp_console_reply_overflow_update",
     settings[["mcp.reply_overflow.behavior"]],
-    settings[["mcp.reply_overflow.text.preview_bytes"]],
-    settings[["mcp.reply_overflow.text.spill_bytes"]],
-    settings[["mcp.reply_overflow.images.preview_count"]],
-    settings[["mcp.reply_overflow.images.spill_count"]],
-    settings[["mcp.reply_overflow.retention.max_dirs"]]
+    as.integer(settings[["mcp.reply_overflow.text.preview_bytes"]]),
+    as.integer(settings[["mcp.reply_overflow.text.spill_bytes"]]),
+    as.integer(settings[["mcp.reply_overflow.images.preview_count"]]),
+    as.integer(settings[["mcp.reply_overflow.images.spill_count"]]),
+    as.integer(settings[["mcp.reply_overflow.retention.max_dirs"]])
   )
   invisible(NULL)
 }

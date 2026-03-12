@@ -125,7 +125,20 @@ impl ReplyPresentation {
         self.files.clear()
     }
 
-    pub(crate) fn handle_input(&mut self, input: &str) -> Option<WorkerReply> {
+    pub(crate) fn reset_settings_to_defaults(&mut self) {
+        self.current = self.defaults.clone();
+        self.pager.dismiss();
+        self.pager_prompt = None;
+    }
+
+    pub(crate) fn handle_input_with_refresh<F>(
+        &mut self,
+        input: &str,
+        refresh_pager: F,
+    ) -> Option<WorkerReply>
+    where
+        F: FnOnce(&mut Pager),
+    {
         if !self.pager.is_active() {
             return None;
         }
@@ -141,6 +154,7 @@ impl ReplyPresentation {
             return None;
         }
 
+        refresh_pager(&mut self.pager);
         let mut reply = self.pager.handle_command(input);
         let pager_active = self.pager.is_active();
         let WorkerReply::Output {
@@ -165,18 +179,22 @@ impl ReplyPresentation {
         Some(reply)
     }
 
-    pub(crate) fn present_reply(&mut self, reply: WorkerReply) -> WorkerReply {
+    pub(crate) fn present_reply_with_source_end(
+        &mut self,
+        reply: WorkerReply,
+        source_end: Option<u64>,
+    ) -> WorkerReply {
         match self.current.behavior {
             ReplyOverflowBehavior::Files => {
                 self.pager.dismiss();
                 self.pager_prompt = None;
                 self.files.apply_to_reply(reply, &self.current)
             }
-            ReplyOverflowBehavior::Pager => self.apply_pager(reply),
+            ReplyOverflowBehavior::Pager => self.apply_pager(reply, source_end),
         }
     }
 
-    fn apply_pager(&mut self, reply: WorkerReply) -> WorkerReply {
+    fn apply_pager(&mut self, reply: WorkerReply, source_end: Option<u64>) -> WorkerReply {
         let page_bytes = pager::resolve_page_bytes(None);
         match reply {
             WorkerReply::Output {
@@ -197,7 +215,11 @@ impl ReplyPresentation {
                     .filter(|content| matches!(content, WorkerContent::ContentImage { .. }))
                     .cloned()
                     .collect::<Vec<_>>();
-                let snapshot = pager::snapshot_page_from_contents(pager_source, page_bytes);
+                let snapshot = pager::snapshot_page_from_contents_with_source_end(
+                    pager_source,
+                    page_bytes,
+                    source_end,
+                );
                 let mut contents = snapshot.contents;
                 ensure_paged_reply_includes_images(&mut contents, &original_images);
                 if snapshot.pages_left > 0 {

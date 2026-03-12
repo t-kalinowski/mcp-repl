@@ -40,9 +40,13 @@ pub(crate) fn run(
     let mut presentation = ReplyPresentation::new(worker.reply_overflow_settings())?;
     worker.warm_start()?;
     let mut last_prompt = None;
+    let mut last_spawn_count = worker.spawn_count();
     let initial_reply = wait_for_initial_prompt(&mut worker, server_timeout)?;
+    let initial_reply_end_offset = worker.output_end_offset();
+    sync_respawned_presentation(&worker, &mut presentation, &mut last_spawn_count)?;
     refresh_reply_presentation(&mut worker, &mut presentation);
-    let reply = presentation.present_reply(initial_reply);
+    let reply =
+        presentation.present_reply_with_source_end(initial_reply, Some(initial_reply_end_offset));
     render_reply(
         reply,
         &mut stdout,
@@ -59,7 +63,9 @@ pub(crate) fn run(
             break;
         };
 
-        if let Some(reply) = presentation.handle_input(&line) {
+        if let Some(reply) = presentation.handle_input_with_refresh(&line, |pager| {
+            worker.refresh_pager_from_output(pager);
+        }) {
             render_reply(
                 reply,
                 &mut stdout,
@@ -72,8 +78,11 @@ pub(crate) fn run(
 
         if is_exact_command(&line, "INTERRUPT") {
             let interrupt_reply = worker.interrupt(DEFAULT_WRITE_STDIN_TIMEOUT)?;
+            let interrupt_reply_end_offset = worker.output_end_offset();
+            sync_respawned_presentation(&worker, &mut presentation, &mut last_spawn_count)?;
             refresh_reply_presentation(&mut worker, &mut presentation);
-            let reply = presentation.present_reply(interrupt_reply);
+            let reply = presentation
+                .present_reply_with_source_end(interrupt_reply, Some(interrupt_reply_end_offset));
             render_reply(
                 reply,
                 &mut stdout,
@@ -85,9 +94,11 @@ pub(crate) fn run(
         }
         if is_exact_command(&line, "RESTART") {
             let reply = worker.restart(DEFAULT_WRITE_STDIN_TIMEOUT)?;
+            let reply_end_offset = worker.output_end_offset();
+            last_spawn_count = worker.spawn_count();
             presentation.reset_to_defaults()?;
             refresh_reply_presentation(&mut worker, &mut presentation);
-            let reply = presentation.present_reply(reply);
+            let reply = presentation.present_reply_with_source_end(reply, Some(reply_end_offset));
             render_reply(
                 reply,
                 &mut stdout,
@@ -105,8 +116,10 @@ pub(crate) fn run(
                 None,
                 false,
             )?;
+            let reply_end_offset = worker.output_end_offset();
+            sync_respawned_presentation(&worker, &mut presentation, &mut last_spawn_count)?;
             refresh_reply_presentation(&mut worker, &mut presentation);
-            let reply = presentation.present_reply(reply);
+            let reply = presentation.present_reply_with_source_end(reply, Some(reply_end_offset));
             render_reply(
                 reply,
                 &mut stdout,
@@ -139,8 +152,10 @@ pub(crate) fn run(
             None,
             false,
         )?;
+        let reply_end_offset = worker.output_end_offset();
+        sync_respawned_presentation(&worker, &mut presentation, &mut last_spawn_count)?;
         refresh_reply_presentation(&mut worker, &mut presentation);
-        let reply = presentation.present_reply(reply);
+        let reply = presentation.present_reply_with_source_end(reply, Some(reply_end_offset));
         render_reply(
             reply,
             &mut stdout,
@@ -156,6 +171,19 @@ pub(crate) fn run(
 fn refresh_reply_presentation(worker: &mut WorkerManager, presentation: &mut ReplyPresentation) {
     let latest = worker.take_latest_reply_overflow_settings(Duration::from_millis(10));
     presentation.update_settings(latest);
+}
+
+fn sync_respawned_presentation(
+    worker: &WorkerManager,
+    presentation: &mut ReplyPresentation,
+    last_spawn_count: &mut u64,
+) -> io::Result<()> {
+    let current_spawn_count = worker.spawn_count();
+    if current_spawn_count != *last_spawn_count {
+        presentation.reset_settings_to_defaults();
+        *last_spawn_count = current_spawn_count;
+    }
+    Ok(())
 }
 
 fn wait_for_initial_prompt(

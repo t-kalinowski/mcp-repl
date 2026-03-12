@@ -79,39 +79,76 @@ impl SharedServer {
         .map_err(|err| McpError::internal_error(err.to_string(), None))
     }
 
+    async fn run_worker_with_respawn<T, F>(&self, f: F) -> Result<(T, bool), McpError>
+    where
+        F: FnOnce(&mut WorkerManager) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.run_worker(move |worker| {
+            let spawn_count_before = worker.spawn_count();
+            let result = f(worker);
+            let respawned = worker.spawn_count() != spawn_count_before;
+            (result, respawned)
+        })
+        .await
+    }
+
     async fn run_write_input(
         &self,
         input: String,
         timeout: Duration,
     ) -> Result<CallToolResult, McpError> {
-        if let Some(reply) = self.presentation.lock().unwrap().handle_input(&input) {
+        let maybe_pager_reply = {
+            let worker = self.worker.clone();
+            let presentation = self.presentation.clone();
+            let pager_input = input.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut worker = worker.lock().unwrap();
+                let mut presentation = presentation.lock().unwrap();
+                presentation.handle_input_with_refresh(&pager_input, |pager| {
+                    worker.refresh_pager_from_output(pager);
+                })
+            })
+            .await
+            .map_err(|err| McpError::internal_error(err.to_string(), None))?
+        };
+        if let Some(reply) = maybe_pager_reply {
             return self.reply_to_call_tool_result(reply);
         }
 
         let worker_timeout = apply_tool_call_margin(timeout);
         let server_timeout = apply_safety_margin(timeout);
-        let (result, latest_settings) = self
-            .run_worker(move |worker| {
+        let ((result, latest_settings, reply_end_offset), respawned) = self
+            .run_worker_with_respawn(move |worker| {
                 let result = worker.write_stdin(input, worker_timeout, server_timeout, None, false);
                 let latest_settings =
                     worker.take_latest_reply_overflow_settings(Duration::from_millis(10));
-                (result, latest_settings)
+                let reply_end_offset = worker.output_end_offset();
+                (result, latest_settings, reply_end_offset)
             })
             .await?;
         {
             let mut presentation = self.presentation.lock().unwrap();
+            if respawned {
+                presentation.reset_settings_to_defaults();
+            }
             presentation.update_settings(latest_settings);
         }
-        self.worker_result_to_call_tool_result(result)
+        self.worker_result_to_call_tool_result(result, Some(reply_end_offset))
     }
 
     fn worker_result_to_call_tool_result(
         &self,
         result: Result<crate::worker_protocol::WorkerReply, WorkerError>,
+        reply_end_offset: Option<u64>,
     ) -> Result<CallToolResult, McpError> {
         match result {
             Ok(reply) => {
-                let reply = self.presentation.lock().unwrap().present_reply(reply);
+                let reply = self
+                    .presentation
+                    .lock()
+                    .unwrap()
+                    .present_reply_with_source_end(reply, reply_end_offset);
                 self.reply_to_call_tool_result(reply)
             }
             Err(err) => {
@@ -182,9 +219,14 @@ impl SharedServer {
         let update_for_log = serde_json::to_value(&update)
             .unwrap_or_else(|err| json!({"serialize_error": err.to_string()}));
 
-        let outcome = self
-            .run_worker(move |worker| worker.update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT))
+        let (outcome, respawned) = self
+            .run_worker_with_respawn(move |worker| {
+                worker.update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT)
+            })
             .await?;
+        if respawned {
+            self.reset_presentation()?;
+        }
         match outcome {
             Ok(changed) => {
                 crate::event_log::log(
@@ -250,10 +292,15 @@ impl SharedServer {
             .unwrap_or_else(|err| json!({"serialize_error": err.to_string()}));
 
         match self
-            .run_worker(move |worker| worker.update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT))
+            .run_worker_with_respawn(move |worker| {
+                worker.update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT)
+            })
             .await
         {
-            Ok(Ok(changed)) => {
+            Ok((Ok(changed), respawned)) => {
+                if respawned {
+                    let _ = self.reset_presentation();
+                }
                 crate::event_log::log(
                     "sandbox_state_notification_applied",
                     json!({
@@ -262,7 +309,7 @@ impl SharedServer {
                     }),
                 );
             }
-            Ok(Err(err)) => {
+            Ok((Err(err), _)) => {
                 eprintln!("sandbox update failed: {err}");
                 crate::event_log::log(
                     "sandbox_state_notification_failed",
@@ -402,13 +449,14 @@ macro_rules! define_backend_tool_server {
             ) -> Result<CallToolResult, McpError> {
                 let timeout = parse_timeout(None, "repl_reset", false)?;
                 let worker_timeout = apply_tool_call_margin(timeout);
-                let (result, latest_settings) = self
+                let (result, latest_settings, reply_end_offset) = self
                     .shared
                     .run_worker(move |worker| {
                         let result = worker.restart(worker_timeout);
                         let latest_settings =
                             worker.take_latest_reply_overflow_settings(Duration::from_millis(10));
-                        (result, latest_settings)
+                        let reply_end_offset = worker.output_end_offset();
+                        (result, latest_settings, reply_end_offset)
                     })
                     .await?;
                 self.shared.reset_presentation()?;
@@ -417,7 +465,8 @@ macro_rules! define_backend_tool_server {
                     .lock()
                     .unwrap()
                     .update_settings(latest_settings);
-                self.shared.worker_result_to_call_tool_result(result)
+                self.shared
+                    .worker_result_to_call_tool_result(result, Some(reply_end_offset))
             }
         }
 

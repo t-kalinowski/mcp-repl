@@ -293,3 +293,71 @@ async fn r_options_update_behavior_and_reset_restores_launch_defaults() -> TestR
     session.cancel().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn respawned_worker_restores_launch_overflow_defaults() -> TestResult<()> {
+    let mut session = common::spawn_server_with_args(small_overflow_args()).await?;
+
+    let set_options = session
+        .write_stdin_raw_with(
+            "invisible(options(mcp.reply_overflow.behavior = 'pager'))",
+            Some(10.0),
+        )
+        .await?;
+    let set_options_text = result_text(&set_options);
+    if backend_unavailable(&set_options_text) {
+        eprintln!("reply overflow backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let _ = session
+        .write_stdin_raw_with("quit('no')", Some(10.0))
+        .await?;
+
+    let follow_up = session
+        .write_stdin_raw_with("cat(strrep('x', 400))", Some(10.0))
+        .await?;
+    let follow_text = result_text(&follow_up);
+    assert!(
+        follow_text.contains("[full output ("),
+        "expected launch-default files overflow after worker respawn, got: {follow_text}"
+    );
+    assert!(
+        !follow_text.contains("--More--"),
+        "expected respawned worker to clear pager runtime override, got: {follow_text}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn r_options_numeric_settings_accept_plain_numeric_literals() -> TestResult<()> {
+    let mut session = common::spawn_server().await?;
+
+    let set_options = session
+        .write_stdin_raw_with(
+            "invisible(options(mcp.reply_overflow.text.preview_bytes = 64, mcp.reply_overflow.text.spill_bytes = 64))",
+            Some(10.0),
+        )
+        .await?;
+    let set_options_text = result_text(&set_options);
+    if backend_unavailable(&set_options_text) {
+        eprintln!("reply overflow backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let spilled = session
+        .write_stdin_raw_with("cat(strrep('x', 400))", Some(10.0))
+        .await?;
+    let spilled_text = result_text(&spilled);
+    assert!(
+        spilled_text.contains("[full output ("),
+        "expected plain numeric option values to update overflow settings, got: {spilled_text}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
