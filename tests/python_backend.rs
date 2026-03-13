@@ -16,6 +16,16 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         .join("")
 }
 
+fn overflow_path(text: &str) -> Option<std::path::PathBuf> {
+    let marker = "full response at ";
+    let start = text.find(marker)? + marker.len();
+    let end = text[start..]
+        .find('\n')
+        .map(|idx| start + idx)
+        .unwrap_or(text.len());
+    Some(std::path::PathBuf::from(text[start..end].trim()))
+}
+
 fn require_python() -> bool {
     if common::python_available() {
         true
@@ -156,6 +166,59 @@ async fn python_busy_discards_input() -> TestResult<()> {
         "expected busy discard message, got: {text:?}"
     );
     assert_ne!(result.is_error, Some(true));
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_truncated_pending_prefix_disables_full_response_overflow_file() -> TestResult<()> {
+    let Some(mut session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let setup = r#"import subprocess, sys
+subprocess.Popen([
+    sys.executable,
+    "-c",
+    "import sys, time; time.sleep(1.0); chunk = ('x' * 4096) + '\\n'; sys.stdout.write(chunk * 2000); sys.stdout.flush()",
+])
+print("started")
+"#;
+    let setup_result = session.write_stdin_raw_with(setup, Some(5.0)).await?;
+    let setup_text = result_text(&setup_result);
+    if is_busy_response(&setup_text) {
+        eprintln!("python_truncated_pending_prefix remained busy during setup; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        setup_text.contains("started"),
+        "expected setup confirmation, got: {setup_text:?}"
+    );
+
+    sleep(Duration::from_secs(4)).await;
+
+    let result = session
+        .write_stdin_raw_with("print('done')", Some(20.0))
+        .await?;
+    let text = result_text(&result);
+    if is_busy_response(&text) {
+        eprintln!("python_truncated_pending_prefix remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert!(
+        text.contains(
+            "full response unavailable because older output was already dropped by the worker"
+        ),
+        "expected dropped pending prefix output to disable persisted full-response overflow files, got: {text:?}"
+    );
+    assert!(
+        overflow_path(&text).is_none(),
+        "expected no persisted full-response path once older pending output was already dropped, got: {text:?}"
+    );
 
     session.cancel().await?;
     Ok(())

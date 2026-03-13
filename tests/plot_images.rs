@@ -1465,6 +1465,66 @@ for (i in 15:90) plot(i:(i + 9))";
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn raw_transport_releases_old_sent_overflow_paths_without_custom_ack() -> TestResult<()> {
+    let mut server = RawMcpServer::spawn().await?;
+    server.initialize().await?;
+
+    let mut overflow_root = None;
+    for batch in 0..5 {
+        let start = batch * 20 + 1;
+        let end = start + 19;
+        let input = format!(
+            "options(console.plot.width = 2, console.plot.height = 2, console.plot.dpi = 10); for (i in {start}:{end}) plot(i:(i + 9))"
+        );
+        let request_id = batch as i64 + 2;
+
+        server.call_tool(request_id, &input, 120_000).await?;
+        let result = server.read_call_tool_result(request_id).await?;
+        let text = result_text(&result);
+        if backend_unavailable(&text) {
+            eprintln!("plot_images backend unavailable in this environment; skipping");
+            server.cancel().await?;
+            return Ok(());
+        }
+
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "raw overflow batch {batch} reported an error: {text}"
+        );
+
+        let overflow_paths = extract_all_paths(&text, "full image at ");
+        assert_eq!(
+            overflow_paths.len(),
+            16,
+            "expected sixteen overflow image paths in raw batch {batch}, got: {text:?}"
+        );
+
+        if overflow_root.is_none() {
+            overflow_root = overflow_paths
+                .first()
+                .and_then(|path| path.parent())
+                .map(|path| path.to_path_buf());
+        }
+
+        if batch == 3 {
+            sleep(Duration::from_secs(5)).await;
+        }
+    }
+
+    let overflow_root =
+        overflow_root.ok_or("expected at least one advertised overflow path from raw transport")?;
+    let retained_file_count = fs::read_dir(&overflow_root)?.count();
+    assert!(
+        retained_file_count <= 64,
+        "expected raw transport replies without custom acks to release old sent overflow files and stay within the cap, got {retained_file_count} files in {overflow_root:?}"
+    );
+
+    server.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn truncated_preview_keeps_only_complete_overflow_image_paths() -> TestResult<()> {
     let mut session = spawn_server().await?;
 

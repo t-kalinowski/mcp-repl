@@ -6,6 +6,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tempfile::{Builder, TempDir};
 
 use crate::worker_protocol::{WorkerContent, WorkerReply};
@@ -13,6 +14,10 @@ use crate::worker_protocol::{WorkerContent, WorkerReply};
 const INLINE_TEXT_LIMIT_BYTES: usize = 10 * 1024;
 const INLINE_IMAGE_LIMIT: usize = 4;
 const DEFAULT_MAX_OVERFLOW_FILES: usize = 64;
+// Raw/pipelined clients can leave replies unread in the transport buffer briefly after the server
+// finishes writing them. Hold those responses for a short grace window without an explicit ack,
+// then release them on a later overflow send so eviction can make progress.
+const UNACKNOWLEDGED_SENT_RESPONSE_GRACE: Duration = Duration::from_secs(4);
 const TOOL_NAME_COMPONENT_MAX_BYTES: usize = 24;
 const REQUEST_ID_COMPONENT_MAX_BYTES: usize = 48;
 const OVERFLOW_ROOT_PREFIX: &str = "mcp-console-overflow-";
@@ -43,6 +48,11 @@ struct RetainedOverflowFile {
     response_path: Option<PathBuf>,
     artifact_paths: Vec<PathBuf>,
     response_key: OverflowResponseKey,
+}
+
+struct SentOverflowResponse {
+    response_key: OverflowResponseKey,
+    sent_at: Instant,
 }
 
 enum RetainedOverflowPathKind {
@@ -89,10 +99,9 @@ struct OverflowFileStoreInner {
     max_overflow_files: usize,
     retained_files: Mutex<VecDeque<RetainedOverflowFile>>,
     active_responses: Mutex<HashMap<OverflowResponseKey, usize>>,
-    open_request_count: Mutex<usize>,
     pending_send_responses: Mutex<HashMap<String, OverflowResponseKey>>,
     consumed_response_ids: Mutex<HashSet<String>>,
-    sent_responses_waiting_for_next_request: Mutex<VecDeque<OverflowResponseKey>>,
+    sent_responses_waiting_for_next_request: Mutex<VecDeque<SentOverflowResponse>>,
     #[cfg(test)]
     retain_hook: Mutex<Option<RetainHook>>,
     _temp_dir: Option<TempDir>,
@@ -139,7 +148,6 @@ impl OverflowFileStore {
                         max_overflow_files: DEFAULT_MAX_OVERFLOW_FILES,
                         retained_files: Mutex::new(VecDeque::new()),
                         active_responses: Mutex::new(HashMap::new()),
-                        open_request_count: Mutex::new(0),
                         pending_send_responses: Mutex::new(HashMap::new()),
                         consumed_response_ids: Mutex::new(HashSet::new()),
                         sent_responses_waiting_for_next_request: Mutex::new(VecDeque::new()),
@@ -159,7 +167,6 @@ impl OverflowFileStore {
                         max_overflow_files: DEFAULT_MAX_OVERFLOW_FILES,
                         retained_files: Mutex::new(VecDeque::new()),
                         active_responses: Mutex::new(HashMap::new()),
-                        open_request_count: Mutex::new(0),
                         pending_send_responses: Mutex::new(HashMap::new()),
                         consumed_response_ids: Mutex::new(HashSet::new()),
                         sent_responses_waiting_for_next_request: Mutex::new(VecDeque::new()),
@@ -194,7 +201,6 @@ impl OverflowFileStore {
                 max_overflow_files: max_overflow_files.max(1),
                 retained_files: Mutex::new(VecDeque::new()),
                 active_responses: Mutex::new(HashMap::new()),
-                open_request_count: Mutex::new(0),
                 pending_send_responses: Mutex::new(HashMap::new()),
                 consumed_response_ids: Mutex::new(HashSet::new()),
                 sent_responses_waiting_for_next_request: Mutex::new(VecDeque::new()),
@@ -222,8 +228,17 @@ impl OverflowFileStore {
     }
 
     pub(crate) fn begin_request(&self) {
-        let mut open_request_count = self.inner.open_request_count.lock().unwrap();
-        *open_request_count += 1;
+        let stale_responses = {
+            let mut sent_responses = self
+                .inner
+                .sent_responses_waiting_for_next_request
+                .lock()
+                .unwrap();
+            drain_expired_sent_responses(&mut sent_responses)
+        };
+        for stale_response in stale_responses {
+            self.release_response(&stale_response);
+        }
     }
 
     pub(crate) fn activate_response_send(&self, metadata: &OverflowMetadata) {
@@ -246,9 +261,6 @@ impl OverflowFileStore {
         else {
             return;
         };
-        let mut open_request_count = self.inner.open_request_count.lock().unwrap();
-        *open_request_count = open_request_count.saturating_sub(1);
-        drop(open_request_count);
         let was_consumed = self
             .inner
             .consumed_response_ids
@@ -259,11 +271,21 @@ impl OverflowFileStore {
             self.release_response(&response_key);
             return;
         }
-        self.inner
-            .sent_responses_waiting_for_next_request
-            .lock()
-            .unwrap()
-            .push_back(response_key);
+        let stale_responses = {
+            let mut sent_responses = self
+                .inner
+                .sent_responses_waiting_for_next_request
+                .lock()
+                .unwrap();
+            sent_responses.push_back(SentOverflowResponse {
+                response_key,
+                sent_at: Instant::now(),
+            });
+            drain_expired_sent_responses(&mut sent_responses)
+        };
+        for stale_response in stale_responses {
+            self.release_response(&stale_response);
+        }
     }
 
     pub(crate) fn mark_response_consumed(&self, request_id: &str) {
@@ -916,13 +938,31 @@ fn cleanup_retained_files(
 }
 
 fn remove_sent_response(
-    sent_responses: &mut VecDeque<OverflowResponseKey>,
+    sent_responses: &mut VecDeque<SentOverflowResponse>,
     request_id: &str,
 ) -> Option<OverflowResponseKey> {
     let response_idx = sent_responses
         .iter()
-        .position(|response_key| response_key.request_id == request_id)?;
-    sent_responses.remove(response_idx)
+        .position(|response| response.response_key.request_id == request_id)?;
+    sent_responses
+        .remove(response_idx)
+        .map(|response| response.response_key)
+}
+
+fn drain_expired_sent_responses(
+    sent_responses: &mut VecDeque<SentOverflowResponse>,
+) -> Vec<OverflowResponseKey> {
+    let now = Instant::now();
+    let expired_count = sent_responses
+        .iter()
+        .take_while(|response| {
+            now.duration_since(response.sent_at) >= UNACKNOWLEDGED_SENT_RESPONSE_GRACE
+        })
+        .count();
+    sent_responses
+        .drain(..expired_count)
+        .map(|response| response.response_key)
+        .collect()
 }
 
 fn is_protected_response(

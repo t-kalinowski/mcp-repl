@@ -370,6 +370,7 @@ impl From<std::io::Error> for WorkerError {
 struct InputContext {
     start_offset: u64,
     prefix_contents: Vec<WorkerContent>,
+    prefix_older_output_dropped: bool,
     prefix_is_error: bool,
     input_echo: Option<String>,
 }
@@ -765,6 +766,7 @@ impl WorkerManager {
             .and_then(|value| build_input_echo(&value));
 
         let mut prefix_contents = Vec::new();
+        let mut prefix_older_output_dropped = false;
         let mut prefix_is_error = false;
 
         if had_pending_output {
@@ -774,7 +776,9 @@ impl WorkerManager {
             prefix_is_error = self
                 .output
                 .saw_stderr_in_range(pending_start.min(pending_end), pending_end);
-            prefix_contents = take_range_from_ring(&self.output, pending_end).contents;
+            let pending_snapshot = take_range_from_ring(&self.output, pending_end);
+            prefix_older_output_dropped = pending_snapshot.older_output_dropped;
+            prefix_contents = pending_snapshot.contents;
         }
 
         let start_offset = self.output.end_offset().unwrap_or(0);
@@ -785,6 +789,7 @@ impl WorkerManager {
         InputContext {
             start_offset,
             prefix_contents,
+            prefix_older_output_dropped,
             prefix_is_error,
             input_echo,
         }
@@ -834,6 +839,7 @@ impl WorkerManager {
         } = snapshot_all_output(&self.output, end_offset);
         contents.append(&mut page_contents);
         contents.push(WorkerContent::stderr(format!("worker error: {err}")));
+        let older_output_dropped = context.prefix_older_output_dropped || older_output_dropped;
         ReplyWithOffset {
             reply: WorkerReply::Output {
                 contents,
@@ -882,6 +888,8 @@ impl WorkerManager {
                     older_output_dropped,
                 } = completion_snapshot.snapshot;
                 contents.append(&mut page_contents);
+                let older_output_dropped =
+                    context.prefix_older_output_dropped || older_output_dropped;
                 let resolved_prompt = if session_end {
                     None
                 } else {
@@ -934,6 +942,8 @@ impl WorkerManager {
                     older_output_dropped,
                 } = snapshot_all_output(&self.output, end_offset);
                 contents.append(&mut page_contents);
+                let older_output_dropped =
+                    context.prefix_older_output_dropped || older_output_dropped;
 
                 contents.push(timeout_status_content(request.started_at.elapsed()));
 
