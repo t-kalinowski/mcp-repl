@@ -16,6 +16,7 @@ pub const CLAUDE_ENV_FILE_ENV: &str = "CLAUDE_ENV_FILE";
 pub const CLAUDE_PROJECT_DIR_ENV: &str = "CLAUDE_PROJECT_DIR";
 
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
+const ACTIVE_SESSION_STALE_AFTER_MS: u128 = 2_000;
 const STATE_SUBDIR: &str = "mcp-repl/claude-clear";
 static NEXT_TMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -93,6 +94,8 @@ struct InstanceRecord {
     cwd: Option<String>,
     control_path: String,
     started_unix_ms: u128,
+    #[serde(default)]
+    last_seen_unix_ms: u128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,6 +253,8 @@ impl ClaudeClearBinding {
             } else if restart_observed && previous.take().is_some() {
                 self.write_record(&session_id, None)
                     .map_err(WorkerError::Io)?;
+            } else {
+                self.touch_record().map_err(WorkerError::Io)?;
             }
         }
         Ok(())
@@ -299,7 +304,16 @@ impl ClaudeClearBinding {
             cwd: self.inner.record_template.cwd.clone(),
             control_path: self.inner.control_path.to_string_lossy().to_string(),
             started_unix_ms: self.inner.record_template.started_unix_ms,
+            last_seen_unix_ms: unix_ms_now(),
         };
+        write_json_atomic(&self.inner.record_path, &record)
+    }
+
+    fn touch_record(&self) -> io::Result<()> {
+        let Some(mut record) = read_instance_record(&self.inner.record_path) else {
+            return Ok(());
+        };
+        record.last_seen_unix_ms = unix_ms_now();
         write_json_atomic(&self.inner.record_path, &record)
     }
 }
@@ -337,6 +351,9 @@ fn handle_session_start(input: &HookInput) -> Result<(), Box<dyn std::error::Err
             .as_ref()
             .map(|(_, session_dir)| session_dir.as_path()),
         env_file_path.as_deref(),
+        project_session_state
+            .as_ref()
+            .map(|(project_dir, _)| project_dir.as_path()),
         session_id,
     ) {
         rebind_instance_records_for_session(
@@ -412,26 +429,51 @@ fn current_claude_session_id_from_sources(
 fn previous_claude_session_id_for_handoff(
     project_session_dir: Option<&Path>,
     env_file_path: Option<&Path>,
+    current_project_dir: Option<&Path>,
     current_session_id: &str,
 ) -> Option<(String, HandoffSource)> {
     if env_file_path.is_some()
         && let Ok(value) = env::var(CLAUDE_SESSION_ID_ENV)
+        && let Some(candidate) = env_handoff_candidate(
+            value.trim(),
+            HandoffSource::EnvVar,
+            current_project_dir,
+            env_file_path,
+            current_session_id,
+        )
     {
-        let value = value.trim().to_string();
-        if !value.is_empty() && value != current_session_id {
-            return Some((value, HandoffSource::EnvVar));
-        }
+        return Some(candidate);
     }
-    if let Some(value) = read_session_id_from_env_file(env_file_path) {
-        let value = value.trim().to_string();
-        if !value.is_empty() && value != current_session_id {
-            return Some((value, HandoffSource::EnvFile));
-        }
+    if let Some(value) = read_session_id_from_env_file(env_file_path)
+        && let Some(candidate) = env_handoff_candidate(
+            value.trim(),
+            HandoffSource::EnvFile,
+            current_project_dir,
+            env_file_path,
+            current_session_id,
+        )
+    {
+        return Some(candidate);
     }
     read_latest_inactive_session_id_from_project_state(project_session_dir)
+        .or_else(|| read_latest_stale_active_session_id_from_project_state(project_session_dir))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty() && value != current_session_id)
         .map(|value| (value, HandoffSource::ProjectState))
+}
+
+fn env_handoff_candidate(
+    value: &str,
+    source: HandoffSource,
+    current_project_dir: Option<&Path>,
+    env_file_path: Option<&Path>,
+    current_session_id: &str,
+) -> Option<(String, HandoffSource)> {
+    if value.is_empty() || value == current_session_id {
+        return None;
+    }
+    session_has_instance_record_for_scope(value, current_project_dir, env_file_path)
+        .then(|| (value.to_string(), source))
 }
 
 fn current_project_session_state() -> Option<(PathBuf, PathBuf)> {
@@ -625,6 +667,18 @@ fn read_latest_inactive_session_id_from_project_state(path: Option<&Path>) -> Op
     })
 }
 
+fn read_latest_stale_active_session_id_from_project_state(path: Option<&Path>) -> Option<String> {
+    let mut records: Vec<ProjectSessionRecord> = load_project_session_records(path)
+        .into_iter()
+        .filter(|record| record.active)
+        .collect();
+    records.sort_by_key(|record| std::cmp::Reverse(record.updated_unix_ms));
+    records.into_iter().find_map(|record| {
+        project_session_has_stale_instance_record(path, &record.claude_session_id)
+            .then_some(record.claude_session_id)
+    })
+}
+
 fn project_session_is_active(path: Option<&Path>, session_id: &str) -> bool {
     load_project_session_records(path)
         .into_iter()
@@ -642,11 +696,68 @@ fn project_session_has_instance_record(path: Option<&Path>, session_id: &str) ->
         .unwrap_or(false)
 }
 
-fn env_file_session_activity(path: Option<&Path>, session_id: &str) -> Option<bool> {
+fn project_session_has_stale_instance_record(path: Option<&Path>, session_id: &str) -> bool {
+    let now_ms = unix_ms_now();
+    load_instance_records()
+        .map(|records| {
+            records.into_iter().any(|record| {
+                instance_record_matches_session(&record, session_id)
+                    && record_project_session_dir(&record).as_deref() == path
+                    && instance_record_is_stale(&record, now_ms)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn session_has_instance_record_for_scope(
+    session_id: &str,
+    current_project_dir: Option<&Path>,
+    env_file_path: Option<&Path>,
+) -> bool {
+    load_instance_records()
+        .map(|records| {
+            records.into_iter().any(|record| {
+                instance_record_matches_session(&record, session_id)
+                    && record_matches_handoff_scope(&record, current_project_dir, env_file_path)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn record_matches_handoff_scope(
+    record: &InstanceRecord,
+    current_project_dir: Option<&Path>,
+    env_file_path: Option<&Path>,
+) -> bool {
+    if record.project_dir.as_deref().map(Path::new) != current_project_dir {
+        return false;
+    }
+    if current_project_dir.is_none() {
+        return env_file_path.is_some() == record.env_file_path.is_some();
+    }
+    true
+}
+
+fn env_file_session_activity(
+    path: Option<&Path>,
+    session_id: &str,
+) -> Option<EnvFileSessionRecord> {
     load_env_file_session_records(path)
         .into_iter()
         .find(|record| record.claude_session_id == session_id)
-        .map(|record| record.active)
+}
+
+fn instance_record_is_stale(record: &InstanceRecord, now_ms: u128) -> bool {
+    now_ms.saturating_sub(record.last_seen_unix_ms) > ACTIVE_SESSION_STALE_AFTER_MS
+}
+
+fn instance_record_has_fresh_session_marker(
+    record: &InstanceRecord,
+    session_id: &str,
+    now_ms: u128,
+) -> bool {
+    project_session_is_active(record_project_session_dir(record).as_deref(), session_id)
+        && !instance_record_is_stale(record, now_ms)
 }
 
 fn read_session_id_from_env_file(path: Option<&Path>) -> Option<String> {
@@ -761,6 +872,7 @@ fn rebind_instance_records_for_session(
     let current_env_session_dir = env_file_path
         .map(env_file_session_dir_for_path)
         .transpose()?;
+    let now_ms = unix_ms_now();
     if !instances_dir.is_dir() {
         return Ok(());
     }
@@ -779,10 +891,7 @@ fn rebind_instance_records_for_session(
         if !instance_record_matches_session(&record, previous_session_id) {
             continue;
         }
-        if project_session_is_active(
-            record_project_session_dir(&record).as_deref(),
-            previous_session_id,
-        ) {
+        if instance_record_has_fresh_session_marker(&record, previous_session_id, now_ms) {
             continue;
         }
         match source {
@@ -799,8 +908,10 @@ fn rebind_instance_records_for_session(
                         current_env_session_dir.as_deref(),
                         previous_session_id,
                     ) {
-                        Some(false) => {}
-                        Some(true) | None => continue,
+                        Some(activity) if !activity.active => {}
+                        Some(activity)
+                            if activity.active && instance_record_is_stale(&record, now_ms) => {}
+                        Some(_) | None => continue,
                     }
                 }
             }
@@ -996,6 +1107,7 @@ mod tests {
                 cwd: None,
                 control_path: control_path.to_string_lossy().to_string(),
                 started_unix_ms: 1,
+                last_seen_unix_ms: 1,
             },
         )
         .expect("write instance record");
@@ -1050,6 +1162,7 @@ mod tests {
                 cwd: None,
                 control_path: control_path.to_string_lossy().to_string(),
                 started_unix_ms: 1,
+                last_seen_unix_ms: 1,
             },
         )
         .expect("write instance record");

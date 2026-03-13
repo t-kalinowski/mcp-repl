@@ -1854,3 +1854,236 @@ async fn claude_clear_project_handoff_skips_inactive_sessions_without_records() 
     );
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_clear_stale_env_handoff_falls_back_to_project_session_worker() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempfile::tempdir()?;
+    let project_dir = temp.path().join("project");
+    let env_file = temp.path().join("claude.env");
+    fs::create_dir_all(&project_dir)?;
+    fs::write(&env_file, "export MCP_REPL_CLAUDE_SESSION_ID=sess-stale\n")?;
+    let exe = resolve_exe()?;
+
+    run_claude_hook(
+        &exe,
+        temp.path(),
+        &project_dir,
+        "session-start",
+        json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-a"
+        }),
+    )?;
+
+    let mut session = common::spawn_server_with_env_vars(vec![
+        (
+            "XDG_STATE_HOME".to_string(),
+            temp.path().to_string_lossy().to_string(),
+        ),
+        (
+            "CLAUDE_PROJECT_DIR".to_string(),
+            project_dir.to_string_lossy().to_string(),
+        ),
+    ])
+    .await?;
+
+    let set_var = session.write_stdin_raw_with("x <- 1", Some(10.0)).await?;
+    let set_var_text = result_text(&set_var);
+    if backend_unavailable(&set_var_text) {
+        eprintln!("claude_clear_binding backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&set_var_text) {
+        eprintln!(
+            "claude_clear_binding worker remained busy before stale env handoff fallback; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    run_claude_hook(
+        &exe,
+        temp.path(),
+        &project_dir,
+        "session-end",
+        json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-a",
+            "reason": "other"
+        }),
+    )?;
+    run_claude_hook_with_env(
+        &exe,
+        &[
+            (
+                "XDG_STATE_HOME".to_string(),
+                temp.path().to_string_lossy().to_string(),
+            ),
+            (
+                "CLAUDE_PROJECT_DIR".to_string(),
+                project_dir.to_string_lossy().to_string(),
+            ),
+            (
+                "CLAUDE_ENV_FILE".to_string(),
+                env_file.to_string_lossy().to_string(),
+            ),
+            (
+                "MCP_REPL_CLAUDE_SESSION_ID".to_string(),
+                "sess-stale".to_string(),
+            ),
+        ],
+        "session-start",
+        json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-b"
+        }),
+    )?;
+    run_claude_hook_with_env(
+        &exe,
+        &[
+            (
+                "XDG_STATE_HOME".to_string(),
+                temp.path().to_string_lossy().to_string(),
+            ),
+            (
+                "CLAUDE_PROJECT_DIR".to_string(),
+                project_dir.to_string_lossy().to_string(),
+            ),
+            (
+                "CLAUDE_ENV_FILE".to_string(),
+                env_file.to_string_lossy().to_string(),
+            ),
+        ],
+        "session-end",
+        json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-b",
+            "reason": "clear"
+        }),
+    )?;
+
+    let after_clear = session
+        .write_stdin_raw_with("print(exists(\"x\"))", Some(10.0))
+        .await?;
+    let after_clear_text = result_text(&after_clear);
+    if backend_unavailable(&after_clear_text) {
+        eprintln!(
+            "claude_clear_binding backend unavailable after stale env handoff fallback clear; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&after_clear_text) {
+        eprintln!(
+            "claude_clear_binding worker remained busy after stale env handoff fallback clear; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+    assert!(
+        after_clear_text.contains("FALSE"),
+        "expected stale env-derived handoff to fall back to the inactive project worker, got: {after_clear_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_clear_stale_active_project_marker_rebinds_after_idle_timeout() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempfile::tempdir()?;
+    let project_dir = temp.path().join("project");
+    fs::create_dir_all(&project_dir)?;
+    let exe = resolve_exe()?;
+
+    run_claude_hook(
+        &exe,
+        temp.path(),
+        &project_dir,
+        "session-start",
+        json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-a"
+        }),
+    )?;
+
+    let mut session = common::spawn_server_with_env_vars(vec![
+        (
+            "XDG_STATE_HOME".to_string(),
+            temp.path().to_string_lossy().to_string(),
+        ),
+        (
+            "CLAUDE_PROJECT_DIR".to_string(),
+            project_dir.to_string_lossy().to_string(),
+        ),
+    ])
+    .await?;
+
+    let set_var = session.write_stdin_raw_with("x <- 1", Some(10.0)).await?;
+    let set_var_text = result_text(&set_var);
+    if backend_unavailable(&set_var_text) {
+        eprintln!("claude_clear_binding backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&set_var_text) {
+        eprintln!(
+            "claude_clear_binding worker remained busy before stale active marker timeout; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(2200)).await;
+
+    run_claude_hook(
+        &exe,
+        temp.path(),
+        &project_dir,
+        "session-start",
+        json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-b"
+        }),
+    )?;
+    run_claude_hook(
+        &exe,
+        temp.path(),
+        &project_dir,
+        "session-end",
+        json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-b",
+            "reason": "clear"
+        }),
+    )?;
+
+    let after_clear = session
+        .write_stdin_raw_with("print(exists(\"x\"))", Some(10.0))
+        .await?;
+    let after_clear_text = result_text(&after_clear);
+    if backend_unavailable(&after_clear_text) {
+        eprintln!(
+            "claude_clear_binding backend unavailable after stale active marker clear; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&after_clear_text) {
+        eprintln!(
+            "claude_clear_binding worker remained busy after stale active marker clear; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+    assert!(
+        after_clear_text.contains("FALSE"),
+        "expected stale active project marker to allow rebinding after idle timeout, got: {after_clear_text:?}"
+    );
+    Ok(())
+}
