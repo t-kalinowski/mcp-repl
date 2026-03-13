@@ -694,6 +694,10 @@ where
                 id: RequestId,
                 result: Result<(), DynamicTransportError>,
             },
+            Response {
+                id: RequestId,
+                result: Result<(), DynamicTransportError>,
+            },
             Notification {
                 responder: Responder<Result<(), ServiceError>>,
                 cancellation_param: Option<CancelledNotificationParam>,
@@ -767,6 +771,12 @@ where
                         }
                     }
                 }
+                Event::SendTaskResult(SendTaskResult::Response { id, result }) => {
+                    if let Err(error) = result {
+                        tracing::error!(%error, "fail to response message");
+                    }
+                    shared_service.on_response_sent(id).await;
+                }
                 Event::SendTaskResult(SendTaskResult::Notification {
                     responder,
                     result,
@@ -794,17 +804,19 @@ where
                         JsonRpcMessage::Error(error) => Some(&error.id),
                         _ => None,
                     } {
-                        if let Some(ct) = local_ct_pool.remove(id) {
+                        let id = id.clone();
+                        if let Some(ct) = local_ct_pool.remove(&id) {
                             ct.cancel();
                         }
                         let send = transport.send(m);
                         let current_span = tracing::Span::current();
-                        tokio::spawn(async move {
-                            let send_result = send.await;
-                            if let Err(error) = send_result {
-                                tracing::error!(%error, "fail to response message");
-                            }
-                        }.instrument(current_span));
+                        send_task_set.spawn(
+                            send.map(move |result| SendTaskResult::Response {
+                                id,
+                                result: result.map_err(DynamicTransportError::new::<T, R>),
+                            })
+                            .instrument(current_span),
+                        );
                     }
                 }
                 Event::ProxyMessage(PeerSinkMessage::Request {
@@ -874,7 +886,6 @@ where
                             let result = service
                                 .handle_request(request, context)
                                 .await;
-                            let request_id = id.clone();
                             let response = match result {
                                 Ok(result) => {
                                     tracing::debug!(%id, ?result, "response message");
@@ -886,7 +897,6 @@ where
                                 }
                             };
                             let _send_result = sink.send(response).await;
-                            service.on_response_sent(request_id).await;
                         }.instrument(current_span));
                     }
                 }

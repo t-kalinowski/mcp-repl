@@ -6,9 +6,13 @@ use base64::Engine as _;
 use common::{TestResult, spawn_server};
 use rmcp::model::{CallToolResult, RawContent};
 use serde::Serialize;
+use serde_json::{Value, json};
 use std::fs;
 use std::path::PathBuf;
+use std::process::Stdio;
 use tempfile::tempdir;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::{Duration, sleep};
 
 #[derive(Debug)]
@@ -27,6 +31,13 @@ struct PlotStepSnapshot {
 #[derive(Debug, Serialize)]
 struct PlotTranscriptSnapshot {
     steps: Vec<PlotStepSnapshot>,
+}
+
+struct RawMcpServer {
+    child: Child,
+    stdin: ChildStdin,
+    stdout_lines: Lines<BufReader<ChildStdout>>,
+    server_pid: Option<u32>,
 }
 
 fn result_text(result: &CallToolResult) -> String {
@@ -71,6 +82,170 @@ fn backend_unavailable(text: &str) -> bool {
         )
         || text.contains("options(\"defaultPackages\") was not found")
         || text.contains("worker io error: Broken pipe")
+}
+
+impl RawMcpServer {
+    async fn spawn() -> TestResult<Self> {
+        let exe = resolve_server_path()?;
+        let mut args = Vec::new();
+        if !common::sandbox_exec_available() {
+            args.push("--sandbox".to_string());
+            args.push("danger-full-access".to_string());
+        }
+
+        let mut child = Command::new(exe)
+            .args(&args)
+            .env_remove("R_PROFILE_USER")
+            .env_remove("R_PROFILE_SITE")
+            .env_remove("R_ENVIRON")
+            .env_remove("R_ENVIRON_USER")
+            .env_remove("MCP_CONSOLE_UPDATE_PLOT_IMAGES")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let server_pid = child.id();
+        let stdin = child.stdin.take().ok_or("missing child stdin")?;
+        let stdout = child.stdout.take().ok_or("missing child stdout")?;
+        Ok(Self {
+            child,
+            stdin,
+            stdout_lines: BufReader::new(stdout).lines(),
+            server_pid,
+        })
+    }
+
+    async fn initialize(&mut self) -> TestResult<()> {
+        self.write_json(&json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "plot-images-test",
+                    "version": "1.0"
+                }
+            }
+        }))
+        .await?;
+        let response = self.read_json().await?;
+        assert_eq!(response.get("id"), Some(&json!(1)));
+        assert!(
+            response.get("result").is_some(),
+            "expected initialize result, got: {response:?}"
+        );
+        self.write_json(&json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .await?;
+        Ok(())
+    }
+
+    async fn call_tool(&mut self, request_id: i64, input: &str, timeout_ms: u64) -> TestResult<()> {
+        let mut input = input.to_string();
+        if !input.ends_with('\n') {
+            input.push('\n');
+        }
+        self.write_json(&json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/call",
+            "params": {
+                "name": "repl",
+                "arguments": {
+                    "input": input,
+                    "timeout_ms": timeout_ms,
+                }
+            }
+        }))
+        .await
+    }
+
+    async fn read_call_tool_result(&mut self, request_id: i64) -> TestResult<CallToolResult> {
+        let response = self.read_json().await?;
+        assert_eq!(
+            response.get("id"),
+            Some(&json!(request_id)),
+            "unexpected response id: {response:?}"
+        );
+        if let Some(error) = response.get("error") {
+            return Err(format!("unexpected MCP error response: {error}").into());
+        }
+        let result = response
+            .get("result")
+            .cloned()
+            .ok_or_else(|| format!("missing result in MCP response: {response:?}"))?;
+        Ok(serde_json::from_value(result)?)
+    }
+
+    async fn write_json(&mut self, value: &Value) -> TestResult<()> {
+        let mut line = serde_json::to_vec(value)?;
+        line.push(b'\n');
+        self.stdin.write_all(&line).await?;
+        self.stdin.flush().await?;
+        Ok(())
+    }
+
+    async fn read_json(&mut self) -> TestResult<Value> {
+        let line = tokio::time::timeout(Duration::from_secs(30), self.stdout_lines.next_line())
+            .await??
+            .ok_or("server stdout closed before JSON-RPC response")?;
+        Ok(serde_json::from_str(&line)?)
+    }
+
+    async fn cancel(mut self) -> TestResult<()> {
+        terminate_process_tree(self.server_pid);
+        let _ = self.child.start_kill();
+        let _ = self.child.wait().await;
+        Ok(())
+    }
+}
+
+fn resolve_server_path() -> TestResult<PathBuf> {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-repl") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-console") {
+        return Ok(PathBuf::from(path));
+    }
+
+    let mut path = std::env::current_exe()?;
+    path.pop();
+    path.pop();
+    for candidate in ["mcp-repl", "mcp-console"] {
+        let mut candidate_path = path.clone();
+        candidate_path.push(candidate);
+        if cfg!(windows) {
+            candidate_path.set_extension("exe");
+        }
+        if candidate_path.exists() {
+            return Ok(candidate_path);
+        }
+    }
+    Err("unable to locate mcp-repl test binary".into())
+}
+
+fn terminate_process_tree(pid: Option<u32>) {
+    let Some(pid) = pid else {
+        return;
+    };
+    let pid_str = pid.to_string();
+    let _ = std::process::Command::new("pkill")
+        .args(["-TERM", "-P", &pid_str])
+        .status();
+    unsafe {
+        let _ = libc::kill(pid as i32, libc::SIGTERM);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+    if alive {
+        unsafe {
+            let _ = libc::kill(pid as i32, libc::SIGKILL);
+        }
+    }
 }
 
 fn any_backend_unavailable(results: &[&CallToolResult]) -> bool {
@@ -1126,5 +1301,53 @@ for (i in 1:7) plot(i:(i + 99))";
     }
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_transport_keeps_overflow_paths_live_until_first_reply_is_read() -> TestResult<()> {
+    let mut server = RawMcpServer::spawn().await?;
+    server.initialize().await?;
+
+    let first_input = "\
+options(console.plot.width = 14, console.plot.height = 10, console.plot.dpi = 160); \
+for (i in 1:7) plot(i:(i + 99))";
+    let second_input = "\
+options(console.plot.width = 2, console.plot.height = 2, console.plot.dpi = 10); \
+for (i in 8:74) plot(i:(i + 9))";
+
+    server.call_tool(2, first_input, 120_000).await?;
+    sleep(Duration::from_millis(1200)).await;
+    server.call_tool(3, second_input, 120_000).await?;
+    sleep(Duration::from_millis(300)).await;
+
+    let first_result = server.read_call_tool_result(2).await?;
+    let first_text = result_text(&first_result);
+    if backend_unavailable(&first_text) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        server.cancel().await?;
+        return Ok(());
+    }
+
+    assert_ne!(
+        first_result.is_error,
+        Some(true),
+        "first raw transport overflow batch reported an error: {first_text}"
+    );
+
+    let overflow_paths = extract_all_paths(&first_text, "full image at ");
+    assert_eq!(
+        overflow_paths.len(),
+        3,
+        "expected three overflow image paths in the first raw reply, got: {first_text:?}"
+    );
+    for path in overflow_paths {
+        assert!(
+            path.exists(),
+            "expected raw transport to keep first-reply overflow path live until that reply is read: {path:?}"
+        );
+    }
+
+    server.cancel().await?;
     Ok(())
 }
