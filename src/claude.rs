@@ -324,6 +324,9 @@ fn handle_session_start(input: &HookInput) -> Result<(), Box<dyn std::error::Err
             &previous_session_id,
             session_id,
             env_file_path.as_deref(),
+            project_session_state
+                .as_ref()
+                .map(|(project_dir, _)| project_dir.as_path()),
             source,
         )?;
     }
@@ -374,8 +377,8 @@ fn current_claude_session_id_from_sources(
     project_session_dir: Option<&Path>,
     env_file_path: Option<&Path>,
 ) -> Option<String> {
-    read_current_session_id_from_project_state(project_session_dir)
-        .or_else(|| read_session_id_from_env_file(env_file_path))
+    read_session_id_from_env_file(env_file_path)
+        .or_else(|| read_current_session_id_from_project_state(project_session_dir))
         .or_else(|| env::var(CLAUDE_SESSION_ID_ENV).ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
@@ -650,6 +653,7 @@ fn rebind_instance_records_for_session(
     previous_session_id: &str,
     session_id: &str,
     env_file_path: Option<&Path>,
+    current_project_dir: Option<&Path>,
     source: HandoffSource,
 ) -> io::Result<()> {
     let instances_dir = claude_clear_state_dir()?.join("instances");
@@ -683,6 +687,9 @@ fn rebind_instance_records_for_session(
                 let Some(current_env_file_path) = env_file_path else {
                     continue;
                 };
+                if record.project_dir.as_deref().map(Path::new) != current_project_dir {
+                    continue;
+                }
                 if record.env_file_path.as_deref().map(Path::new) == Some(current_env_file_path) {
                     continue;
                 }
