@@ -609,7 +609,7 @@ cat("INLINE_OVERFLOW_AFTER_PLOT\n")
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn overflow_store_reenforces_cap_after_large_plot_batch_finishes() -> TestResult<()> {
+async fn large_plot_batch_keeps_all_advertised_overflow_paths_alive() -> TestResult<()> {
     let mut session = spawn_server().await?;
 
     let input = "\
@@ -632,26 +632,105 @@ for (i in 1:80) plot(i:(i + 9))";
     let inline_images = extract_images(&result);
     assert_eq!(inline_images.len(), 4, "expected four inline images");
 
-    let response_path = overflow_path(&text);
-    let overflow_paths = extract_all_paths(&text, "full image at ");
+    let response_path = overflow_path(&text)
+        .ok_or_else(|| format!("expected overflow response path, got: {text:?}"))?;
     assert!(
-        response_path.is_some() || !overflow_paths.is_empty(),
-        "expected overflow artifacts in the response, got: {text:?}"
+        response_path.exists(),
+        "expected overflow response file to exist: {response_path:?}"
     );
+    let overflow_text = fs::read_to_string(&response_path)?;
+    let overflow_paths = extract_all_paths(&overflow_text, "full image at ");
+    assert!(
+        !overflow_paths.is_empty(),
+        "expected overflow image notices in persisted response file, got: {overflow_text:?}"
+    );
+    for path in &overflow_paths {
+        assert!(
+            path.exists(),
+            "expected advertised overflow path to exist: {path:?}"
+        );
+    }
 
     let overflow_root = response_path
-        .as_deref()
-        .or_else(|| overflow_paths.first().map(PathBuf::as_path))
-        .and_then(std::path::Path::parent)
-        .ok_or_else(|| {
-            format!(
-                "missing overflow root for response_path={response_path:?} overflow_paths={overflow_paths:?}"
-            )
-        })?;
+        .parent()
+        .ok_or_else(|| format!("overflow response path missing parent: {response_path:?}"))?;
     let retained_file_count = fs::read_dir(overflow_root)?.count();
+    assert!(
+        retained_file_count > 64,
+        "expected current response files to remain live even when they exceed the nominal cap, got {retained_file_count}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn overflow_cleanup_retries_after_delete_failure() -> TestResult<()> {
+    let mut session = spawn_server().await?;
+
+    let first_result = session
+        .write_stdin_raw_with("for (i in 1:7) plot(i:(i + 9))", Some(60.0))
+        .await?;
+    let first_text = result_text(&first_result);
+    if backend_unavailable(&first_text) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let blocked_path = extract_all_paths(&first_text, "full image at ")
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("expected at least one overflow image path, got: {first_text:?}"))?;
+    assert!(
+        blocked_path.exists(),
+        "expected initial overflow path to exist: {blocked_path:?}"
+    );
+
+    fs::remove_file(&blocked_path)?;
+    fs::create_dir(&blocked_path)?;
+
+    let second_input = "\
+options(console.plot.width = 2, console.plot.height = 2, console.plot.dpi = 10); \
+for (i in 1:80) plot(i:(i + 9))";
+    let second_result = session
+        .write_stdin_raw_with(second_input, Some(120.0))
+        .await?;
+    let second_text = result_text(&second_result);
+    assert_ne!(
+        second_result.is_error,
+        Some(true),
+        "second overflow batch reported an error: {second_text}"
+    );
+    assert!(
+        blocked_path.is_dir(),
+        "expected blocked overflow path to still be present as a directory after delete failure: {blocked_path:?}"
+    );
+
+    fs::remove_dir(&blocked_path)?;
+    fs::write(&blocked_path, b"stale-overflow-artifact")?;
+
+    let third_result = session
+        .write_stdin_raw_with("for (i in 81:85) plot(i:(i + 9))", Some(60.0))
+        .await?;
+    let third_text = result_text(&third_result);
+    assert_ne!(
+        third_result.is_error,
+        Some(true),
+        "third overflow batch reported an error: {third_text}"
+    );
+
+    let overflow_root = blocked_path
+        .parent()
+        .ok_or_else(|| format!("blocked overflow path missing parent: {blocked_path:?}"))?;
+    assert!(
+        !blocked_path.exists(),
+        "expected cleanup to retry and delete the previously blocked overflow path: {blocked_path:?}"
+    );
     assert_eq!(
-        retained_file_count, 64,
-        "expected overflow store to enforce the 64-file cap after the response finished"
+        fs::read_dir(overflow_root)?.count(),
+        64,
+        "expected retrying cleanup to restore the on-disk overflow file count to the configured cap"
     );
 
     session.cancel().await?;

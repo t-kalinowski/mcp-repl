@@ -1,7 +1,7 @@
 use base64::Engine as _;
 use rmcp::model::{AnnotateAble, CallToolResult, Content, Meta, RawContent, RawImageContent};
 use serde_json::json;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -42,6 +42,11 @@ impl OverflowResponseKey {
 struct RetainedOverflowFile {
     path: PathBuf,
     response_key: OverflowResponseKey,
+}
+
+struct OverflowCleanupError {
+    path: PathBuf,
+    err: io::Error,
 }
 
 struct OverflowFileStoreInner {
@@ -179,21 +184,26 @@ impl OverflowFileStore {
             active_responses.remove(response_key);
         }
         let mut retained = self.inner.retained_files.lock().unwrap();
-        let evicted = collect_evicted_paths(
+        if let Err(err) = cleanup_retained_files(
             &mut retained,
             &active_responses,
             self.inner.max_overflow_files,
-        );
+            Some(response_key),
+        ) {
+            drop(retained);
+            drop(active_responses);
+            log_overflow_eviction_failure(Some(self.root_path()), &err.path, &err.err);
+            return;
+        }
         drop(retained);
         drop(active_responses);
-        for path in evicted {
-            if let Err(err) = remove_retained_file(&path) {
-                log_overflow_eviction_failure(Some(self.root_path()), &path, &err);
-            }
-        }
     }
 
-    fn retain_written_file(&self, path: PathBuf, metadata: &OverflowMetadata) -> io::Result<()> {
+    fn retain_written_file(
+        &self,
+        path: PathBuf,
+        metadata: &OverflowMetadata,
+    ) -> Result<(), OverflowCleanupError> {
         let protected_response = OverflowResponseKey::from_metadata(metadata);
         #[cfg(test)]
         let retained_path = path.clone();
@@ -203,17 +213,14 @@ impl OverflowFileStore {
             path,
             response_key: protected_response.clone(),
         });
-        let evicted = collect_evicted_paths(
+        cleanup_retained_files(
             &mut retained,
             &active_responses,
             self.inner.max_overflow_files,
-        );
+            None,
+        )?;
         drop(retained);
         drop(active_responses);
-
-        for path in evicted {
-            remove_retained_file(&path)?;
-        }
 
         #[cfg(test)]
         {
@@ -314,8 +321,8 @@ fn maybe_overflow_text_contents(
                             log_overflow_retention_failure(
                                 Some(store.root_path()),
                                 overflow_metadata,
-                                &path,
-                                &err,
+                                &err.path,
+                                &err.err,
                             );
                         }
                     }
@@ -399,8 +406,8 @@ fn maybe_overflow_image_contents(
                     log_overflow_retention_failure(
                         Some(overflow_store.root_path()),
                         overflow_metadata,
-                        &path,
-                        &err,
+                        &err.path,
+                        &err.err,
                     );
                 }
                 rewritten.push(Content::text(image_overflow_notice(
@@ -663,25 +670,51 @@ fn fallback_overflow_root() -> PathBuf {
     root
 }
 
-fn collect_evicted_paths(
+fn cleanup_retained_files(
     retained: &mut VecDeque<RetainedOverflowFile>,
     active_responses: &HashMap<OverflowResponseKey, usize>,
     max_overflow_files: usize,
-) -> Vec<PathBuf> {
-    let mut evicted = Vec::new();
+    protected_response: Option<&OverflowResponseKey>,
+) -> Result<(), OverflowCleanupError> {
+    let mut skipped_paths = HashSet::new();
+    let mut first_err = None;
     while retained.len() > max_overflow_files {
-        let Some(eviction_idx) = retained
-            .iter()
-            .position(|entry| !active_responses.contains_key(&entry.response_key))
-        else {
+        let Some(eviction_idx) = retained.iter().position(|entry| {
+            !is_protected_response(entry, active_responses, protected_response)
+                && !skipped_paths.contains(&entry.path)
+        }) else {
             break;
         };
-        let file = retained
-            .remove(eviction_idx)
-            .expect("eviction index must exist");
-        evicted.push(file.path);
+        let path = retained[eviction_idx].path.clone();
+        match remove_retained_file(&path) {
+            Ok(()) => {
+                retained
+                    .remove(eviction_idx)
+                    .expect("eviction index must exist");
+            }
+            Err(err) => {
+                skipped_paths.insert(path.clone());
+                if first_err.is_none() {
+                    first_err = Some(OverflowCleanupError { path, err });
+                }
+            }
+        }
     }
-    evicted
+    match first_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+fn is_protected_response(
+    entry: &RetainedOverflowFile,
+    active_responses: &HashMap<OverflowResponseKey, usize>,
+    protected_response: Option<&OverflowResponseKey>,
+) -> bool {
+    active_responses.contains_key(&entry.response_key)
+        || protected_response
+            .map(|response_key| response_key == &entry.response_key)
+            .unwrap_or(false)
 }
 
 fn remove_retained_file(path: &Path) -> io::Result<()> {
@@ -1108,7 +1141,7 @@ mod tests {
     }
 
     #[test]
-    fn image_overflow_reenforces_cap_after_same_response_finishes() {
+    fn image_overflow_keeps_same_response_paths_alive_after_finalize() {
         let temp = tempdir().expect("tempdir");
         let store = OverflowFileStore::from_root_with_limit_for_tests(temp.path().to_path_buf(), 2);
         let contents = (1..=7).map(image_content).collect();
@@ -1122,29 +1155,17 @@ mod tests {
         let text = result_text(&result);
         let paths = extract_all_paths(&text, "full image at ");
         assert_eq!(paths.len(), 3, "expected three overflow image notices");
-        assert!(
-            !paths[0].exists(),
-            "expected the oldest overflow image file to be evicted: {:?}",
-            paths[0]
-        );
-        assert!(
-            paths[1].exists(),
-            "expected second overflow image file to remain"
-        );
-        assert!(
-            paths[2].exists(),
-            "expected newest overflow image file to remain"
-        );
+        assert!(paths.iter().all(|path| path.exists()));
         assert_eq!(
             fs::read_dir(temp.path())
                 .expect("read overflow dir")
                 .count(),
-            2
+            3
         );
     }
 
     #[test]
-    fn mixed_overflow_reenforces_cap_after_same_response_finishes() {
+    fn mixed_overflow_keeps_same_response_paths_alive_after_finalize() {
         let temp = tempdir().expect("tempdir");
         let store = OverflowFileStore::from_root_with_limit_for_tests(temp.path().to_path_buf(), 2);
         let mut contents: Vec<_> = (1..=7).map(image_content).collect();
@@ -1172,14 +1193,14 @@ mod tests {
             "expected overflow response file to remain"
         );
         assert!(
-            image_paths.iter().all(|path| !path.exists()),
-            "expected mixed overflow image files to be evicted once the response finished: {image_paths:?}"
+            image_paths.iter().all(|path| path.exists()),
+            "expected mixed overflow image files to remain live for the finalized response: {image_paths:?}"
         );
         assert_eq!(
             fs::read_dir(temp.path())
                 .expect("read overflow dir")
                 .count(),
-            2
+            8
         );
     }
 
