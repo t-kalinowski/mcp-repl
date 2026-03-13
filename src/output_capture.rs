@@ -432,13 +432,18 @@ impl OutputRing {
             }
             cursor = end_byte;
         }
+        let older_output_dropped = collected.start_offset > start_offset
+            || collected
+                .events
+                .iter()
+                .any(|event| is_output_truncation_notice(&event.kind));
         OutputRange {
             start_offset: collected.start_offset,
             end_offset: collected.end_offset,
             bytes,
             events: collected.events,
             text_spans,
-            older_output_dropped: collected.start_offset > start_offset,
+            older_output_dropped,
         }
     }
 
@@ -734,6 +739,16 @@ fn event_size_bytes(kind: &OutputEventKind) -> usize {
             .saturating_add(32),
         OutputEventKind::Text { text, .. } => text.len().saturating_add(16),
     }
+}
+
+fn is_output_truncation_notice(kind: &OutputEventKind) -> bool {
+    matches!(
+        kind,
+        OutputEventKind::Text {
+            text,
+            is_stderr: false,
+        } if text == OUTPUT_TRUNCATION_NOTICE
+    )
 }
 
 fn assemble_bytes(slices: &[OutputSlice]) -> Vec<u8> {

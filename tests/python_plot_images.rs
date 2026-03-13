@@ -6,6 +6,7 @@ use base64::Engine as _;
 use common::TestResult;
 use rmcp::model::{CallToolResult, RawContent};
 use serde::Serialize;
+use std::path::PathBuf;
 use tempfile::tempdir;
 
 #[derive(Debug)]
@@ -36,6 +37,25 @@ fn result_text(result: &CallToolResult) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn overflow_path(text: &str) -> Option<PathBuf> {
+    let marker = "full response at ";
+    let start = text.find(marker)? + marker.len();
+    let end = text[start..]
+        .find('\n')
+        .map(|idx| start + idx)
+        .unwrap_or(text.len());
+    Some(PathBuf::from(text[start..end].trim()))
+}
+
+fn extract_all_paths(text: &str, marker: &str) -> Vec<PathBuf> {
+    text.lines()
+        .filter_map(|line| {
+            let start = line.find(marker)? + marker.len();
+            Some(PathBuf::from(line[start..].trim()))
+        })
+        .collect()
 }
 
 fn response_snapshot(result: &CallToolResult) -> serde_json::Value {
@@ -111,6 +131,17 @@ fn extract_images(result: &CallToolResult) -> Vec<ImageData> {
 
 fn python_plot_preamble() -> &'static str {
     r#"import matplotlib.pyplot as plt; plt.rcParams["figure.dpi"] = 96; plt.rcParams["figure.figsize"] = (8.3333333333, 6.25)"#
+}
+
+fn fake_plot_image_script(
+    plot_count: usize,
+    image_payload_bytes: usize,
+    trailing_print_bytes: usize,
+) -> String {
+    format!(
+        r#"{preamble}; import warnings, matplotlib.figure; warnings.filterwarnings("ignore"); plt.rcParams["figure.max_open_warning"] = 0; matplotlib.figure.Figure.savefig = lambda self, buf, format="png": buf.write(b"\x89PNG\r\n\x1a\n" + (bytes([self.number % 251 or 1]) * {image_payload_bytes})); _ = [(plt.figure(i + 1), plt.clf(), plt.plot(list(range(10))), plt.show()) for i in range({plot_count})]; print("x" * {trailing_print_bytes})"#,
+        preamble = python_plot_preamble(),
+    )
 }
 
 fn reference_image_script(name: &str, path: &std::path::Path) -> Option<String> {
@@ -788,5 +819,131 @@ async fn python_plot_emitted_after_truncation() -> TestResult<()> {
         "expected plot image even after truncation"
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_event_only_plot_truncation_does_not_advertise_full_response_file() -> TestResult<()>
+{
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let cache_dir = tempfile::tempdir()?;
+    let mut session = common::spawn_server_with_args_env(
+        vec![
+            "--interpreter".to_string(),
+            "python".to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+        ],
+        vec![
+            (
+                "MPLCONFIGDIR".to_string(),
+                cache_dir.path().display().to_string(),
+            ),
+            (
+                "XDG_CACHE_HOME".to_string(),
+                cache_dir.path().display().to_string(),
+            ),
+        ],
+    )
+    .await?;
+    let worker_notice =
+        "full response unavailable because older output was already dropped by the worker";
+    let input = fake_plot_image_script(240, 10_000, 12_000);
+    let result = session.write_stdin_raw_with(&input, Some(120.0)).await?;
+    let text = result_text(&result);
+    session.cancel().await?;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "python event-only plot truncation scenario reported an error: {text}"
+    );
+    assert!(
+        text.contains(worker_notice),
+        "event-only plot truncation should mark the response incomplete before advertising a full-response overflow file, got: {text:?}"
+    );
+    assert!(
+        overflow_path(&text).is_none(),
+        "event-only plot truncation must not advertise a recoverable full-response file: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_worker_truncation_keeps_all_overflow_image_paths_reachable() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+
+    let startup_dir = tempfile::tempdir()?;
+    let cache_dir = tempfile::tempdir()?;
+    std::fs::write(
+        startup_dir.path().join("sitecustomize.py"),
+        "import sys\nsys.stdout.write(('startup-' + ('x' * 4096) + '\\n') * 600)\nsys.stdout.flush()\n",
+    )?;
+
+    let mut session = common::spawn_server_with_args_env(
+        vec![
+            "--interpreter".to_string(),
+            "python".to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+        ],
+        vec![
+            (
+                "PYTHONPATH".to_string(),
+                startup_dir.path().display().to_string(),
+            ),
+            (
+                "MPLCONFIGDIR".to_string(),
+                cache_dir.path().display().to_string(),
+            ),
+            (
+                "XDG_CACHE_HOME".to_string(),
+                cache_dir.path().display().to_string(),
+            ),
+        ],
+    )
+    .await?;
+
+    let plot_count = 8usize;
+    let input = fake_plot_image_script(plot_count, 15_000, 0);
+    let result = session.write_stdin_raw_with(&input, Some(120.0)).await?;
+    let text = result_text(&result);
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "startup-truncated python plot batch reported an error: {text}"
+    );
+    assert!(
+        text.contains(
+            "full response unavailable because older output was already dropped by the worker"
+        ),
+        "expected startup truncation to disable persisted full-response overflow files, got: {text:?}"
+    );
+    assert!(
+        overflow_path(&text).is_none(),
+        "expected no persisted full-response path once older worker output was already dropped, got: {text:?}"
+    );
+
+    let visible_paths = extract_all_paths(&text, "full image at ");
+    assert_eq!(
+        visible_paths.len(),
+        plot_count.saturating_sub(4),
+        "expected every saved overflow image path to remain visible when no response file was written, got {} paths from {:?}",
+        visible_paths.len(),
+        text,
+    );
+    for path in visible_paths {
+        assert!(
+            path.exists(),
+            "expected every visible overflow image path to exist: {path:?}"
+        );
+    }
+
+    session.cancel().await?;
     Ok(())
 }

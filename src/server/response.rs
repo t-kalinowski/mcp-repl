@@ -550,8 +550,8 @@ fn maybe_overflow_text_contents(
     else {
         return contents;
     };
-    let overflow_notice = if worker_output_was_truncated {
-        overflow_notice_worker_truncated()
+    let (overflow_notice, preserve_all_image_notice_paths) = if worker_output_was_truncated {
+        (overflow_notice_worker_truncated(), true)
     } else {
         match overflow_store {
             Some(store) => {
@@ -581,7 +581,7 @@ fn maybe_overflow_text_contents(
                                 );
                             }
                         }
-                        overflow_notice_prefix(Some(&overflow_path))
+                        (overflow_notice_prefix(Some(&overflow_path)), false)
                     }
                     Err(err) => {
                         log_overflow_write_failure(
@@ -589,16 +589,28 @@ fn maybe_overflow_text_contents(
                             overflow_metadata,
                             &err,
                         );
-                        overflow_notice_prefix(None)
+                        (overflow_notice_prefix(None), true)
                     }
                 }
             }
-            None => overflow_notice_prefix(None),
+            None => (overflow_notice_prefix(None), true),
         }
     };
     let overflow_notice =
         utf8_prefix_by_bytes(&overflow_notice, INLINE_TEXT_LIMIT_BYTES).to_string();
-    let mut preview_budget = INLINE_TEXT_LIMIT_BYTES.saturating_sub(overflow_notice.len());
+    let reserved_image_notice_bytes = if preserve_all_image_notice_paths {
+        contents
+            .iter()
+            .filter_map(content_text)
+            .filter(|text| is_image_overflow_notice(text))
+            .map(|text| text.len())
+            .sum()
+    } else {
+        0
+    };
+    let mut preview_budget = INLINE_TEXT_LIMIT_BYTES
+        .saturating_sub(overflow_notice.len())
+        .saturating_sub(reserved_image_notice_bytes);
     let mut preview_exhausted = false;
 
     let mut rewritten = Vec::with_capacity(contents.len());
@@ -614,7 +626,9 @@ fn maybe_overflow_text_contents(
             replacement.push_str(&overflow_notice);
             inserted_notice = true;
         }
-        if preview_budget > 0 && !preview_exhausted {
+        if preserve_all_image_notice_paths && is_image_overflow_notice(text) {
+            replacement.push_str(text);
+        } else if preview_budget > 0 && !preview_exhausted {
             let (preview, was_truncated) = preview_text_prefix_by_bytes(text, preview_budget);
             if !preview.is_empty() {
                 replacement.push_str(preview);
@@ -817,6 +831,10 @@ fn image_overflow_notice(image_index: usize, path: &Path) -> String {
         "[repl] image {image_index} omitted from inline response; full image at {}\n",
         path.display()
     )
+}
+
+fn is_image_overflow_notice(text: &str) -> bool {
+    text.starts_with("[repl] image ") && text.contains(" full image at ")
 }
 
 fn persisted_image_notice(image_index: usize, path: &Path) -> String {

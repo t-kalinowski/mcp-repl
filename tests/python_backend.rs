@@ -233,7 +233,7 @@ async fn python_startup_overflow_disables_full_response_overflow_file() -> TestR
     let startup_dir = tempfile::tempdir()?;
     std::fs::write(
         startup_dir.path().join("sitecustomize.py"),
-        "import sys\nsys.stdout.write(('startup-' + ('x' * 4096) + '\\n') * 2000)\nsys.stdout.flush()\n",
+        "import sys\nsys.stdout.write(('startup-' + ('x' * 4096) + '\\n') * 600)\nsys.stdout.flush()\n",
     )?;
 
     let mut session = common::spawn_server_with_args_env(
