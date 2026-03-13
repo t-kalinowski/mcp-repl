@@ -1022,6 +1022,148 @@ async fn claude_clear_shared_env_file_does_not_reset_another_live_session() -> T
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn claude_clear_shared_env_file_rebinds_after_previous_session_ends() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempfile::tempdir()?;
+    let env_file = temp.path().join("claude.env");
+    let exe = resolve_exe()?;
+    fs::write(&env_file, "export MCP_REPL_CLAUDE_SESSION_ID=sess-a\n")?;
+
+    run_claude_hook_with_env(
+        &exe,
+        &[
+            (
+                "XDG_STATE_HOME".to_string(),
+                temp.path().to_string_lossy().to_string(),
+            ),
+            (
+                "CLAUDE_ENV_FILE".to_string(),
+                env_file.to_string_lossy().to_string(),
+            ),
+        ],
+        "session-start",
+        json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-a"
+        }),
+    )?;
+
+    let mut session = common::spawn_server_with_env_vars(vec![
+        (
+            "XDG_STATE_HOME".to_string(),
+            temp.path().to_string_lossy().to_string(),
+        ),
+        (
+            "CLAUDE_ENV_FILE".to_string(),
+            env_file.to_string_lossy().to_string(),
+        ),
+    ])
+    .await?;
+
+    let set_var = session.write_stdin_raw_with("x <- 1", Some(10.0)).await?;
+    let set_var_text = result_text(&set_var);
+    if backend_unavailable(&set_var_text) {
+        eprintln!("claude_clear_binding backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&set_var_text) {
+        eprintln!(
+            "claude_clear_binding worker remained busy before shared env-file handoff; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    run_claude_hook_with_env(
+        &exe,
+        &[
+            (
+                "XDG_STATE_HOME".to_string(),
+                temp.path().to_string_lossy().to_string(),
+            ),
+            (
+                "CLAUDE_ENV_FILE".to_string(),
+                env_file.to_string_lossy().to_string(),
+            ),
+        ],
+        "session-end",
+        json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-a",
+            "reason": "other"
+        }),
+    )?;
+    run_claude_hook_with_env(
+        &exe,
+        &[
+            (
+                "XDG_STATE_HOME".to_string(),
+                temp.path().to_string_lossy().to_string(),
+            ),
+            (
+                "CLAUDE_ENV_FILE".to_string(),
+                env_file.to_string_lossy().to_string(),
+            ),
+            (
+                "MCP_REPL_CLAUDE_SESSION_ID".to_string(),
+                "sess-a".to_string(),
+            ),
+        ],
+        "session-start",
+        json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-b"
+        }),
+    )?;
+    run_claude_hook_with_env(
+        &exe,
+        &[
+            (
+                "XDG_STATE_HOME".to_string(),
+                temp.path().to_string_lossy().to_string(),
+            ),
+            (
+                "CLAUDE_ENV_FILE".to_string(),
+                env_file.to_string_lossy().to_string(),
+            ),
+        ],
+        "session-end",
+        json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": "sess-b",
+            "reason": "clear"
+        }),
+    )?;
+
+    let after_clear = session
+        .write_stdin_raw_with("print(exists(\"x\"))", Some(10.0))
+        .await?;
+    let after_clear_text = result_text(&after_clear);
+    if backend_unavailable(&after_clear_text) {
+        eprintln!(
+            "claude_clear_binding backend unavailable after shared env-file handoff clear; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&after_clear_text) {
+        eprintln!(
+            "claude_clear_binding worker remained busy after shared env-file handoff clear; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+    assert!(
+        after_clear_text.contains("FALSE"),
+        "expected shared env-file handoff clear to reset session A state for session B, got: {after_clear_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn claude_clear_stale_inherited_env_session_id_does_not_steal_live_server() -> TestResult<()>
 {
     let _guard = test_guard();

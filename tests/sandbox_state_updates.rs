@@ -5,6 +5,9 @@ mod common;
 use common::{McpTestSession, TestResult};
 use rmcp::model::{CallToolResult, RawContent};
 use serde_json::json;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -65,6 +68,72 @@ fn busy_response(text: &str) -> bool {
         || text.contains("worker is busy")
         || text.contains("request already running")
         || text.contains("input discarded while worker busy")
+}
+
+fn resolve_exe() -> TestResult<PathBuf> {
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-repl") {
+        return Ok(PathBuf::from(path));
+    }
+    if let Ok(path) = std::env::var("CARGO_BIN_EXE_mcp-console") {
+        return Ok(PathBuf::from(path));
+    }
+
+    let mut path = std::env::current_exe()?;
+    path.pop();
+    path.pop();
+    for candidate in ["mcp-repl", "mcp-console"] {
+        let mut candidate_path = path.clone();
+        candidate_path.push(candidate);
+        if cfg!(windows) {
+            candidate_path.set_extension("exe");
+        }
+        if candidate_path.exists() {
+            return Ok(candidate_path);
+        }
+    }
+
+    Err("unable to locate mcp-repl test binary".into())
+}
+
+fn run_claude_hook(
+    exe: &Path,
+    env_vars: &[(String, String)],
+    subcommand: &str,
+    input: serde_json::Value,
+) -> TestResult<()> {
+    let mut cmd = Command::new(exe);
+    cmd.arg("claude-hook")
+        .arg(subcommand)
+        .env_remove("CLAUDE_PROJECT_DIR")
+        .env_remove("CLAUDE_ENV_FILE")
+        .env_remove("MCP_REPL_CLAUDE_SESSION_ID")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
+    let mut child = cmd.spawn()?;
+
+    {
+        let stdin = child
+            .stdin
+            .as_mut()
+            .ok_or_else(|| "failed to capture claude-hook stdin".to_string())?;
+        stdin.write_all(serde_json::to_string(&input)?.as_bytes())?;
+    }
+
+    let output = child.wait_with_output()?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "claude-hook {subcommand} failed with status {}\nstderr:\n{stderr}",
+        output.status
+    )
+    .into())
 }
 
 async fn spawn_server_retry() -> TestResult<common::McpTestSession> {
@@ -318,6 +387,66 @@ async fn sandbox_inherit_without_state_update_errors_on_repl_reset() -> TestResu
         text.contains("--sandbox inherit requested but no client sandbox state was provided"),
         "expected missing sandbox-state error, got: {text}"
     );
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_inherit_late_claude_binding_allows_first_sandbox_update() -> TestResult<()> {
+    let _guard = test_mutex()
+        .lock()
+        .map_err(|_| "sandbox_state_updates test mutex poisoned")?;
+    let temp = tempfile::tempdir()?;
+    let project_dir = temp.path().join("project");
+    std::fs::create_dir_all(&project_dir)?;
+    let exe = resolve_exe()?;
+    let env_vars = vec![
+        (
+            "XDG_STATE_HOME".to_string(),
+            temp.path().to_string_lossy().to_string(),
+        ),
+        (
+            "CLAUDE_PROJECT_DIR".to_string(),
+            project_dir.to_string_lossy().to_string(),
+        ),
+    ];
+    let mut session = common::spawn_server_with_args_env_and_pager_page_chars(
+        vec!["--sandbox".to_string(), "inherit".to_string()],
+        env_vars.clone(),
+        300,
+    )
+    .await?;
+
+    run_claude_hook(
+        &exe,
+        &env_vars,
+        "session-start",
+        json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-late"
+        }),
+    )?;
+
+    session
+        .send_custom_request(SANDBOX_STATE_METHOD, sandbox_update_params(true))
+        .await?;
+
+    let result = session.write_stdin_raw_with("1+1", Some(10.0)).await?;
+    let text = collect_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("sandbox_state_updates late claude binding backend unavailable; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        !text.contains("--sandbox inherit requested but no client sandbox state was provided"),
+        "expected first sandbox update to unblock a late-bound Claude inherit session, got: {text}"
+    );
+    assert!(
+        text.contains("2"),
+        "expected late-bound Claude inherit session to evaluate input after first sandbox update, got: {text}"
+    );
+
     session.cancel().await?;
     Ok(())
 }

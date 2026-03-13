@@ -69,6 +69,8 @@ impl SharedServer {
         let backend = self.backend;
         tokio::task::spawn_blocking(move || {
             let mut worker = worker.lock().unwrap();
+            let awaiting_initial_sandbox_state_update =
+                worker.awaiting_initial_sandbox_state_update();
             {
                 let mut claude_clear_binding = claude_clear_binding
                     .lock()
@@ -76,7 +78,9 @@ impl SharedServer {
                 if claude_clear_binding.is_none() {
                     *claude_clear_binding = ClaudeClearBinding::maybe_register_late(backend)?;
                 }
-                if let Some(binding) = claude_clear_binding.as_ref() {
+                if !awaiting_initial_sandbox_state_update
+                    && let Some(binding) = claude_clear_binding.as_ref()
+                {
                     binding.sync(&mut worker)?;
                 }
             }

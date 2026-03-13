@@ -110,6 +110,14 @@ struct ProjectSessionRecord {
     updated_unix_ms: u128,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EnvFileSessionRecord {
+    claude_session_id: String,
+    env_file_path: String,
+    active: bool,
+    updated_unix_ms: u128,
+}
+
 impl ClaudeClearBinding {
     pub fn maybe_register(backend: Backend) -> Result<Option<Self>, WorkerError> {
         Self::maybe_register_with_initial_seq(backend, 0)
@@ -344,6 +352,9 @@ fn handle_session_start(input: &HookInput) -> Result<(), Box<dyn std::error::Err
     if let Some((project_dir, _)) = project_session_state {
         write_project_session_record(&project_dir, session_id, true)?;
     }
+    if let Some(path) = env_file_path.as_deref() {
+        write_env_file_session_record(path, session_id, true)?;
+    }
     if let Some(path) = env_file_path {
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
@@ -370,6 +381,9 @@ fn handle_session_end(input: &HookInput) -> Result<(), Box<dyn std::error::Error
     }
     if let Some(project_dir) = current_project_dir() {
         write_project_session_record(&project_dir, session_id, false)?;
+    }
+    if let Some(path) = env::var_os(CLAUDE_ENV_FILE_ENV).map(PathBuf::from) {
+        write_env_file_session_record(&path, session_id, false)?;
     }
     if input.reason.as_deref() != Some("clear") {
         // Keep inactive per-session project state so the next SessionStart can rebind any idle
@@ -442,17 +456,25 @@ fn project_session_dir_for_dir(project_dir: &Path) -> io::Result<PathBuf> {
 }
 
 fn stable_project_key(project_dir: &Path) -> String {
-    let project_dir = project_dir.to_string_lossy();
+    stable_path_key(project_dir, "project")
+}
+
+fn stable_env_file_key(env_file_path: &Path) -> String {
+    stable_path_key(env_file_path, "env")
+}
+
+fn stable_path_key(path: &Path, fallback_stem: &str) -> String {
+    let path = path.to_string_lossy();
     let mut hash = 0xcbf29ce484222325u64;
-    for byte in project_dir.as_bytes() {
+    for byte in path.as_bytes() {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
-    let stem = Path::new(project_dir.as_ref())
+    let stem = Path::new(path.as_ref())
         .file_name()
         .and_then(|value| value.to_str())
         .filter(|value| !value.is_empty())
-        .unwrap_or("project");
+        .unwrap_or(fallback_stem);
     let stem: String = stem
         .chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
@@ -474,6 +496,19 @@ fn project_session_path_for_session(project_dir: &Path, session_id: &str) -> io:
     Ok(session_dir.join(format!("{}.json", stable_session_key(session_id))))
 }
 
+fn env_file_session_dir_for_path(env_file_path: &Path) -> io::Result<PathBuf> {
+    let sessions_dir = claude_clear_state_dir()?.join("env-sessions");
+    Ok(sessions_dir.join(stable_env_file_key(env_file_path)))
+}
+
+fn env_file_session_path_for_session(
+    env_file_path: &Path,
+    session_id: &str,
+) -> io::Result<PathBuf> {
+    let session_dir = env_file_session_dir_for_path(env_file_path)?;
+    Ok(session_dir.join(format!("{}.json", stable_session_key(session_id))))
+}
+
 fn write_project_session_record(
     project_dir: &Path,
     session_id: &str,
@@ -485,6 +520,23 @@ fn write_project_session_record(
         &ProjectSessionRecord {
             claude_session_id: session_id.to_string(),
             project_dir: project_dir.to_string_lossy().to_string(),
+            active,
+            updated_unix_ms: unix_ms_now(),
+        },
+    )
+}
+
+fn write_env_file_session_record(
+    env_file_path: &Path,
+    session_id: &str,
+    active: bool,
+) -> io::Result<()> {
+    let path = env_file_session_path_for_session(env_file_path, session_id)?;
+    write_json_atomic(
+        &path,
+        &EnvFileSessionRecord {
+            claude_session_id: session_id.to_string(),
+            env_file_path: env_file_path.to_string_lossy().to_string(),
             active,
             updated_unix_ms: unix_ms_now(),
         },
@@ -512,6 +564,37 @@ fn load_project_session_records(path: Option<&Path>) -> Vec<ProjectSessionRecord
             continue;
         };
         let Ok(record) = serde_json::from_str::<ProjectSessionRecord>(&raw) else {
+            continue;
+        };
+        if record.claude_session_id.trim().is_empty() {
+            continue;
+        }
+        records.push(record);
+    }
+    records
+}
+
+fn load_env_file_session_records(path: Option<&Path>) -> Vec<EnvFileSessionRecord> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    if !path.is_dir() {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return Vec::new();
+    };
+
+    let mut records = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<EnvFileSessionRecord>(&raw) else {
             continue;
         };
         if record.claude_session_id.trim().is_empty() {
@@ -557,6 +640,13 @@ fn project_session_has_instance_record(path: Option<&Path>, session_id: &str) ->
             })
         })
         .unwrap_or(false)
+}
+
+fn env_file_session_activity(path: Option<&Path>, session_id: &str) -> Option<bool> {
+    load_env_file_session_records(path)
+        .into_iter()
+        .find(|record| record.claude_session_id == session_id)
+        .map(|record| record.active)
 }
 
 fn read_session_id_from_env_file(path: Option<&Path>) -> Option<String> {
@@ -668,6 +758,9 @@ fn rebind_instance_records_for_session(
     source: HandoffSource,
 ) -> io::Result<()> {
     let instances_dir = claude_clear_state_dir()?.join("instances");
+    let current_env_session_dir = env_file_path
+        .map(env_file_session_dir_for_path)
+        .transpose()?;
     if !instances_dir.is_dir() {
         return Ok(());
     }
@@ -702,7 +795,13 @@ fn rebind_instance_records_for_session(
                     continue;
                 }
                 if record.env_file_path.as_deref().map(Path::new) == Some(current_env_file_path) {
-                    continue;
+                    match env_file_session_activity(
+                        current_env_session_dir.as_deref(),
+                        previous_session_id,
+                    ) {
+                        Some(false) => {}
+                        Some(true) | None => continue,
+                    }
                 }
             }
         }

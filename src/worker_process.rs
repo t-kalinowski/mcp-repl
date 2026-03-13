@@ -565,6 +565,10 @@ impl WorkerManager {
         self.ensure_process()
     }
 
+    pub fn awaiting_initial_sandbox_state_update(&self) -> bool {
+        self.awaiting_initial_sandbox_state_update
+    }
+
     pub fn write_stdin(
         &mut self,
         text: String,
