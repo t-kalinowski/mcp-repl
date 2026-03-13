@@ -72,6 +72,7 @@ struct ClaudeSessionBinding {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct InstanceRecord {
     claude_session_id: String,
     env_file_path: String,
@@ -646,6 +647,42 @@ mod tests {
         unsafe {
             env::remove_var("XDG_STATE_HOME");
             env::remove_var(CLAUDE_ENV_FILE_ENV);
+        }
+    }
+
+    #[test]
+    fn load_instance_records_ignores_legacy_records_with_unknown_fields() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let temp = tempfile::tempdir().expect("tempdir");
+        unsafe {
+            env::set_var("XDG_STATE_HOME", temp.path());
+        }
+        let state_root = claude_clear_state_dir().expect("state root");
+        let instances_dir = state_root.join("instances");
+        fs::create_dir_all(&instances_dir).expect("create instances dir");
+        fs::write(
+            instances_dir.join("legacy.json"),
+            r#"{
+  "claude_session_id": "sess-legacy",
+  "env_file_path": "/tmp/legacy.env",
+  "backend": "r",
+  "pid": 1,
+  "cwd": null,
+  "control_path": "/tmp/control.json",
+  "started_unix_ms": 1,
+  "previous_claude_session_id": "sess-old"
+}"#,
+        )
+        .expect("write legacy record");
+
+        let records = load_instance_records().expect("load instance records");
+        assert!(
+            records.is_empty(),
+            "expected legacy records with unknown fields to be ignored, got: {records:?}"
+        );
+
+        unsafe {
+            env::remove_var("XDG_STATE_HOME");
         }
     }
 
