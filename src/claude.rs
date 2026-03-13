@@ -13,10 +13,8 @@ use crate::worker_process::{WorkerError, WorkerManager};
 
 pub const CLAUDE_SESSION_ID_ENV: &str = "MCP_REPL_CLAUDE_SESSION_ID";
 pub const CLAUDE_ENV_FILE_ENV: &str = "CLAUDE_ENV_FILE";
-pub const CLAUDE_PROJECT_DIR_ENV: &str = "CLAUDE_PROJECT_DIR";
 
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
-const ACTIVE_SESSION_STALE_AFTER_MS: u128 = 2_000;
 const STATE_SUBDIR: &str = "mcp-repl/claude-clear";
 static NEXT_TMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -24,13 +22,6 @@ static NEXT_TMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 pub enum HookCommand {
     SessionStart,
     SessionEnd,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HandoffSource {
-    EnvVar,
-    EnvFile,
-    ProjectState,
 }
 
 impl HookCommand {
@@ -63,11 +54,7 @@ pub struct ClaudeClearBinding {
 struct ClaudeClearBindingInner {
     record_path: PathBuf,
     control_path: PathBuf,
-    env_file_path: Mutex<Option<PathBuf>>,
-    current_session_id: Mutex<String>,
-    previous_session_id: Mutex<Option<String>>,
     last_control_seq: Mutex<u64>,
-    record_template: InstanceRecordTemplate,
 }
 
 #[derive(Debug, Clone)]
@@ -75,27 +62,25 @@ struct InstanceRecordTemplate {
     backend: String,
     pid: u32,
     cwd: Option<String>,
-    project_dir: Option<String>,
     started_unix_ms: u128,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeSessionBinding {
+    env_file_path: PathBuf,
+    session_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct InstanceRecord {
     claude_session_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    previous_claude_session_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    env_file_path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    project_dir: Option<String>,
+    env_file_path: String,
     backend: String,
     pid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     cwd: Option<String>,
     control_path: String,
     started_unix_ms: u128,
-    #[serde(default)]
-    last_seen_unix_ms: u128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -103,22 +88,6 @@ struct ControlRequest {
     seq: u64,
     op: String,
     requested_unix_ms: u128,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ProjectSessionRecord {
-    claude_session_id: String,
-    project_dir: String,
-    active: bool,
-    updated_unix_ms: u128,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct EnvFileSessionRecord {
-    claude_session_id: String,
-    env_file_path: String,
-    active: bool,
-    updated_unix_ms: u128,
 }
 
 impl ClaudeClearBinding {
@@ -134,12 +103,7 @@ impl ClaudeClearBinding {
         backend: Backend,
         initial_control_seq: u64,
     ) -> Result<Option<Self>, WorkerError> {
-        let project_session_dir = current_project_session_dir();
-        let env_file_path = env::var_os(CLAUDE_ENV_FILE_ENV).map(PathBuf::from);
-        let Some(session_id) = current_claude_session_id_from_sources(
-            project_session_dir.as_deref(),
-            env_file_path.as_deref(),
-        ) else {
+        let Some(binding_session) = current_claude_session_from_env_file() else {
             return Ok(None);
         };
 
@@ -164,20 +128,7 @@ impl ClaudeClearBinding {
             inner: Arc::new(ClaudeClearBindingInner {
                 record_path,
                 control_path,
-                env_file_path: Mutex::new(env_file_path),
-                current_session_id: Mutex::new(session_id.clone()),
-                previous_session_id: Mutex::new(None),
                 last_control_seq: Mutex::new(0),
-                record_template: InstanceRecordTemplate {
-                    backend: backend_label.to_string(),
-                    pid,
-                    cwd: env::current_dir()
-                        .ok()
-                        .map(|path| path.to_string_lossy().to_string()),
-                    project_dir: current_project_dir()
-                        .map(|path| path.to_string_lossy().to_string()),
-                    started_unix_ms,
-                },
             }),
         };
         write_control_request(
@@ -190,13 +141,22 @@ impl ClaudeClearBinding {
         )
         .map_err(WorkerError::Io)?;
         binding
-            .write_record(&session_id, None)
+            .write_record(
+                &binding_session,
+                &InstanceRecordTemplate {
+                    backend: backend_label.to_string(),
+                    pid,
+                    cwd: env::current_dir()
+                        .ok()
+                        .map(|path| path.to_string_lossy().to_string()),
+                    started_unix_ms,
+                },
+            )
             .map_err(WorkerError::Io)?;
         Ok(Some(binding))
     }
 
     pub fn sync(&self, worker: &mut WorkerManager) -> Result<(), WorkerError> {
-        let mut restart_observed = false;
         let next_seq = read_control_request(&self.inner.control_path)
             .map(|request| request.seq)
             .unwrap_or(0);
@@ -208,112 +168,36 @@ impl ClaudeClearBinding {
                 .expect("claude control seq mutex poisoned");
             next_seq > *last_seq
         };
-        if should_restart {
-            let _ = worker.restart(CONTROL_REQUEST_TIMEOUT)?;
-            let mut last_seq = self
-                .inner
-                .last_control_seq
-                .lock()
-                .expect("claude control seq mutex poisoned");
-            if next_seq > *last_seq {
-                *last_seq = next_seq;
-            }
-            restart_observed = true;
+        if !should_restart {
+            return Ok(());
         }
 
-        if let Some((session_id, recorded_previous_session_id)) =
-            self.resolve_current_session_state()
-        {
-            let mut current = self
-                .inner
-                .current_session_id
-                .lock()
-                .expect("claude session id mutex poisoned");
-            let mut previous = self
-                .inner
-                .previous_session_id
-                .lock()
-                .expect("claude previous session id mutex poisoned");
-            if *current != session_id {
-                let previous_session_id = if restart_observed {
-                    None
-                } else {
-                    recorded_previous_session_id.or_else(|| {
-                        // `/clear` can deliver SessionStart for the new Claude session before the
-                        // old SessionEnd hook has scanned instance records. Keep the old session id
-                        // in the record during that handoff so the clear-triggered restart still
-                        // finds us.
-                        Some(current.clone())
-                    })
-                };
-                self.write_record(&session_id, previous_session_id.as_deref())
-                    .map_err(WorkerError::Io)?;
-                *previous = previous_session_id;
-                *current = session_id;
-            } else if restart_observed && previous.take().is_some() {
-                self.write_record(&session_id, None)
-                    .map_err(WorkerError::Io)?;
-            } else {
-                self.touch_record().map_err(WorkerError::Io)?;
-            }
+        let _ = worker.restart(CONTROL_REQUEST_TIMEOUT)?;
+        let mut last_seq = self
+            .inner
+            .last_control_seq
+            .lock()
+            .expect("claude control seq mutex poisoned");
+        if next_seq > *last_seq {
+            *last_seq = next_seq;
         }
         Ok(())
     }
 
-    fn resolve_current_session_state(&self) -> Option<(String, Option<String>)> {
-        if let Some(record) = read_instance_record(&self.inner.record_path) {
-            let mut env_file_path = self
-                .inner
-                .env_file_path
-                .lock()
-                .expect("claude env file path mutex poisoned");
-            *env_file_path = record.env_file_path.as_deref().map(PathBuf::from);
-            return Some((record.claude_session_id, record.previous_claude_session_id));
-        }
-        let session_id = self
-            .inner
-            .current_session_id
-            .lock()
-            .expect("claude session id mutex poisoned")
-            .clone();
-        let previous_session_id = self
-            .inner
-            .previous_session_id
-            .lock()
-            .expect("claude previous session id mutex poisoned")
-            .clone();
-        Some((session_id, previous_session_id))
-    }
-
-    fn write_record(&self, session_id: &str, previous_session_id: Option<&str>) -> io::Result<()> {
-        let env_file_path = self
-            .inner
-            .env_file_path
-            .lock()
-            .expect("claude env file path mutex poisoned")
-            .clone();
+    fn write_record(
+        &self,
+        binding_session: &ClaudeSessionBinding,
+        template: &InstanceRecordTemplate,
+    ) -> io::Result<()> {
         let record = InstanceRecord {
-            claude_session_id: session_id.to_string(),
-            previous_claude_session_id: previous_session_id.map(str::to_string),
-            env_file_path: env_file_path
-                .as_ref()
-                .map(|path| path.to_string_lossy().to_string()),
-            project_dir: self.inner.record_template.project_dir.clone(),
-            backend: self.inner.record_template.backend.clone(),
-            pid: self.inner.record_template.pid,
-            cwd: self.inner.record_template.cwd.clone(),
+            claude_session_id: binding_session.session_id.clone(),
+            env_file_path: binding_session.env_file_path.to_string_lossy().to_string(),
+            backend: template.backend.clone(),
+            pid: template.pid,
+            cwd: template.cwd.clone(),
             control_path: self.inner.control_path.to_string_lossy().to_string(),
-            started_unix_ms: self.inner.record_template.started_unix_ms,
-            last_seen_unix_ms: unix_ms_now(),
+            started_unix_ms: template.started_unix_ms,
         };
-        write_json_atomic(&self.inner.record_path, &record)
-    }
-
-    fn touch_record(&self) -> io::Result<()> {
-        let Some(mut record) = read_instance_record(&self.inner.record_path) else {
-            return Ok(());
-        };
-        record.last_seen_unix_ms = unix_ms_now();
         write_json_atomic(&self.inner.record_path, &record)
     }
 }
@@ -344,47 +228,20 @@ fn handle_session_start(input: &HookInput) -> Result<(), Box<dyn std::error::Err
     if input.hook_event_name.as_deref() != Some("SessionStart") {
         return Ok(());
     }
-    let project_session_state = current_project_session_state();
-    let env_file_path = env::var_os(CLAUDE_ENV_FILE_ENV).map(PathBuf::from);
-    if let Some((previous_session_id, source)) = previous_claude_session_id_for_handoff(
-        project_session_state
-            .as_ref()
-            .map(|(_, session_dir)| session_dir.as_path()),
-        env_file_path.as_deref(),
-        project_session_state
-            .as_ref()
-            .map(|(project_dir, _)| project_dir.as_path()),
-        session_id,
-    ) {
-        rebind_instance_records_for_session(
-            &previous_session_id,
-            session_id,
-            env_file_path.as_deref(),
-            project_session_state
-                .as_ref()
-                .map(|(project_dir, _)| project_dir.as_path()),
-            source,
-        )?;
+    let Some(path) = env::var_os(CLAUDE_ENV_FILE_ENV).map(PathBuf::from) else {
+        return Ok(());
+    };
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
     }
-    if let Some((project_dir, _)) = project_session_state {
-        write_project_session_record(&project_dir, session_id, true)?;
+    let needs_separator = env_file_needs_separator(&path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    if needs_separator {
+        writeln!(file)?;
     }
-    if let Some(path) = env_file_path.as_deref() {
-        write_env_file_session_record(path, session_id, true)?;
-    }
-    if let Some(path) = env_file_path {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
-        let needs_separator = env_file_needs_separator(&path)?;
-        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-        if needs_separator {
-            writeln!(file)?;
-        }
-        writeln!(file, "export {CLAUDE_SESSION_ID_ENV}={}", session_id)?;
-    }
+    writeln!(file, "export {CLAUDE_SESSION_ID_ENV}={session_id}")?;
     Ok(())
 }
 
@@ -396,389 +253,35 @@ fn handle_session_end(input: &HookInput) -> Result<(), Box<dyn std::error::Error
     if input.hook_event_name.as_deref() != Some("SessionEnd") {
         return Ok(());
     }
-    if let Some(project_dir) = current_project_dir() {
-        write_project_session_record(&project_dir, session_id, false)?;
-    }
-    if let Some(path) = env::var_os(CLAUDE_ENV_FILE_ENV).map(PathBuf::from) {
-        write_env_file_session_record(&path, session_id, false)?;
-    }
     if input.reason.as_deref() != Some("clear") {
-        // Keep inactive per-session project state so the next SessionStart can rebind any idle
-        // server records before a `/clear` arrives in the new Claude session.
+        return Ok(());
+    }
+    let Some(env_file_path) = env::var_os(CLAUDE_ENV_FILE_ENV).map(PathBuf::from) else {
+        return Ok(());
+    };
+    if fs::read_to_string(&env_file_path).is_err() {
         return Ok(());
     }
 
-    for record in load_instance_records_for_session(session_id)? {
+    for record in load_instance_records_for_binding(&env_file_path, session_id)? {
         let path = PathBuf::from(record.control_path);
         request_restart(&path)?;
     }
     Ok(())
 }
 
-fn current_claude_session_id_from_sources(
-    project_session_dir: Option<&Path>,
-    env_file_path: Option<&Path>,
-) -> Option<String> {
-    let env_file_session = read_session_id_from_env_file(env_file_path)
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty());
-    if let Some(env_session_id) = env_file_session.as_ref()
-        && env_file_session_activity(
-            env_file_path
-                .map(env_file_session_dir_for_path)
-                .transpose()
-                .ok()
-                .flatten()
-                .as_deref(),
-            env_session_id,
-        )
-        .is_some_and(|record| record.active)
-    {
-        return Some(env_session_id.clone());
-    }
-    if let Some(project_session_id) = read_current_project_session_record(project_session_dir)
-        .map(|record| record.claude_session_id.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        return Some(project_session_id);
-    }
-    env_file_session
-        .or_else(|| env::var(CLAUDE_SESSION_ID_ENV).ok())
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-fn previous_claude_session_id_for_handoff(
-    project_session_dir: Option<&Path>,
-    env_file_path: Option<&Path>,
-    current_project_dir: Option<&Path>,
-    current_session_id: &str,
-) -> Option<(String, HandoffSource)> {
-    if env_file_path.is_some()
-        && let Ok(value) = env::var(CLAUDE_SESSION_ID_ENV)
-        && let Some(candidate) = env_handoff_candidate(
-            value.trim(),
-            HandoffSource::EnvVar,
-            current_project_dir,
-            env_file_path,
-            current_session_id,
-        )
-    {
-        return Some(candidate);
-    }
-    if let Some(value) = read_session_id_from_env_file(env_file_path)
-        && let Some(candidate) = env_handoff_candidate(
-            value.trim(),
-            HandoffSource::EnvFile,
-            current_project_dir,
-            env_file_path,
-            current_session_id,
-        )
-    {
-        return Some(candidate);
-    }
-    read_latest_inactive_session_id_from_project_state(project_session_dir)
-        .or_else(|| read_latest_stale_active_session_id_from_project_state(project_session_dir))
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty() && value != current_session_id)
-        .map(|value| (value, HandoffSource::ProjectState))
-}
-
-fn env_handoff_candidate(
-    value: &str,
-    source: HandoffSource,
-    current_project_dir: Option<&Path>,
-    env_file_path: Option<&Path>,
-    current_session_id: &str,
-) -> Option<(String, HandoffSource)> {
-    if value.is_empty() || value == current_session_id {
+fn current_claude_session_from_env_file() -> Option<ClaudeSessionBinding> {
+    let env_file_path = env::var_os(CLAUDE_ENV_FILE_ENV).map(PathBuf::from)?;
+    let session_id = read_session_id_from_env_file(Some(&env_file_path))?
+        .trim()
+        .to_string();
+    if session_id.is_empty() {
         return None;
     }
-    session_has_instance_record_for_scope(value, current_project_dir, env_file_path)
-        .then(|| (value.to_string(), source))
-}
-
-fn current_project_session_state() -> Option<(PathBuf, PathBuf)> {
-    let project_dir = current_project_dir()?;
-    let session_dir = project_session_dir_for_dir(&project_dir).ok()?;
-    Some((project_dir, session_dir))
-}
-
-fn current_project_session_dir() -> Option<PathBuf> {
-    current_project_session_state().map(|(_, path)| path)
-}
-
-fn current_project_dir() -> Option<PathBuf> {
-    env::var_os(CLAUDE_PROJECT_DIR_ENV)
-        .filter(|raw| !raw.is_empty())
-        .map(PathBuf::from)
-}
-
-fn project_session_dir_for_dir(project_dir: &Path) -> io::Result<PathBuf> {
-    let sessions_dir = claude_clear_state_dir()?.join("sessions");
-    Ok(sessions_dir.join(stable_project_key(project_dir)))
-}
-
-fn stable_project_key(project_dir: &Path) -> String {
-    stable_path_key(project_dir, "project")
-}
-
-fn stable_env_file_key(env_file_path: &Path) -> String {
-    stable_path_key(env_file_path, "env")
-}
-
-fn stable_path_key(path: &Path, fallback_stem: &str) -> String {
-    let path = path.to_string_lossy();
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in path.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    let stem = Path::new(path.as_ref())
-        .file_name()
-        .and_then(|value| value.to_str())
-        .filter(|value| !value.is_empty())
-        .unwrap_or(fallback_stem);
-    let stem: String = stem
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect();
-    format!("{stem}-{hash:016x}")
-}
-
-fn stable_session_key(session_id: &str) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
-    for byte in session_id.as_bytes() {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("session-{hash:016x}")
-}
-
-fn project_session_path_for_session(project_dir: &Path, session_id: &str) -> io::Result<PathBuf> {
-    let session_dir = project_session_dir_for_dir(project_dir)?;
-    Ok(session_dir.join(format!("{}.json", stable_session_key(session_id))))
-}
-
-fn env_file_session_dir_for_path(env_file_path: &Path) -> io::Result<PathBuf> {
-    let sessions_dir = claude_clear_state_dir()?.join("env-sessions");
-    Ok(sessions_dir.join(stable_env_file_key(env_file_path)))
-}
-
-fn env_file_session_path_for_session(
-    env_file_path: &Path,
-    session_id: &str,
-) -> io::Result<PathBuf> {
-    let session_dir = env_file_session_dir_for_path(env_file_path)?;
-    Ok(session_dir.join(format!("{}.json", stable_session_key(session_id))))
-}
-
-fn write_project_session_record(
-    project_dir: &Path,
-    session_id: &str,
-    active: bool,
-) -> io::Result<()> {
-    let path = project_session_path_for_session(project_dir, session_id)?;
-    write_json_atomic(
-        &path,
-        &ProjectSessionRecord {
-            claude_session_id: session_id.to_string(),
-            project_dir: project_dir.to_string_lossy().to_string(),
-            active,
-            updated_unix_ms: unix_ms_now(),
-        },
-    )
-}
-
-fn write_env_file_session_record(
-    env_file_path: &Path,
-    session_id: &str,
-    active: bool,
-) -> io::Result<()> {
-    let path = env_file_session_path_for_session(env_file_path, session_id)?;
-    write_json_atomic(
-        &path,
-        &EnvFileSessionRecord {
-            claude_session_id: session_id.to_string(),
-            env_file_path: env_file_path.to_string_lossy().to_string(),
-            active,
-            updated_unix_ms: unix_ms_now(),
-        },
-    )
-}
-
-fn load_project_session_records(path: Option<&Path>) -> Vec<ProjectSessionRecord> {
-    let Some(path) = path else {
-        return Vec::new();
-    };
-    if !path.is_dir() {
-        return Vec::new();
-    }
-    let Ok(entries) = fs::read_dir(path) else {
-        return Vec::new();
-    };
-
-    let mut records = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(record) = serde_json::from_str::<ProjectSessionRecord>(&raw) else {
-            continue;
-        };
-        if record.claude_session_id.trim().is_empty() {
-            continue;
-        }
-        records.push(record);
-    }
-    records
-}
-
-fn load_env_file_session_records(path: Option<&Path>) -> Vec<EnvFileSessionRecord> {
-    let Some(path) = path else {
-        return Vec::new();
-    };
-    if !path.is_dir() {
-        return Vec::new();
-    }
-    let Ok(entries) = fs::read_dir(path) else {
-        return Vec::new();
-    };
-
-    let mut records = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(record) = serde_json::from_str::<EnvFileSessionRecord>(&raw) else {
-            continue;
-        };
-        if record.claude_session_id.trim().is_empty() {
-            continue;
-        }
-        records.push(record);
-    }
-    records
-}
-
-fn read_current_project_session_record(path: Option<&Path>) -> Option<ProjectSessionRecord> {
-    load_project_session_records(path)
-        .into_iter()
-        .filter(|record| record.active)
-        .max_by_key(|record| record.updated_unix_ms)
-}
-
-fn read_latest_inactive_session_id_from_project_state(path: Option<&Path>) -> Option<String> {
-    let mut records: Vec<ProjectSessionRecord> = load_project_session_records(path)
-        .into_iter()
-        .filter(|record| !record.active)
-        .collect();
-    records.sort_by_key(|record| std::cmp::Reverse(record.updated_unix_ms));
-    records.into_iter().find_map(|record| {
-        project_session_has_instance_record(path, &record.claude_session_id)
-            .then_some(record.claude_session_id)
+    Some(ClaudeSessionBinding {
+        env_file_path,
+        session_id,
     })
-}
-
-fn read_latest_stale_active_session_id_from_project_state(path: Option<&Path>) -> Option<String> {
-    let mut records: Vec<ProjectSessionRecord> = load_project_session_records(path)
-        .into_iter()
-        .filter(|record| record.active)
-        .collect();
-    records.sort_by_key(|record| std::cmp::Reverse(record.updated_unix_ms));
-    records.into_iter().find_map(|record| {
-        project_session_has_stale_instance_record(path, &record.claude_session_id)
-            .then_some(record.claude_session_id)
-    })
-}
-
-fn project_session_is_active(path: Option<&Path>, session_id: &str) -> bool {
-    load_project_session_records(path)
-        .into_iter()
-        .any(|record| record.active && record.claude_session_id == session_id)
-}
-
-fn project_session_has_instance_record(path: Option<&Path>, session_id: &str) -> bool {
-    load_instance_records()
-        .map(|records| {
-            records.into_iter().any(|record| {
-                instance_record_matches_session(&record, session_id)
-                    && record_project_session_dir(&record).as_deref() == path
-            })
-        })
-        .unwrap_or(false)
-}
-
-fn project_session_has_stale_instance_record(path: Option<&Path>, session_id: &str) -> bool {
-    let now_ms = unix_ms_now();
-    load_instance_records()
-        .map(|records| {
-            records.into_iter().any(|record| {
-                instance_record_matches_session(&record, session_id)
-                    && record_project_session_dir(&record).as_deref() == path
-                    && instance_record_is_stale(&record, now_ms)
-            })
-        })
-        .unwrap_or(false)
-}
-
-fn session_has_instance_record_for_scope(
-    session_id: &str,
-    current_project_dir: Option<&Path>,
-    env_file_path: Option<&Path>,
-) -> bool {
-    load_instance_records()
-        .map(|records| {
-            records.into_iter().any(|record| {
-                instance_record_matches_session(&record, session_id)
-                    && record_matches_handoff_scope(&record, current_project_dir, env_file_path)
-            })
-        })
-        .unwrap_or(false)
-}
-
-fn record_matches_handoff_scope(
-    record: &InstanceRecord,
-    current_project_dir: Option<&Path>,
-    env_file_path: Option<&Path>,
-) -> bool {
-    if record.project_dir.as_deref().map(Path::new) != current_project_dir {
-        return false;
-    }
-    if current_project_dir.is_none() {
-        return env_file_path.is_some() == record.env_file_path.is_some();
-    }
-    true
-}
-
-fn env_file_session_activity(
-    path: Option<&Path>,
-    session_id: &str,
-) -> Option<EnvFileSessionRecord> {
-    load_env_file_session_records(path)
-        .into_iter()
-        .find(|record| record.claude_session_id == session_id)
-}
-
-fn instance_record_is_stale(record: &InstanceRecord, now_ms: u128) -> bool {
-    now_ms.saturating_sub(record.last_seen_unix_ms) > ACTIVE_SESSION_STALE_AFTER_MS
-}
-
-fn instance_record_has_fresh_session_marker(
-    record: &InstanceRecord,
-    session_id: &str,
-    now_ms: u128,
-) -> bool {
-    project_session_is_active(record_project_session_dir(record).as_deref(), session_id)
-        && !instance_record_is_stale(record, now_ms)
 }
 
 fn read_session_id_from_env_file(path: Option<&Path>) -> Option<String> {
@@ -818,11 +321,6 @@ fn request_restart(path: &Path) -> io::Result<()> {
     )
 }
 
-fn read_instance_record(path: &Path) -> Option<InstanceRecord> {
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
-}
-
 fn read_control_request(path: &Path) -> Option<ControlRequest> {
     let raw = fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
@@ -839,10 +337,14 @@ fn env_file_needs_separator(path: &Path) -> io::Result<bool> {
     Ok(!raw.is_empty() && !raw.ends_with(b"\n"))
 }
 
-fn load_instance_records_for_session(session_id: &str) -> io::Result<Vec<InstanceRecord>> {
+fn load_instance_records_for_binding(
+    env_file_path: &Path,
+    session_id: &str,
+) -> io::Result<Vec<InstanceRecord>> {
+    let env_file_path = env_file_path.to_string_lossy().to_string();
     let mut out = Vec::new();
     for record in load_instance_records()? {
-        if instance_record_matches_session(&record, session_id) {
+        if record.claude_session_id == session_id && record.env_file_path == env_file_path {
             out.push(record);
         }
     }
@@ -870,84 +372,6 @@ fn load_instance_records() -> io::Result<Vec<InstanceRecord>> {
         out.push(record);
     }
     Ok(out)
-}
-
-fn instance_record_matches_session(record: &InstanceRecord, session_id: &str) -> bool {
-    record.claude_session_id == session_id
-        || record.previous_claude_session_id.as_deref() == Some(session_id)
-}
-
-fn record_project_session_dir(record: &InstanceRecord) -> Option<PathBuf> {
-    let project_dir = record.project_dir.as_deref()?;
-    project_session_dir_for_dir(Path::new(project_dir)).ok()
-}
-
-fn rebind_instance_records_for_session(
-    previous_session_id: &str,
-    session_id: &str,
-    env_file_path: Option<&Path>,
-    current_project_dir: Option<&Path>,
-    source: HandoffSource,
-) -> io::Result<()> {
-    let instances_dir = claude_clear_state_dir()?.join("instances");
-    let current_env_session_dir = env_file_path
-        .map(env_file_session_dir_for_path)
-        .transpose()?;
-    let now_ms = unix_ms_now();
-    if !instances_dir.is_dir() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(instances_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let Ok(raw) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(mut record) = serde_json::from_str::<InstanceRecord>(&raw) else {
-            continue;
-        };
-        if !instance_record_matches_session(&record, previous_session_id) {
-            continue;
-        }
-        if instance_record_has_fresh_session_marker(&record, previous_session_id, now_ms) {
-            continue;
-        }
-        match source {
-            HandoffSource::ProjectState => {}
-            HandoffSource::EnvVar | HandoffSource::EnvFile => {
-                let Some(current_env_file_path) = env_file_path else {
-                    continue;
-                };
-                if record.project_dir.as_deref().map(Path::new) != current_project_dir {
-                    continue;
-                }
-                if current_project_dir.is_some()
-                    && record.env_file_path.as_deref().map(Path::new) != Some(current_env_file_path)
-                {
-                    continue;
-                }
-                if record.env_file_path.as_deref().map(Path::new) == Some(current_env_file_path) {
-                    match env_file_session_activity(
-                        current_env_session_dir.as_deref(),
-                        previous_session_id,
-                    ) {
-                        Some(activity) if !activity.active => {}
-                        Some(activity)
-                            if activity.active && instance_record_is_stale(&record, now_ms) => {}
-                        Some(_) | None => continue,
-                    }
-                }
-            }
-        }
-        record.claude_session_id = session_id.to_string();
-        record.previous_claude_session_id = Some(previous_session_id.to_string());
-        record.env_file_path = env_file_path.map(|path| path.to_string_lossy().to_string());
-        write_json_atomic(&path, &record)?;
-    }
-    Ok(())
 }
 
 fn unique_instance_id(
@@ -1073,11 +497,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let temp = tempfile::tempdir().expect("tempdir");
         let env_file = temp.path().join("claude.env");
-        let project_dir = temp.path().join("project");
-        fs::create_dir_all(&project_dir).expect("create project dir");
         unsafe {
-            env::set_var("XDG_STATE_HOME", temp.path());
-            env::set_var(CLAUDE_PROJECT_DIR_ENV, &project_dir);
             env::set_var(CLAUDE_ENV_FILE_ENV, &env_file);
         }
 
@@ -1092,18 +512,23 @@ mod tests {
         assert!(raw.contains("export MCP_REPL_CLAUDE_SESSION_ID=sess-start"));
 
         unsafe {
-            env::remove_var("XDG_STATE_HOME");
-            env::remove_var(CLAUDE_PROJECT_DIR_ENV);
             env::remove_var(CLAUDE_ENV_FILE_ENV);
         }
     }
 
     #[test]
-    fn session_end_hook_queues_restart_for_matching_records() {
+    fn session_end_hook_queues_restart_only_for_matching_env_file_and_session() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let temp = tempfile::tempdir().expect("tempdir");
+        let env_file_a = temp.path().join("claude-a.env");
+        let env_file_b = temp.path().join("claude-b.env");
+        fs::write(&env_file_a, "export MCP_REPL_CLAUDE_SESSION_ID=sess-shared\n")
+            .expect("write env file a");
+        fs::write(&env_file_b, "export MCP_REPL_CLAUDE_SESSION_ID=sess-shared\n")
+            .expect("write env file b");
         unsafe {
             env::set_var("XDG_STATE_HOME", temp.path());
+            env::set_var(CLAUDE_ENV_FILE_ENV, &env_file_b);
         }
         let state_root = claude_clear_state_dir().expect("state root");
         let instances_dir = state_root.join("instances");
@@ -1111,158 +536,86 @@ mod tests {
         fs::create_dir_all(&instances_dir).expect("create instances dir");
         fs::create_dir_all(&controls_dir).expect("create controls dir");
 
-        let control_path = controls_dir.join("r-1.json");
+        let control_a = controls_dir.join("r-a.json");
+        let control_b = controls_dir.join("r-b.json");
         write_control_request(
-            &control_path,
+            &control_a,
             &ControlRequest {
                 seq: 0,
                 op: "restart".to_string(),
                 requested_unix_ms: 1,
             },
         )
-        .expect("seed control request");
-        write_json_atomic(
-            &instances_dir.join("r-1.json"),
-            &InstanceRecord {
-                claude_session_id: "sess-old".to_string(),
-                previous_claude_session_id: None,
-                env_file_path: None,
-                project_dir: None,
-                backend: "r".to_string(),
-                pid: 1,
-                cwd: None,
-                control_path: control_path.to_string_lossy().to_string(),
-                started_unix_ms: 1,
-                last_seen_unix_ms: 1,
-            },
-        )
-        .expect("write instance record");
-
-        handle_session_end(&HookInput {
-            hook_event_name: Some("SessionEnd".to_string()),
-            session_id: "sess-old".to_string(),
-            reason: Some("clear".to_string()),
-        })
-        .expect("handle session end");
-
-        let request = read_control_request(&control_path).expect("control request");
-        assert_eq!(request.seq, 1);
-
-        unsafe {
-            env::remove_var("XDG_STATE_HOME");
-        }
-    }
-
-    #[test]
-    fn session_end_hook_matches_previous_session_id_during_rebind() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let temp = tempfile::tempdir().expect("tempdir");
-        unsafe {
-            env::set_var("XDG_STATE_HOME", temp.path());
-        }
-        let state_root = claude_clear_state_dir().expect("state root");
-        let instances_dir = state_root.join("instances");
-        let controls_dir = state_root.join("controls");
-        fs::create_dir_all(&instances_dir).expect("create instances dir");
-        fs::create_dir_all(&controls_dir).expect("create controls dir");
-
-        let control_path = controls_dir.join("r-1.json");
+        .expect("seed control a");
         write_control_request(
-            &control_path,
+            &control_b,
             &ControlRequest {
                 seq: 0,
                 op: "restart".to_string(),
                 requested_unix_ms: 1,
             },
         )
-        .expect("seed control request");
+        .expect("seed control b");
         write_json_atomic(
-            &instances_dir.join("r-1.json"),
+            &instances_dir.join("r-a.json"),
             &InstanceRecord {
-                claude_session_id: "sess-new".to_string(),
-                previous_claude_session_id: Some("sess-old".to_string()),
-                env_file_path: None,
-                project_dir: None,
+                claude_session_id: "sess-shared".to_string(),
+                env_file_path: env_file_a.to_string_lossy().to_string(),
                 backend: "r".to_string(),
                 pid: 1,
                 cwd: None,
-                control_path: control_path.to_string_lossy().to_string(),
+                control_path: control_a.to_string_lossy().to_string(),
                 started_unix_ms: 1,
-                last_seen_unix_ms: 1,
             },
         )
-        .expect("write instance record");
+        .expect("write record a");
+        write_json_atomic(
+            &instances_dir.join("r-b.json"),
+            &InstanceRecord {
+                claude_session_id: "sess-shared".to_string(),
+                env_file_path: env_file_b.to_string_lossy().to_string(),
+                backend: "r".to_string(),
+                pid: 2,
+                cwd: None,
+                control_path: control_b.to_string_lossy().to_string(),
+                started_unix_ms: 1,
+            },
+        )
+        .expect("write record b");
 
         handle_session_end(&HookInput {
             hook_event_name: Some("SessionEnd".to_string()),
-            session_id: "sess-old".to_string(),
+            session_id: "sess-shared".to_string(),
             reason: Some("clear".to_string()),
         })
         .expect("handle session end");
 
-        let request = read_control_request(&control_path).expect("control request");
-        assert_eq!(request.seq, 1);
+        let request_a = read_control_request(&control_a).expect("read control a");
+        let request_b = read_control_request(&control_b).expect("read control b");
+        assert_eq!(request_a.seq, 0, "env file mismatch should not queue restart");
+        assert_eq!(request_b.seq, 1, "exact env file + session should queue restart");
 
         unsafe {
             env::remove_var("XDG_STATE_HOME");
+            env::remove_var(CLAUDE_ENV_FILE_ENV);
         }
     }
 
     #[test]
-    fn current_claude_session_id_prefers_env_file_value() {
+    fn current_claude_session_id_reads_last_valid_export_from_env_file() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let temp = tempfile::tempdir().expect("tempdir");
         let env_file = temp.path().join("claude.env");
         fs::write(
             &env_file,
-            "MCP_REPL_CLAUDE_SESSION_ID=sess-from-file\nMCP_REPL_CLAUDE_SESSION_ID=sess-latest\n",
+            "export MCP_REPL_CLAUDE_SESSION_ID=sess-old\nexport MCP_REPL_CLAUDE_SESSION_ID=sess-latest\n",
         )
         .expect("write env file");
 
-        unsafe {
-            env::set_var(CLAUDE_SESSION_ID_ENV, "sess-from-env");
-        }
-
-        let session_id = current_claude_session_id_from_sources(None, Some(&env_file))
-            .expect("current claude session id");
-        assert_eq!(session_id, "sess-latest");
-
-        unsafe {
-            env::remove_var(CLAUDE_SESSION_ID_ENV);
-        }
-    }
-
-    #[test]
-    fn current_claude_session_id_prefers_project_state_over_stale_env() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let temp = tempfile::tempdir().expect("tempdir");
-        let project_dir = temp.path().join("project");
-        fs::create_dir_all(&project_dir).expect("create project dir");
-
-        unsafe {
-            env::set_var("XDG_STATE_HOME", temp.path());
-            env::set_var(CLAUDE_PROJECT_DIR_ENV, &project_dir);
-            env::set_var(CLAUDE_SESSION_ID_ENV, "sess-stale");
-            env::remove_var(CLAUDE_ENV_FILE_ENV);
-        }
-
-        handle_session_start(&HookInput {
-            hook_event_name: Some("SessionStart".to_string()),
-            session_id: "sess-current".to_string(),
-            reason: None,
-        })
-        .expect("handle session start");
-
-        let session_id =
-            current_claude_session_id_from_sources(current_project_session_dir().as_deref(), None)
-                .expect("current claude session id");
-        assert_eq!(session_id, "sess-current");
-
-        unsafe {
-            env::remove_var("XDG_STATE_HOME");
-            env::remove_var(CLAUDE_PROJECT_DIR_ENV);
-            env::remove_var(CLAUDE_SESSION_ID_ENV);
-        }
+        let binding_session =
+            current_claude_session_from_env_file_with_path(&env_file).expect("binding session");
+        assert_eq!(binding_session.session_id, "sess-latest");
+        assert_eq!(binding_session.env_file_path, env_file);
     }
 
     #[test]
@@ -1279,8 +632,6 @@ mod tests {
         unsafe {
             env::set_var("XDG_STATE_HOME", temp.path());
             env::set_var(CLAUDE_ENV_FILE_ENV, &env_file);
-            env::remove_var(CLAUDE_PROJECT_DIR_ENV);
-            env::remove_var(CLAUDE_SESSION_ID_ENV);
         }
 
         let binding = ClaudeClearBinding::maybe_register(Backend::R).expect("maybe register");
@@ -1297,49 +648,6 @@ mod tests {
     }
 
     #[test]
-    fn maybe_register_requires_claude_project_dir_for_project_state_lookup() {
-        let _guard = ENV_LOCK.lock().expect("env lock");
-        let temp = tempfile::tempdir().expect("tempdir");
-        let project_dir = temp.path().join("project");
-        fs::create_dir_all(&project_dir).expect("create project dir");
-
-        unsafe {
-            env::set_var("XDG_STATE_HOME", temp.path());
-            env::remove_var(CLAUDE_PROJECT_DIR_ENV);
-            env::remove_var(CLAUDE_ENV_FILE_ENV);
-            env::remove_var(CLAUDE_SESSION_ID_ENV);
-        }
-
-        let previous_cwd = env::current_dir().expect("current dir");
-        env::set_current_dir(&project_dir).expect("set current dir");
-        let cwd = env::current_dir().expect("cwd after set");
-
-        let session_path = project_session_path_for_session(&cwd, "sess-from-project-state")
-            .expect("project session state path");
-        write_json_atomic(
-            &session_path,
-            &ProjectSessionRecord {
-                claude_session_id: "sess-from-project-state".to_string(),
-                project_dir: cwd.to_string_lossy().to_string(),
-                active: true,
-                updated_unix_ms: 1,
-            },
-        )
-        .expect("write project session state");
-
-        let binding = ClaudeClearBinding::maybe_register(Backend::R).expect("maybe register");
-        assert!(
-            binding.is_none(),
-            "expected no claude binding without CLAUDE_PROJECT_DIR"
-        );
-
-        env::set_current_dir(previous_cwd).expect("restore current dir");
-        unsafe {
-            env::remove_var("XDG_STATE_HOME");
-        }
-    }
-
-    #[test]
     fn sync_does_not_consume_control_seq_when_restart_fails() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let temp_root = env::current_dir().expect("current dir");
@@ -1347,12 +655,13 @@ mod tests {
             .prefix("claude-sync-")
             .tempdir_in(temp_root)
             .expect("tempdir");
+        let env_file = temp.path().join("claude.env");
+        fs::write(&env_file, "export MCP_REPL_CLAUDE_SESSION_ID=sess-current\n")
+            .expect("write env file");
 
         unsafe {
             env::set_var("XDG_STATE_HOME", temp.path());
-            env::set_var(CLAUDE_SESSION_ID_ENV, "sess-current");
-            env::remove_var(CLAUDE_PROJECT_DIR_ENV);
-            env::remove_var(CLAUDE_ENV_FILE_ENV);
+            env::set_var(CLAUDE_ENV_FILE_ENV, &env_file);
         }
 
         let binding = ClaudeClearBinding::maybe_register(Backend::Python)
@@ -1363,8 +672,19 @@ mod tests {
         let inherit_plan = SandboxCliPlan {
             operations: vec![SandboxCliOperation::SetMode(SandboxModeArg::Inherit)],
         };
-        let mut failing_worker =
-            WorkerManager::new(Backend::Python, inherit_plan).expect("worker manager");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut failing_worker = loop {
+            let worker =
+                WorkerManager::new(Backend::Python, inherit_plan.clone()).expect("worker manager");
+            if worker.awaiting_initial_sandbox_state_update() {
+                break worker;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "expected worker to await inherited sandbox state before restart test"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        };
         let restart_err = binding
             .sync(&mut failing_worker)
             .expect_err("restart should fail without inherited sandbox state");
@@ -1381,8 +701,21 @@ mod tests {
 
         unsafe {
             env::remove_var("XDG_STATE_HOME");
-            env::remove_var(CLAUDE_SESSION_ID_ENV);
+            env::remove_var(CLAUDE_ENV_FILE_ENV);
         }
+    }
+
+    fn current_claude_session_from_env_file_with_path(path: &Path) -> Option<ClaudeSessionBinding> {
+        let session_id = read_session_id_from_env_file(Some(path))?
+            .trim()
+            .to_string();
+        if session_id.is_empty() {
+            return None;
+        }
+        Some(ClaudeSessionBinding {
+            env_file_path: path.to_path_buf(),
+            session_id,
+        })
     }
 
     #[cfg(windows)]
