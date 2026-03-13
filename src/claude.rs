@@ -495,10 +495,17 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    fn test_tempdir(prefix: &str) -> tempfile::TempDir {
+        tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in(env::current_dir().expect("current dir"))
+            .expect("tempdir")
+    }
+
     #[test]
     fn session_start_hook_appends_session_id_to_claude_env_file() {
         let _guard = ENV_LOCK.lock().expect("env lock");
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = test_tempdir("claude-session-start-");
         let env_file = temp.path().join("claude.env");
         unsafe {
             env::set_var(CLAUDE_ENV_FILE_ENV, &env_file);
@@ -522,13 +529,19 @@ mod tests {
     #[test]
     fn session_end_hook_queues_restart_only_for_matching_env_file_and_session() {
         let _guard = ENV_LOCK.lock().expect("env lock");
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = test_tempdir("claude-session-end-");
         let env_file_a = temp.path().join("claude-a.env");
         let env_file_b = temp.path().join("claude-b.env");
-        fs::write(&env_file_a, "export MCP_REPL_CLAUDE_SESSION_ID=sess-shared\n")
-            .expect("write env file a");
-        fs::write(&env_file_b, "export MCP_REPL_CLAUDE_SESSION_ID=sess-shared\n")
-            .expect("write env file b");
+        fs::write(
+            &env_file_a,
+            "export MCP_REPL_CLAUDE_SESSION_ID=sess-shared\n",
+        )
+        .expect("write env file a");
+        fs::write(
+            &env_file_b,
+            "export MCP_REPL_CLAUDE_SESSION_ID=sess-shared\n",
+        )
+        .expect("write env file b");
         unsafe {
             env::set_var("XDG_STATE_HOME", temp.path());
             env::set_var(CLAUDE_ENV_FILE_ENV, &env_file_b);
@@ -595,8 +608,14 @@ mod tests {
 
         let request_a = read_control_request(&control_a).expect("read control a");
         let request_b = read_control_request(&control_b).expect("read control b");
-        assert_eq!(request_a.seq, 0, "env file mismatch should not queue restart");
-        assert_eq!(request_b.seq, 1, "exact env file + session should queue restart");
+        assert_eq!(
+            request_a.seq, 0,
+            "env file mismatch should not queue restart"
+        );
+        assert_eq!(
+            request_b.seq, 1,
+            "exact env file + session should queue restart"
+        );
 
         unsafe {
             env::remove_var("XDG_STATE_HOME");
@@ -607,7 +626,7 @@ mod tests {
     #[test]
     fn current_claude_session_id_reads_last_valid_export_from_env_file() {
         let _guard = ENV_LOCK.lock().expect("env lock");
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = test_tempdir("claude-current-session-");
         let env_file = temp.path().join("claude.env");
         fs::write(
             &env_file,
@@ -624,7 +643,7 @@ mod tests {
     #[test]
     fn maybe_register_ignores_malformed_env_file_lines_after_valid_session_export() {
         let _guard = ENV_LOCK.lock().expect("env lock");
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = test_tempdir("claude-register-");
         let env_file = temp.path().join("claude.env");
         fs::write(
             &env_file,
@@ -653,7 +672,7 @@ mod tests {
     #[test]
     fn load_instance_records_ignores_legacy_records_with_unknown_fields() {
         let _guard = ENV_LOCK.lock().expect("env lock");
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = test_tempdir("claude-load-records-");
         unsafe {
             env::set_var("XDG_STATE_HOME", temp.path());
         }
@@ -695,8 +714,11 @@ mod tests {
             .tempdir_in(temp_root)
             .expect("tempdir");
         let env_file = temp.path().join("claude.env");
-        fs::write(&env_file, "export MCP_REPL_CLAUDE_SESSION_ID=sess-current\n")
-            .expect("write env file");
+        fs::write(
+            &env_file,
+            "export MCP_REPL_CLAUDE_SESSION_ID=sess-current\n",
+        )
+        .expect("write env file");
 
         unsafe {
             env::set_var("XDG_STATE_HOME", temp.path());
@@ -760,7 +782,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn write_json_atomic_replaces_existing_files() {
-        let temp = tempfile::tempdir().expect("tempdir");
+        let temp = test_tempdir("claude-write-json-");
         let path = temp.path().join("state.json");
         write_json_atomic(
             &path,
