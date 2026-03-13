@@ -55,8 +55,8 @@ pub struct ClaudeClearBinding {
 struct ClaudeClearBindingInner {
     record_path: PathBuf,
     control_path: PathBuf,
-    project_session_path: Option<PathBuf>,
-    env_file_path: Option<PathBuf>,
+    project_session_dir: Option<PathBuf>,
+    env_file_path: Mutex<Option<PathBuf>>,
     current_session_id: Mutex<String>,
     previous_session_id: Mutex<Option<String>>,
     last_control_seq: Mutex<u64>,
@@ -76,6 +76,8 @@ struct InstanceRecord {
     claude_session_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     previous_claude_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    env_file_path: Option<String>,
     backend: String,
     pid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -95,15 +97,16 @@ struct ControlRequest {
 struct ProjectSessionRecord {
     claude_session_id: String,
     project_dir: String,
+    active: bool,
     updated_unix_ms: u128,
 }
 
 impl ClaudeClearBinding {
     pub fn maybe_register(backend: Backend) -> Result<Option<Self>, WorkerError> {
-        let project_session_path = current_project_session_path();
+        let project_session_dir = current_project_session_dir();
         let env_file_path = env::var_os(CLAUDE_ENV_FILE_ENV).map(PathBuf::from);
         let Some(session_id) = current_claude_session_id_from_sources(
-            project_session_path.as_deref(),
+            project_session_dir.as_deref(),
             env_file_path.as_deref(),
         ) else {
             return Ok(None);
@@ -130,8 +133,8 @@ impl ClaudeClearBinding {
             inner: Arc::new(ClaudeClearBindingInner {
                 record_path,
                 control_path,
-                project_session_path,
-                env_file_path,
+                project_session_dir,
+                env_file_path: Mutex::new(env_file_path),
                 current_session_id: Mutex::new(session_id.clone()),
                 previous_session_id: Mutex::new(None),
                 last_control_seq: Mutex::new(0),
@@ -186,7 +189,9 @@ impl ClaudeClearBinding {
             restart_observed = true;
         }
 
-        if let Some(session_id) = self.resolve_current_session_id() {
+        if let Some((session_id, recorded_previous_session_id)) =
+            self.resolve_current_session_state()
+        {
             let mut current = self
                 .inner
                 .current_session_id
@@ -201,10 +206,13 @@ impl ClaudeClearBinding {
                 let previous_session_id = if restart_observed {
                     None
                 } else {
-                    // `/clear` can deliver SessionStart for the new Claude session before the old
-                    // SessionEnd hook has scanned instance records. Keep the old session id in the
-                    // record during that handoff so the clear-triggered restart still finds us.
-                    Some(current.clone())
+                    recorded_previous_session_id.or_else(|| {
+                        // `/clear` can deliver SessionStart for the new Claude session before the
+                        // old SessionEnd hook has scanned instance records. Keep the old session id
+                        // in the record during that handoff so the clear-triggered restart still
+                        // finds us.
+                        Some(current.clone())
+                    })
                 };
                 self.write_record(&session_id, previous_session_id.as_deref())
                     .map_err(WorkerError::Io)?;
@@ -218,17 +226,51 @@ impl ClaudeClearBinding {
         Ok(())
     }
 
-    fn resolve_current_session_id(&self) -> Option<String> {
-        current_claude_session_id_from_sources(
-            self.inner.project_session_path.as_deref(),
-            self.inner.env_file_path.as_deref(),
+    fn resolve_current_session_state(&self) -> Option<(String, Option<String>)> {
+        let record = read_instance_record(&self.inner.record_path);
+        if let Some(record) = record.as_ref() {
+            let mut env_file_path = self
+                .inner
+                .env_file_path
+                .lock()
+                .expect("claude env file path mutex poisoned");
+            *env_file_path = record.env_file_path.as_deref().map(PathBuf::from);
+        }
+        let env_file_path = self
+            .inner
+            .env_file_path
+            .lock()
+            .expect("claude env file path mutex poisoned")
+            .clone();
+        let session_id = current_claude_session_id_from_sources(
+            self.inner.project_session_dir.as_deref(),
+            env_file_path.as_deref(),
         )
+        .or_else(|| {
+            record
+                .as_ref()
+                .map(|record| record.claude_session_id.clone())
+        })?;
+        let previous_session_id = record
+            .as_ref()
+            .filter(|record| record.claude_session_id == session_id)
+            .and_then(|record| record.previous_claude_session_id.clone());
+        Some((session_id, previous_session_id))
     }
 
     fn write_record(&self, session_id: &str, previous_session_id: Option<&str>) -> io::Result<()> {
+        let env_file_path = self
+            .inner
+            .env_file_path
+            .lock()
+            .expect("claude env file path mutex poisoned")
+            .clone();
         let record = InstanceRecord {
             claude_session_id: session_id.to_string(),
             previous_claude_session_id: previous_session_id.map(str::to_string),
+            env_file_path: env_file_path
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string()),
             backend: self.inner.record_template.backend.clone(),
             pid: self.inner.record_template.pid,
             cwd: self.inner.record_template.cwd.clone(),
@@ -267,25 +309,21 @@ fn handle_session_start(input: &HookInput) -> Result<(), Box<dyn std::error::Err
     }
     let project_session_state = current_project_session_state();
     let env_file_path = env::var_os(CLAUDE_ENV_FILE_ENV).map(PathBuf::from);
-    if let Some(previous_session_id) = current_claude_session_id_from_sources(
+    if let Some(previous_session_id) = previous_claude_session_id_for_handoff(
         project_session_state
             .as_ref()
-            .map(|(_, path)| path.as_path()),
+            .map(|(_, session_dir)| session_dir.as_path()),
         env_file_path.as_deref(),
-    )
-    .filter(|previous_session_id| previous_session_id != session_id)
-    {
-        rebind_instance_records_for_session(&previous_session_id, session_id)?;
-    }
-    if let Some((project_dir, path)) = project_session_state {
-        write_json_atomic(
-            &path,
-            &ProjectSessionRecord {
-                claude_session_id: session_id.to_string(),
-                project_dir: project_dir.to_string_lossy().to_string(),
-                updated_unix_ms: unix_ms_now(),
-            },
+        session_id,
+    ) {
+        rebind_instance_records_for_session(
+            &previous_session_id,
+            session_id,
+            env_file_path.as_deref(),
         )?;
+    }
+    if let Some((project_dir, _)) = project_session_state {
+        write_project_session_record(&project_dir, session_id, true)?;
     }
     if let Some(path) = env_file_path {
         if let Some(parent) = path.parent()
@@ -304,19 +342,23 @@ fn handle_session_start(input: &HookInput) -> Result<(), Box<dyn std::error::Err
 }
 
 fn handle_session_end(input: &HookInput) -> Result<(), Box<dyn std::error::Error>> {
-    if input.session_id.trim().is_empty() {
+    let session_id = input.session_id.trim();
+    if session_id.is_empty() {
         return Ok(());
     }
     if input.hook_event_name.as_deref() != Some("SessionEnd") {
         return Ok(());
     }
+    if let Some(project_dir) = current_project_dir() {
+        write_project_session_record(&project_dir, session_id, false)?;
+    }
     if input.reason.as_deref() != Some("clear") {
-        // Keep the last per-project session id so the next SessionStart can rebind any idle
+        // Keep inactive per-session project state so the next SessionStart can rebind any idle
         // server records before a `/clear` arrives in the new Claude session.
         return Ok(());
     }
 
-    for record in load_instance_records_for_session(input.session_id.trim())? {
+    for record in load_instance_records_for_session(session_id)? {
         let path = PathBuf::from(record.control_path);
         request_restart(&path)?;
     }
@@ -324,23 +366,36 @@ fn handle_session_end(input: &HookInput) -> Result<(), Box<dyn std::error::Error
 }
 
 fn current_claude_session_id_from_sources(
-    project_session_path: Option<&Path>,
+    project_session_dir: Option<&Path>,
     env_file_path: Option<&Path>,
 ) -> Option<String> {
-    read_session_id_from_project_state(project_session_path)
+    read_current_session_id_from_project_state(project_session_dir)
         .or_else(|| read_session_id_from_env_file(env_file_path))
         .or_else(|| env::var(CLAUDE_SESSION_ID_ENV).ok())
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }
 
-fn current_project_session_state() -> Option<(PathBuf, PathBuf)> {
-    let project_dir = current_project_dir()?;
-    let session_path = project_session_path_for_dir(&project_dir).ok()?;
-    Some((project_dir, session_path))
+fn previous_claude_session_id_for_handoff(
+    project_session_dir: Option<&Path>,
+    env_file_path: Option<&Path>,
+    current_session_id: &str,
+) -> Option<String> {
+    env::var(CLAUDE_SESSION_ID_ENV)
+        .ok()
+        .or_else(|| read_session_id_from_env_file(env_file_path))
+        .or_else(|| read_latest_inactive_session_id_from_project_state(project_session_dir))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty() && value != current_session_id)
 }
 
-fn current_project_session_path() -> Option<PathBuf> {
+fn current_project_session_state() -> Option<(PathBuf, PathBuf)> {
+    let project_dir = current_project_dir()?;
+    let session_dir = project_session_dir_for_dir(&project_dir).ok()?;
+    Some((project_dir, session_dir))
+}
+
+fn current_project_session_dir() -> Option<PathBuf> {
     current_project_session_state().map(|(_, path)| path)
 }
 
@@ -350,9 +405,9 @@ fn current_project_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn project_session_path_for_dir(project_dir: &Path) -> io::Result<PathBuf> {
+fn project_session_dir_for_dir(project_dir: &Path) -> io::Result<PathBuf> {
     let sessions_dir = claude_clear_state_dir()?.join("sessions");
-    Ok(sessions_dir.join(format!("{}.json", stable_project_key(project_dir))))
+    Ok(sessions_dir.join(stable_project_key(project_dir)))
 }
 
 fn stable_project_key(project_dir: &Path) -> String {
@@ -374,12 +429,82 @@ fn stable_project_key(project_dir: &Path) -> String {
     format!("{stem}-{hash:016x}")
 }
 
-fn read_session_id_from_project_state(path: Option<&Path>) -> Option<String> {
-    let path = path?;
-    let raw = fs::read_to_string(path).ok()?;
-    let record = serde_json::from_str::<ProjectSessionRecord>(&raw).ok()?;
-    let session_id = record.claude_session_id.trim();
-    (!session_id.is_empty()).then(|| session_id.to_string())
+fn stable_session_key(session_id: &str) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in session_id.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("session-{hash:016x}")
+}
+
+fn project_session_path_for_session(project_dir: &Path, session_id: &str) -> io::Result<PathBuf> {
+    let session_dir = project_session_dir_for_dir(project_dir)?;
+    Ok(session_dir.join(format!("{}.json", stable_session_key(session_id))))
+}
+
+fn write_project_session_record(
+    project_dir: &Path,
+    session_id: &str,
+    active: bool,
+) -> io::Result<()> {
+    let path = project_session_path_for_session(project_dir, session_id)?;
+    write_json_atomic(
+        &path,
+        &ProjectSessionRecord {
+            claude_session_id: session_id.to_string(),
+            project_dir: project_dir.to_string_lossy().to_string(),
+            active,
+            updated_unix_ms: unix_ms_now(),
+        },
+    )
+}
+
+fn load_project_session_records(path: Option<&Path>) -> Vec<ProjectSessionRecord> {
+    let Some(path) = path else {
+        return Vec::new();
+    };
+    if !path.is_dir() {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return Vec::new();
+    };
+
+    let mut records = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<ProjectSessionRecord>(&raw) else {
+            continue;
+        };
+        if record.claude_session_id.trim().is_empty() {
+            continue;
+        }
+        records.push(record);
+    }
+    records
+}
+
+fn read_current_session_id_from_project_state(path: Option<&Path>) -> Option<String> {
+    load_project_session_records(path)
+        .into_iter()
+        .filter(|record| record.active)
+        .max_by_key(|record| record.updated_unix_ms)
+        .map(|record| record.claude_session_id)
+}
+
+fn read_latest_inactive_session_id_from_project_state(path: Option<&Path>) -> Option<String> {
+    load_project_session_records(path)
+        .into_iter()
+        .filter(|record| !record.active)
+        .max_by_key(|record| record.updated_unix_ms)
+        .map(|record| record.claude_session_id)
 }
 
 fn read_session_id_from_env_file(path: Option<&Path>) -> Option<String> {
@@ -417,6 +542,11 @@ fn request_restart(path: &Path) -> io::Result<()> {
             requested_unix_ms: unix_ms_now(),
         },
     )
+}
+
+fn read_instance_record(path: &Path) -> Option<InstanceRecord> {
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
 }
 
 fn read_control_request(path: &Path) -> Option<ControlRequest> {
@@ -465,6 +595,7 @@ fn load_instance_records_for_session(session_id: &str) -> io::Result<Vec<Instanc
 fn rebind_instance_records_for_session(
     previous_session_id: &str,
     session_id: &str,
+    env_file_path: Option<&Path>,
 ) -> io::Result<()> {
     let instances_dir = claude_clear_state_dir()?.join("instances");
     if !instances_dir.is_dir() {
@@ -489,6 +620,7 @@ fn rebind_instance_records_for_session(
         }
         record.claude_session_id = session_id.to_string();
         record.previous_claude_session_id = Some(previous_session_id.to_string());
+        record.env_file_path = env_file_path.map(|path| path.to_string_lossy().to_string());
         write_json_atomic(&path, &record)?;
     }
     Ok(())
@@ -670,6 +802,7 @@ mod tests {
             &InstanceRecord {
                 claude_session_id: "sess-old".to_string(),
                 previous_claude_session_id: None,
+                env_file_path: None,
                 backend: "r".to_string(),
                 pid: 1,
                 cwd: None,
@@ -722,6 +855,7 @@ mod tests {
             &InstanceRecord {
                 claude_session_id: "sess-new".to_string(),
                 previous_claude_session_id: Some("sess-old".to_string()),
+                env_file_path: None,
                 backend: "r".to_string(),
                 pid: 1,
                 cwd: None,
@@ -792,7 +926,7 @@ mod tests {
         .expect("handle session start");
 
         let session_id =
-            current_claude_session_id_from_sources(current_project_session_path().as_deref(), None)
+            current_claude_session_id_from_sources(current_project_session_dir().as_deref(), None)
                 .expect("current claude session id");
         assert_eq!(session_id, "sess-current");
 
@@ -852,12 +986,14 @@ mod tests {
         env::set_current_dir(&project_dir).expect("set current dir");
         let cwd = env::current_dir().expect("cwd after set");
 
-        let session_path = project_session_path_for_dir(&cwd).expect("project session state path");
+        let session_path = project_session_path_for_session(&cwd, "sess-from-project-state")
+            .expect("project session state path");
         write_json_atomic(
             &session_path,
             &ProjectSessionRecord {
                 claude_session_id: "sess-from-project-state".to_string(),
                 project_dir: cwd.to_string_lossy().to_string(),
+                active: true,
                 updated_unix_ms: 1,
             },
         )
