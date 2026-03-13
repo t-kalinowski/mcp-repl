@@ -5,9 +5,9 @@ Status: Proposed
 
 ## Summary
 
-Replace the current ring-buffer and post-hoc overflow reconstruction logic with a per-session unread-output sink.
+Replace the current ring-buffer and post-hoc overflow reconstruction logic with a server-owned unread-output sink.
 
-The server will continue draining worker stdout and stderr eagerly at all times using the existing dedicated reader threads. Instead of retaining a replayable transcript and inferring truncation or lifecycle state later, the server will keep only unread session output. Each `repl(...)` call will wait until the REPL becomes idle or the timeout expires, then drain the unread batch exactly once and format that drained batch for the MCP client.
+The server will continue draining worker stdout and stderr eagerly at all times using the existing dedicated reader threads. Instead of retaining a replayable transcript and inferring truncation or lifecycle state later, the server will keep only unread output that has not yet been shown. Each `repl(...)` call will wait until the REPL becomes idle or the timeout expires, then drain the unread batch exactly once and format that drained batch for the MCP client.
 
 Small drained batches will be returned inline. Oversized drained batches will return an inline preview plus a retained overflow file containing the complete batch for that one reply. That overflow file is a convenience artifact and not part of live unread-output storage.
 
@@ -49,9 +49,9 @@ The core issue is architectural. The implementation currently reconstructs persi
 
 ## Chosen Approach
 
-Use one unread-only `PendingOutput` owner per session.
+Use one unread-only `PendingOutput` owner per server-side REPL wrapper.
 
-`PendingOutput` starts in memory and stays active for the whole session, even while no tool call is currently pending. If unread output grows too large before the next drain, it promotes once to an internal spill representation on disk. When a `repl(...)` call returns, it drains all unread output exactly once and removes it from in-memory or on-disk storage. If the drained batch itself is oversized for inline presentation, the server creates a separate retained overflow artifact for that returned reply.
+`PendingOutput` starts in memory and stays active independently of any active tool call and independently of a particular worker process lifetime. If unread output grows too large before the next drain, it promotes once to an internal spill representation on disk. When a `repl(...)` call returns, it drains all unread output exactly once and removes it from in-memory or on-disk storage. If the drained batch itself is oversized for inline presentation, the server creates a separate retained overflow artifact for that returned reply.
 
 This keeps capture, unread state, and drain semantics in one place while keeping reply overflow retention as a separate convenience layer.
 
@@ -59,14 +59,14 @@ This keeps capture, unread state, and drain semantics in one place while keeping
 
 ### Session Model
 
-Each REPL session has exactly one worker, one session-owned unread-output sink, and one execution state:
+Each REPL session has at most one current worker and one execution state, but unread output is owned by the server-side REPL wrapper rather than by a particular worker lifetime:
 
 - `IdleNoUnread`
 - `IdleWithUnread`
 - `Busy`
 - `CaptureFailed`
 
-`PendingOutput` belongs to the session, not to the currently running tool call. This is required because the worker or a child process may continue writing to stdout/stderr after a previous tool call has already returned and the session is otherwise idle.
+`PendingOutput` belongs to the server-side REPL wrapper, not to the currently running tool call and not to a single worker lifetime. This is required because the worker or a child process may continue writing to stdout/stderr after a previous tool call has already returned and the session is otherwise idle, and because one returned reply may legitimately include output from before a worker exit and after the next worker respawn.
 
 There is no input queue. Plain non-empty input submitted while `Busy` is active is rejected unless the input begins with a control prefix that explicitly interrupts or restarts the session.
 
@@ -181,10 +181,11 @@ The redesign preserves these current public behaviors:
 - current internal `promptVariants`-driven prompt cleanup behavior
 - plot/image update collapsing within one returned batch
 - the separate `repl_reset` tool
+- current session-end / respawn behavior, including session-ended output being surfaced in-band and the next plain request being allowed to spawn a fresh worker session
 
 The redesign intentionally changes or retires these behaviors:
 
-- unread output ownership is session-level rather than tied to an active request
+- unread output ownership is server-level rather than tied to an active request or a single worker lifetime
 - there is no replayable full-job transcript in normal operation
 - overflow artifacts represent one returned reply batch only, never a whole job transcript
 - `overflowResponseToken` will stop being emitted
@@ -197,7 +198,7 @@ The redesign intentionally changes or retires these behaviors:
 Keep the existing dedicated reader threads for worker stdout and stderr. These threads continue to:
 
 - block on reading worker output
-- forward text chunks into the session-owned unread-output sink immediately
+- forward text chunks into the server-owned unread-output sink immediately
 
 Image events continue to be forwarded into the same sink through the existing server-side integration point.
 
@@ -215,13 +216,21 @@ Responsibilities:
 
 This unit does not own unread output. It only owns execution/busy state.
 
+It also owns session-lifecycle state:
+
+- whether the worker is alive
+- whether the previous session ended cleanly
+- whether the next plain request should spawn a fresh worker process
+
 ### 3. PendingOutput
 
-`PendingOutput` is the canonical unread-output store for the session.
+`PendingOutput` is the canonical unread-output store for the server-side REPL wrapper.
 
 It contains only output that has been captured from the worker or its descendants and not yet shown to the MCP client.
 
 Once output has been returned to the client, it is removed from `PendingOutput` and is no longer kept in memory or spill storage.
+
+`PendingOutput` must survive worker exit and respawn. A later returned batch may contain unread output captured before a worker exit and unread output captured after a fresh worker has been spawned, as long as neither portion has been shown yet.
 
 #### States
 
@@ -250,7 +259,7 @@ This spill layer exists only to support a running job that produces more unread 
 
 Recommended shape:
 
-- one per-session temporary directory
+- one server-owned temporary directory for unread spill storage
 - one append-only text file for unread text
 - image files for unread image items
 - a small ordered metadata index if needed to reconstruct text/image ordering during drain
@@ -316,7 +325,7 @@ No files are created.
 
 1. a command returns and the session becomes idle
 2. later, the worker process or one of its children emits more stdout/stderr
-3. reader threads append that output into session-owned `PendingOutput`
+3. reader threads append that output into server-owned `PendingOutput`
 4. a later `repl("")` or plain `repl(code, ...)` drains that unread prefix exactly once
 
 This is a required behavior of the redesign, not an edge-case fallback.
@@ -330,6 +339,16 @@ This is a required behavior of the redesign, not an edge-case fallback.
 5. returned batch never overlaps with earlier replies
 
 If the model polls often enough and each drained batch is small, no files are created.
+
+### Worker Exit While Idle Or Busy
+
+1. the worker exits cleanly, crashes, or the IPC/session reaches EOF
+2. any final output observed by the always-on reader threads is appended into server-owned `PendingOutput`
+3. the execution-state controller marks the session as ended and not busy
+4. the next drain surfaces the session-ended output in-band using the same public behavior this repo already exposes today
+5. the following plain request is allowed to spawn a fresh worker session
+
+The redesign preserves the existing user-facing expectation that session end is surfaced in-band rather than hidden in out-of-band metadata. If unread output still exists when the fresh worker later emits new output, both portions may appear together in one later returned batch.
 
 ### Running Job With Internal Spill
 
@@ -385,9 +404,29 @@ Implementation should prefer a small number of explicit failures over hidden fal
 
 ### Overflow Artifact Write Failure
 
-If writing a retained overflow artifact fails, the reply should still return the inline preview plus a clear message that the full reply could not be persisted.
+If writing a retained overflow artifact fails, the reply stays bounded and lossy.
 
-This is a presentation failure, not a capture failure. It must not corrupt or duplicate unread output semantics.
+Required behavior:
+
+- the drained batch has already been removed from unread storage, so the server must not rely on re-reading it later
+- the server still returns only the normal bounded inline response for that reply, not the full drained batch
+- the bounded inline response must include a short notice that overflow persistence failed because the server could not write the artifact
+- any undisplayed tail from that drained batch is dropped
+
+This is a rare presentation failure, not a capture failure. It must not duplicate output or flood the client context with an oversized inline fallback.
+
+### Worker Exit / Respawn
+
+The redesign preserves the current model where worker exit is not automatically fatal to the whole session abstraction.
+
+Required behavior:
+
+- if the worker exits or the session ends, the session leaves `Busy` and becomes idle
+- any unread output already captured before the exit remains drainable exactly once
+- a subsequent plain `repl(code, ...)` request is allowed to spawn a fresh worker session unless the session is in the latched `CaptureFailed` state
+- `repl_reset` also remains a valid explicit respawn path
+
+The implementation plan should keep the current in-band session-end notices and restart notices consistent with today's public transcripts.
 
 ## Testing Strategy
 
@@ -411,10 +450,14 @@ Required coverage:
 - internal spill promotion for long-running unread output
 - latched `CaptureFailed` behavior when spill promotion fails without an active request in flight
 - oversized drained batch creating a self-contained overflow artifact for that reply only
+- overflow artifact write failure returning the normal bounded inline response plus a short write-failure notice
 - multiple oversized polls producing separate overflow artifacts with no overlap
 - retention window eviction for old overflow artifacts
 - missing older overflow files simply disappearing after eviction
 - legacy `codex/overflow-response-consumed` notification being accepted as a no-op during compatibility
+- worker exit while busy still leaving already-captured unread output drainable once
+- worker exit while idle preserving current in-band session-end behavior
+- next plain request after worker exit spawning a fresh worker session
 
 Regression tests should avoid asserting internal capture implementation details such as ring offsets or transport-hook bookkeeping, because those are intentionally being removed.
 
@@ -433,7 +476,7 @@ The implementation plan should prefer a small number of well-bounded units:
 
 - request parser for control-byte prefixes
 - session execution-state controller
-- session-owned pending unread-output sink
+- server-owned pending unread-output sink
 - reply batch formatter
 - overflow artifact retention manager
 
