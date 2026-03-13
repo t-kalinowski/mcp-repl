@@ -292,7 +292,9 @@ fn read_session_id_from_env_file(path: Option<&Path>) -> Option<String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some(line) = line.strip_prefix("export ") else {
+            continue;
+        };
         let Some((key, value)) = line.split_once('=') else {
             continue;
         };
