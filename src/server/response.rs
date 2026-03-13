@@ -52,7 +52,13 @@ struct RetainedOverflowFile {
 
 struct SentOverflowResponse {
     response_key: OverflowResponseKey,
+    response_token: String,
     sent_at: Instant,
+}
+
+struct PendingOverflowResponse {
+    response_key: OverflowResponseKey,
+    response_token: String,
 }
 
 enum RetainedOverflowPathKind {
@@ -99,8 +105,8 @@ struct OverflowFileStoreInner {
     max_overflow_files: usize,
     retained_files: Mutex<VecDeque<RetainedOverflowFile>>,
     active_responses: Mutex<HashMap<OverflowResponseKey, usize>>,
-    pending_send_responses: Mutex<HashMap<String, OverflowResponseKey>>,
-    consumed_response_ids: Mutex<HashSet<String>>,
+    pending_send_responses: Mutex<HashMap<String, PendingOverflowResponse>>,
+    consumed_response_tokens: Mutex<HashSet<String>>,
     sent_responses_waiting_for_next_request: Mutex<VecDeque<SentOverflowResponse>>,
     #[cfg(test)]
     retain_hook: Mutex<Option<RetainHook>>,
@@ -149,7 +155,7 @@ impl OverflowFileStore {
                         retained_files: Mutex::new(VecDeque::new()),
                         active_responses: Mutex::new(HashMap::new()),
                         pending_send_responses: Mutex::new(HashMap::new()),
-                        consumed_response_ids: Mutex::new(HashSet::new()),
+                        consumed_response_tokens: Mutex::new(HashSet::new()),
                         sent_responses_waiting_for_next_request: Mutex::new(VecDeque::new()),
                         #[cfg(test)]
                         retain_hook: Mutex::new(None),
@@ -168,7 +174,7 @@ impl OverflowFileStore {
                         retained_files: Mutex::new(VecDeque::new()),
                         active_responses: Mutex::new(HashMap::new()),
                         pending_send_responses: Mutex::new(HashMap::new()),
-                        consumed_response_ids: Mutex::new(HashSet::new()),
+                        consumed_response_tokens: Mutex::new(HashSet::new()),
                         sent_responses_waiting_for_next_request: Mutex::new(VecDeque::new()),
                         #[cfg(test)]
                         retain_hook: Mutex::new(None),
@@ -202,7 +208,7 @@ impl OverflowFileStore {
                 retained_files: Mutex::new(VecDeque::new()),
                 active_responses: Mutex::new(HashMap::new()),
                 pending_send_responses: Mutex::new(HashMap::new()),
-                consumed_response_ids: Mutex::new(HashSet::new()),
+                consumed_response_tokens: Mutex::new(HashSet::new()),
                 sent_responses_waiting_for_next_request: Mutex::new(VecDeque::new()),
                 retain_hook: Mutex::new(None),
                 _temp_dir: None,
@@ -243,16 +249,19 @@ impl OverflowFileStore {
 
     pub(crate) fn activate_response_send(&self, metadata: &OverflowMetadata) {
         let response_key = OverflowResponseKey::from_metadata(metadata);
-        self.inner
-            .pending_send_responses
-            .lock()
-            .unwrap()
-            .insert(metadata.request_id.clone(), response_key.clone());
+        let response_token = overflow_response_token(metadata);
+        self.inner.pending_send_responses.lock().unwrap().insert(
+            metadata.request_id.clone(),
+            PendingOverflowResponse {
+                response_key: response_key.clone(),
+                response_token,
+            },
+        );
         self.increment_active_response(&response_key);
     }
 
     pub(crate) fn finish_response_send(&self, request_id: &str) {
-        let Some(response_key) = self
+        let Some(pending_response) = self
             .inner
             .pending_send_responses
             .lock()
@@ -263,12 +272,12 @@ impl OverflowFileStore {
         };
         let was_consumed = self
             .inner
-            .consumed_response_ids
+            .consumed_response_tokens
             .lock()
             .unwrap()
-            .remove(request_id);
+            .remove(&pending_response.response_token);
         if was_consumed {
-            self.release_response(&response_key);
+            self.release_response(&pending_response.response_key);
             return;
         }
         let stale_responses = {
@@ -278,7 +287,8 @@ impl OverflowFileStore {
                 .lock()
                 .unwrap();
             sent_responses.push_back(SentOverflowResponse {
-                response_key,
+                response_key: pending_response.response_key,
+                response_token: pending_response.response_token,
                 sent_at: Instant::now(),
             });
             drain_expired_sent_responses(&mut sent_responses)
@@ -288,31 +298,84 @@ impl OverflowFileStore {
         }
     }
 
-    pub(crate) fn mark_response_consumed(&self, request_id: &str) {
-        if let Some(response_key) = remove_sent_response(
-            &mut self
+    pub(crate) fn mark_response_consumed(
+        &self,
+        response_token: Option<&str>,
+        request_id: Option<&str>,
+    ) {
+        if let Some(response_token) = response_token {
+            if let Some(response_key) = remove_sent_response_by_token(
+                &mut self
+                    .inner
+                    .sent_responses_waiting_for_next_request
+                    .lock()
+                    .unwrap(),
+                response_token,
+            ) {
+                self.release_response(&response_key);
+                return;
+            }
+
+            let should_defer_release = self
+                .inner
+                .pending_send_responses
+                .lock()
+                .unwrap()
+                .values()
+                .any(|response| response.response_token == response_token);
+            if should_defer_release {
+                self.inner
+                    .consumed_response_tokens
+                    .lock()
+                    .unwrap()
+                    .insert(response_token.to_string());
+            }
+            return;
+        }
+
+        let Some(request_id) = request_id else {
+            return;
+        };
+
+        let sent_match_count = sent_response_match_count(
+            &self
                 .inner
                 .sent_responses_waiting_for_next_request
                 .lock()
                 .unwrap(),
             request_id,
-        ) {
-            self.release_response(&response_key);
+        );
+        let pending_match_count = pending_response_match_count(
+            &self.inner.pending_send_responses.lock().unwrap(),
+            request_id,
+        );
+        if sent_match_count + pending_match_count != 1 {
             return;
         }
 
-        let should_defer_release = self
-            .inner
-            .pending_send_responses
-            .lock()
-            .unwrap()
-            .contains_key(request_id);
-        if should_defer_release {
+        if sent_match_count == 1 {
+            if let Some(response_key) = remove_unique_sent_response_by_request_id(
+                &mut self
+                    .inner
+                    .sent_responses_waiting_for_next_request
+                    .lock()
+                    .unwrap(),
+                request_id,
+            ) {
+                self.release_response(&response_key);
+            }
+            return;
+        }
+
+        if let Some(response_token) = find_unique_pending_response_token_by_request_id(
+            &self.inner.pending_send_responses.lock().unwrap(),
+            request_id,
+        ) {
             self.inner
-                .consumed_response_ids
+                .consumed_response_tokens
                 .lock()
                 .unwrap()
-                .insert(request_id.to_string());
+                .insert(response_token);
         }
     }
 
@@ -453,7 +516,11 @@ pub(crate) fn finalize_batch(
     // Preserve backend error detection (for prompt normalization, paging decisions, etc.) but
     // do not map it to MCP tool errors.
     let _ = is_error;
-    CallToolResult::success(contents)
+    let mut result = CallToolResult::success(contents);
+    if overflow_store.is_some() {
+        add_overflow_response_meta(&mut result, &overflow_metadata);
+    }
+    result
 }
 
 fn ensure_nonempty_contents(contents: &mut Vec<Content>) {
@@ -937,18 +1004,6 @@ fn cleanup_retained_files(
     }
 }
 
-fn remove_sent_response(
-    sent_responses: &mut VecDeque<SentOverflowResponse>,
-    request_id: &str,
-) -> Option<OverflowResponseKey> {
-    let response_idx = sent_responses
-        .iter()
-        .position(|response| response.response_key.request_id == request_id)?;
-    sent_responses
-        .remove(response_idx)
-        .map(|response| response.response_key)
-}
-
 fn drain_expired_sent_responses(
     sent_responses: &mut VecDeque<SentOverflowResponse>,
 ) -> Vec<OverflowResponseKey> {
@@ -963,6 +1018,91 @@ fn drain_expired_sent_responses(
         .drain(..expired_count)
         .map(|response| response.response_key)
         .collect()
+}
+
+fn remove_sent_response_by_token(
+    sent_responses: &mut VecDeque<SentOverflowResponse>,
+    response_token: &str,
+) -> Option<OverflowResponseKey> {
+    let response_idx = sent_responses
+        .iter()
+        .position(|response| response.response_token == response_token)?;
+    sent_responses
+        .remove(response_idx)
+        .map(|response| response.response_key)
+}
+
+fn remove_unique_sent_response_by_request_id(
+    sent_responses: &mut VecDeque<SentOverflowResponse>,
+    request_id: &str,
+) -> Option<OverflowResponseKey> {
+    let mut matches = sent_responses
+        .iter()
+        .enumerate()
+        .filter(|(_, response)| response.response_key.request_id == request_id)
+        .map(|(idx, _)| idx);
+    let response_idx = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    sent_responses
+        .remove(response_idx)
+        .map(|response| response.response_key)
+}
+
+fn sent_response_match_count(
+    sent_responses: &VecDeque<SentOverflowResponse>,
+    request_id: &str,
+) -> usize {
+    sent_responses
+        .iter()
+        .filter(|response| response.response_key.request_id == request_id)
+        .count()
+}
+
+fn find_unique_pending_response_token_by_request_id(
+    pending_send_responses: &HashMap<String, PendingOverflowResponse>,
+    request_id: &str,
+) -> Option<String> {
+    let mut matches = pending_send_responses
+        .values()
+        .filter(|response| response.response_key.request_id == request_id)
+        .map(|response| response.response_token.clone());
+    let response_token = matches.next()?;
+    if matches.next().is_some() {
+        return None;
+    }
+    Some(response_token)
+}
+
+fn pending_response_match_count(
+    pending_send_responses: &HashMap<String, PendingOverflowResponse>,
+    request_id: &str,
+) -> usize {
+    pending_send_responses
+        .values()
+        .filter(|response| response.response_key.request_id == request_id)
+        .count()
+}
+
+fn add_overflow_response_meta(result: &mut CallToolResult, metadata: &OverflowMetadata) {
+    let mut meta = result.meta.take().unwrap_or_default();
+    meta.0.insert(
+        "mcpConsole".to_string(),
+        json!({
+            "overflowResponseToken": overflow_response_token(metadata),
+        }),
+    );
+    result.meta = Some(meta);
+}
+
+pub(crate) fn overflow_response_token(metadata: &OverflowMetadata) -> String {
+    json!([
+        metadata.tool_name,
+        metadata.turn_number,
+        metadata.request_id,
+    ])
+    .to_string()
 }
 
 fn is_protected_response(

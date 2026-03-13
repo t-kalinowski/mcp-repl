@@ -11,7 +11,7 @@ use rmcp::ServiceExt;
 use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CallToolRequestParams, ClientNotification, ClientRequest, CustomNotification, CustomRequest,
-    RawContent,
+    RawContent, RequestId,
 };
 use rmcp::service::{PeerRequestOptions, ServiceError};
 use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
@@ -295,12 +295,28 @@ fn tool_result_snapshot(result: &rmcp::model::CallToolResult) -> SnapshotCallToo
     }
 }
 
+fn overflow_response_token(result: &rmcp::model::CallToolResult) -> Option<String> {
+    result
+        .meta
+        .as_ref()?
+        .0
+        .get("mcpConsole")?
+        .get("overflowResponseToken")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
 pub struct McpTestSession {
     service: rmcp::service::RunningService<rmcp::service::RoleClient, TestClient>,
     steps: Vec<SnapshotStep>,
     server_pid: Option<u32>,
     backend: TestBackend,
-    last_consumed_request_id: Mutex<Option<String>>,
+    last_consumed_response: Mutex<Option<OverflowResponseConsumedAck>>,
+}
+
+struct OverflowResponseConsumedAck {
+    request_id: RequestId,
+    response_token: String,
 }
 
 impl McpTestSession {
@@ -309,8 +325,8 @@ impl McpTestSession {
     }
 
     async fn flush_consumed_response_notification(&self) {
-        let previous_request_id = self.last_consumed_request_id.lock().unwrap().take();
-        let Some(request_id) = previous_request_id else {
+        let previous_response = self.last_consumed_response.lock().unwrap().take();
+        let Some(previous_response) = previous_response else {
             return;
         };
         let _ = self
@@ -318,7 +334,10 @@ impl McpTestSession {
             .send_notification(ClientNotification::CustomNotification(
                 CustomNotification::new(
                     OVERFLOW_RESPONSE_CONSUMED_METHOD,
-                    Some(json!({ "request_id": request_id })),
+                    Some(json!({
+                        "request_id": previous_response.request_id.into_json_value(),
+                        "response_token": previous_response.response_token,
+                    })),
                 ),
             ))
             .await;
@@ -445,7 +464,7 @@ impl McpTestSession {
                 PeerRequestOptions::no_options(),
             )
             .await?;
-        let request_id = handle.id.to_string();
+        let request_id = handle.id.clone();
         let result = match handle.await_response().await? {
             rmcp::model::ServerResult::CallToolResult(result) => result,
             other => {
@@ -455,7 +474,11 @@ impl McpTestSession {
                 )));
             }
         };
-        *self.last_consumed_request_id.lock().unwrap() = Some(request_id);
+        *self.last_consumed_response.lock().unwrap() =
+            overflow_response_token(&result).map(|response_token| OverflowResponseConsumedAck {
+                request_id,
+                response_token,
+            });
         Ok(result)
     }
 
@@ -1054,7 +1077,7 @@ pub async fn spawn_server_with_args_env(
         steps: Vec::new(),
         server_pid,
         backend,
-        last_consumed_request_id: Mutex::new(None),
+        last_consumed_response: Mutex::new(None),
     })
 }
 

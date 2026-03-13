@@ -71,6 +71,17 @@ fn extract_all_paths(text: &str, marker: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+fn overflow_response_token(result: &CallToolResult) -> Option<String> {
+    result
+        .meta
+        .as_ref()?
+        .0
+        .get("mcpConsole")?
+        .get("overflowResponseToken")?
+        .as_str()
+        .map(ToOwned::to_owned)
+}
+
 fn backend_unavailable(text: &str) -> bool {
     text.contains("Fatal error: cannot create 'R_TempDir'")
         || text.contains("failed to start R session")
@@ -181,6 +192,22 @@ impl RawMcpServer {
         Ok(serde_json::from_value(result)?)
     }
 
+    async fn send_overflow_consumed_ack(
+        &mut self,
+        request_id: i64,
+        response_token: &str,
+    ) -> TestResult<()> {
+        self.write_json(&json!({
+            "jsonrpc": "2.0",
+            "method": "codex/overflow-response-consumed",
+            "params": {
+                "request_id": request_id,
+                "response_token": response_token,
+            }
+        }))
+        .await
+    }
+
     async fn write_json(&mut self, value: &Value) -> TestResult<()> {
         let mut line = serde_json::to_vec(value)?;
         line.push(b'\n');
@@ -257,6 +284,23 @@ fn any_backend_unavailable(results: &[&CallToolResult]) -> bool {
 fn response_snapshot(result: &CallToolResult) -> serde_json::Value {
     let mut value = serde_json::to_value(result)
         .unwrap_or_else(|_| serde_json::json!({"error": "failed to serialize response"}));
+    if let Some(meta) = value.get_mut("_meta").and_then(|meta| meta.as_object_mut()) {
+        if let Some(mcp_console) = meta
+            .get_mut("mcpConsole")
+            .and_then(|mcp_console| mcp_console.as_object_mut())
+        {
+            mcp_console.remove("overflowResponseToken");
+            if mcp_console.is_empty() {
+                meta.remove("mcpConsole");
+            }
+        }
+        if meta.is_empty() {
+            value
+                .as_object_mut()
+                .expect("response snapshot must be an object")
+                .remove("_meta");
+        }
+    }
     if let Some(content) = value
         .get_mut("content")
         .and_then(|content| content.as_array_mut())
@@ -1519,6 +1563,97 @@ async fn raw_transport_releases_old_sent_overflow_paths_without_custom_ack() -> 
         retained_file_count <= 64,
         "expected raw transport replies without custom acks to release old sent overflow files and stay within the cap, got {retained_file_count} files in {overflow_root:?}"
     );
+
+    server.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn raw_transport_consumed_ack_uses_response_token_for_reused_numeric_request_ids()
+-> TestResult<()> {
+    let mut server = RawMcpServer::spawn().await?;
+    server.initialize().await?;
+
+    let first_input = "\
+options(console.plot.width = 2, console.plot.height = 2, console.plot.dpi = 10); \
+for (i in 1:20) plot(i:(i + 9))";
+    let second_input = "\
+options(console.plot.width = 2, console.plot.height = 2, console.plot.dpi = 10); \
+for (i in 21:40) plot(i:(i + 9))";
+
+    server.call_tool(7, first_input, 120_000).await?;
+    let first_result = server.read_call_tool_result(7).await?;
+    server.call_tool(7, second_input, 120_000).await?;
+    let second_result = server.read_call_tool_result(7).await?;
+    let first_text = result_text(&first_result);
+    let second_text = result_text(&second_result);
+    if any_backend_unavailable(&[&first_result, &second_result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        server.cancel().await?;
+        return Ok(());
+    }
+
+    assert_ne!(
+        first_result.is_error,
+        Some(true),
+        "first reused-id overflow batch reported an error: {first_text}"
+    );
+    assert_ne!(
+        second_result.is_error,
+        Some(true),
+        "second reused-id overflow batch reported an error: {second_text}"
+    );
+
+    let first_paths = extract_all_paths(&first_text, "full image at ");
+    let second_paths = extract_all_paths(&second_text, "full image at ");
+    assert_eq!(
+        first_paths.len(),
+        16,
+        "expected sixteen overflow image paths in the first reused-id reply, got: {first_text:?}"
+    );
+    assert_eq!(
+        second_paths.len(),
+        16,
+        "expected sixteen overflow image paths in the second reused-id reply, got: {second_text:?}"
+    );
+
+    let second_token = overflow_response_token(&second_result).ok_or_else(|| {
+        format!("expected overflow response token in second reply meta, got: {second_result:?}")
+    })?;
+    server.send_overflow_consumed_ack(7, &second_token).await?;
+
+    for (request_id, start) in [(8, 41), (9, 61), (10, 81)] {
+        let input = format!(
+            "options(console.plot.width = 2, console.plot.height = 2, console.plot.dpi = 10); for (i in {start}:{}) plot(i:(i + 9))",
+            start + 19
+        );
+        server.call_tool(request_id, &input, 120_000).await?;
+        let result = server.read_call_tool_result(request_id).await?;
+        let text = result_text(&result);
+        if backend_unavailable(&text) {
+            eprintln!("plot_images backend unavailable in this environment; skipping");
+            server.cancel().await?;
+            return Ok(());
+        }
+        assert_ne!(
+            result.is_error,
+            Some(true),
+            "overflow pressure batch {request_id} reported an error: {text}"
+        );
+    }
+
+    for path in first_paths {
+        assert!(
+            path.exists(),
+            "expected the unacked first reused-id reply to stay pinned while later cap pressure evicts the explicitly acked second reply: {path:?}"
+        );
+    }
+    for path in second_paths {
+        assert!(
+            !path.exists(),
+            "expected the explicitly acked second reused-id reply to become evictable even though it reused numeric request id 7: {path:?}"
+        );
+    }
 
     server.cancel().await?;
     Ok(())

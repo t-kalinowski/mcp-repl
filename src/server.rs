@@ -2,7 +2,7 @@ use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, Content, CustomNotification, CustomRequest, CustomResult, ErrorCode,
-    ErrorData as McpError, JsonObject, ProtocolVersion, ServerCapabilities, ServerInfo,
+    ErrorData as McpError, JsonObject, ProtocolVersion, RequestId, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext;
 use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -51,7 +51,10 @@ struct SharedServer {
 
 #[derive(Deserialize)]
 struct OverflowResponseConsumedNotification {
-    request_id: String,
+    #[serde(default)]
+    request_id: Option<RequestId>,
+    #[serde(default)]
+    response_token: Option<String>,
 }
 
 impl SharedServer {
@@ -220,7 +223,14 @@ impl SharedServer {
                 }
             };
             if let Some(overflow_store) = self.overflow_store.as_ref() {
-                overflow_store.mark_response_consumed(&consumed.request_id);
+                let request_id = consumed
+                    .request_id
+                    .as_ref()
+                    .map(|request_id| request_id.to_string());
+                overflow_store.mark_response_consumed(
+                    consumed.response_token.as_deref(),
+                    request_id.as_deref(),
+                );
             }
             return;
         }

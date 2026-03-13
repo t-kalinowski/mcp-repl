@@ -41,6 +41,23 @@ fn result_text(result: &CallToolResult) -> String {
 fn response_snapshot(result: &CallToolResult) -> serde_json::Value {
     let mut value = serde_json::to_value(result)
         .unwrap_or_else(|_| serde_json::json!({"error": "failed to serialize response"}));
+    if let Some(meta) = value.get_mut("_meta").and_then(|meta| meta.as_object_mut()) {
+        if let Some(mcp_console) = meta
+            .get_mut("mcpConsole")
+            .and_then(|mcp_console| mcp_console.as_object_mut())
+        {
+            mcp_console.remove("overflowResponseToken");
+            if mcp_console.is_empty() {
+                meta.remove("mcpConsole");
+            }
+        }
+        if meta.is_empty() {
+            value
+                .as_object_mut()
+                .expect("response snapshot must be an object")
+                .remove("_meta");
+        }
+    }
     if let Some(content) = value
         .get_mut("content")
         .and_then(|content| content.as_array_mut())
