@@ -74,7 +74,7 @@ impl SharedServer {
                     .lock()
                     .expect("claude clear binding mutex poisoned");
                 if claude_clear_binding.is_none() {
-                    *claude_clear_binding = ClaudeClearBinding::maybe_register(backend)?;
+                    *claude_clear_binding = ClaudeClearBinding::maybe_register_late(backend)?;
                 }
                 if let Some(binding) = claude_clear_binding.as_ref() {
                     binding.sync(&mut worker)?;

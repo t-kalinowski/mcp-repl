@@ -112,6 +112,17 @@ struct ProjectSessionRecord {
 
 impl ClaudeClearBinding {
     pub fn maybe_register(backend: Backend) -> Result<Option<Self>, WorkerError> {
+        Self::maybe_register_with_initial_seq(backend, 0)
+    }
+
+    pub fn maybe_register_late(backend: Backend) -> Result<Option<Self>, WorkerError> {
+        Self::maybe_register_with_initial_seq(backend, 1)
+    }
+
+    fn maybe_register_with_initial_seq(
+        backend: Backend,
+        initial_control_seq: u64,
+    ) -> Result<Option<Self>, WorkerError> {
         let project_session_dir = current_project_session_dir();
         let env_file_path = env::var_os(CLAUDE_ENV_FILE_ENV).map(PathBuf::from);
         let Some(session_id) = current_claude_session_id_from_sources(
@@ -161,7 +172,7 @@ impl ClaudeClearBinding {
         write_control_request(
             &binding.inner.control_path,
             &ControlRequest {
-                seq: 0,
+                seq: initial_control_seq,
                 op: "restart".to_string(),
                 requested_unix_ms: started_unix_ms,
             },

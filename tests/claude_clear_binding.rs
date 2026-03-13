@@ -239,6 +239,73 @@ async fn claude_clear_restart_binds_after_session_start_hook() -> TestResult<()>
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn claude_clear_late_session_binding_restarts_prebound_worker_state() -> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempfile::tempdir()?;
+    let project_dir = temp.path().join("project");
+    fs::create_dir_all(&project_dir)?;
+    let exe = resolve_exe()?;
+
+    let mut session = common::spawn_server_with_env_vars(vec![
+        (
+            "XDG_STATE_HOME".to_string(),
+            temp.path().to_string_lossy().to_string(),
+        ),
+        (
+            "CLAUDE_PROJECT_DIR".to_string(),
+            project_dir.to_string_lossy().to_string(),
+        ),
+    ])
+    .await?;
+
+    let set_var = session.write_stdin_raw_with("x <- 1", Some(10.0)).await?;
+    let set_var_text = result_text(&set_var);
+    if backend_unavailable(&set_var_text) {
+        eprintln!("claude_clear_binding backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&set_var_text) {
+        eprintln!("claude_clear_binding worker remained busy before late bind; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    run_claude_hook(
+        &exe,
+        temp.path(),
+        &project_dir,
+        "session-start",
+        json!({
+            "hook_event_name": "SessionStart",
+            "session_id": "sess-current"
+        }),
+    )?;
+
+    let after_bind = session
+        .write_stdin_raw_with("print(exists(\"x\"))", Some(10.0))
+        .await?;
+    let after_bind_text = result_text(&after_bind);
+    if backend_unavailable(&after_bind_text) {
+        eprintln!("claude_clear_binding backend unavailable after late bind restart; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if busy_response(&after_bind_text) {
+        eprintln!("claude_clear_binding worker remained busy after late bind; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+    assert!(
+        after_bind_text.contains("FALSE"),
+        "expected late session binding to restart the worker before the first bound request, got: {after_bind_text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn claude_clear_rebinds_idle_server_before_new_session_clears() -> TestResult<()> {
     let _guard = test_guard();
     let temp = tempfile::tempdir()?;

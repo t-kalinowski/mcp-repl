@@ -608,25 +608,19 @@ fn upsert_claude_settings_hooks(
     let Some(root_obj) = root.as_object_mut() else {
         return Err("claude settings root must be a JSON object".into());
     };
-    let hooks = root_obj
-        .entry("hooks".to_string())
-        .or_insert_with(|| JsonValue::Object(JsonMap::new()));
-    let Some(hooks_obj) = hooks.as_object_mut() else {
-        return Err("claude settings `hooks` must be a JSON object".into());
-    };
 
     let session_start_command = claude_hook_command(command, args, "session-start");
     let session_end_command = claude_hook_command(command, args, "session-end");
     for matcher in CLAUDE_HOOK_SESSION_START_MATCHERS {
         upsert_claude_hook_command(
-            hooks_obj,
+            root_obj,
             "SessionStart",
             Some(matcher),
             &session_start_command,
         )?;
     }
     for matcher in CLAUDE_HOOK_SESSION_END_MATCHERS {
-        upsert_claude_hook_command(hooks_obj, "SessionEnd", Some(matcher), &session_end_command)?;
+        upsert_claude_hook_command(root_obj, "SessionEnd", Some(matcher), &session_end_command)?;
     }
 
     let serialized = serde_json::to_string_pretty(&root)?;
@@ -644,7 +638,7 @@ fn upsert_claude_hook_command(
         .entry(event.to_string())
         .or_insert_with(|| JsonValue::Array(Vec::new()));
     let Some(entries_arr) = entries.as_array_mut() else {
-        return Err(format!("claude settings `hooks.{event}` must be an array").into());
+        return Err(format!("claude settings `{event}` must be an array").into());
     };
 
     if let Some(existing) = entries_arr
@@ -1534,7 +1528,7 @@ name="demo"
 
         let text = fs::read_to_string(&settings).expect("read settings");
         let root: JsonValue = serde_json::from_str(&text).expect("parse json");
-        let session_start = root["hooks"]["SessionStart"]
+        let session_start = root["SessionStart"]
             .as_array()
             .expect("session start hooks array");
         assert!(
@@ -1547,7 +1541,7 @@ name="demo"
             }),
             "expected startup SessionStart hook"
         );
-        let session_end = root["hooks"]["SessionEnd"]
+        let session_end = root["SessionEnd"]
             .as_array()
             .expect("session end hooks array");
         for matcher in CLAUDE_HOOK_SESSION_END_MATCHERS {
@@ -1576,7 +1570,7 @@ name="demo"
 
         let text = fs::read_to_string(&settings).expect("read settings");
         let root: JsonValue = serde_json::from_str(&text).expect("parse json");
-        let session_start = root["hooks"]["SessionStart"]
+        let session_start = root["SessionStart"]
             .as_array()
             .expect("session start hooks array");
         let startup_count = session_start
@@ -1598,17 +1592,15 @@ name="demo"
         let settings = dir.path().join("settings.json");
 
         let stale = serde_json::json!({
-            "hooks": {
-                "SessionStart": [
-                    {
-                        "matcher": "startup",
-                        "hooks": [
-                            {"type": "command", "command": "/opt/old/mcp-repl claude-hook session-start"},
-                            {"type": "command", "command": "echo keep-me"}
-                        ]
-                    }
-                ]
-            }
+            "SessionStart": [
+                {
+                    "matcher": "startup",
+                    "hooks": [
+                        {"type": "command", "command": "/opt/old/mcp-repl claude-hook session-start"},
+                        {"type": "command", "command": "echo keep-me"}
+                    ]
+                }
+            ]
         });
         fs::write(
             &settings,
@@ -1621,7 +1613,7 @@ name="demo"
 
         let text = fs::read_to_string(&settings).expect("read settings");
         let root: JsonValue = serde_json::from_str(&text).expect("parse json");
-        let session_start = root["hooks"]["SessionStart"]
+        let session_start = root["SessionStart"]
             .as_array()
             .expect("session start hooks array");
         let startup = session_start
