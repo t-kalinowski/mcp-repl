@@ -9,6 +9,8 @@ static OUTPUT_RING: OnceLock<Arc<OutputRing>> = OnceLock::new();
 static LAST_REPLY_MARKER_OFFSET: AtomicU64 = AtomicU64::new(u64::MAX);
 
 pub(crate) const OUTPUT_RING_CAPACITY_BYTES: usize = 2 * 1024 * 1024;
+pub(crate) const OUTPUT_TRUNCATION_NOTICE: &str =
+    "[repl] output truncated (older output dropped)\n";
 const STDERR_PREFIX: &[u8] = b"stderr: ";
 
 pub(crate) fn ensure_output_ring(capacity_bytes: usize) -> Arc<OutputRing> {
@@ -542,7 +544,7 @@ impl OutputRing {
         extra_bytes: usize,
     ) {
         let notice_kind = OutputEventKind::Text {
-            text: "[repl] output truncated (older output dropped)\n".to_string(),
+            text: OUTPUT_TRUNCATION_NOTICE.to_string(),
             is_stderr: false,
         };
         let notice_bytes = event_size_bytes(&notice_kind);

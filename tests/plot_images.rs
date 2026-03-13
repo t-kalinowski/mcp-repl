@@ -1024,6 +1024,10 @@ plot(1:10)
         text.contains("output truncated"),
         "expected truncation notice, got: {text:?}"
     );
+    assert!(
+        overflow_path(&text).is_none(),
+        "worker-truncated output must not advertise a recoverable full response file: {text:?}"
+    );
 
     let images = extract_images(&result);
     assert!(

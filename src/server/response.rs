@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::{Builder, TempDir};
 
+use crate::output_capture::OUTPUT_TRUNCATION_NOTICE;
 use crate::worker_protocol::{WorkerContent, WorkerReply};
 
 const INLINE_TEXT_LIMIT_BYTES: usize = 10 * 1024;
@@ -349,40 +350,56 @@ fn maybe_overflow_text_contents(
     else {
         return contents;
     };
+    let worker_output_was_truncated = contents
+        .iter()
+        .filter_map(content_text)
+        .any(|text| text == OUTPUT_TRUNCATION_NOTICE);
 
-    let overflow_notice = match overflow_store {
-        Some(store) => {
-            let overflow_path = store.overflow_path(overflow_metadata);
-            match write_overflow_response_file(store, overflow_metadata, &overflow_path, &contents)
-            {
-                Ok(mut persisted_image_paths) => {
-                    persisted_image_paths.push(overflow_path.clone());
-                    for path in persisted_image_paths {
-                        let kind = if path == overflow_path {
-                            RetainedOverflowPathKind::ResponseFile
-                        } else {
-                            RetainedOverflowPathKind::ArtifactFile
-                        };
-                        if let Err(err) =
-                            store.retain_written_file(path.clone(), overflow_metadata, kind)
-                        {
-                            log_overflow_retention_failure(
-                                Some(store.root_path()),
-                                overflow_metadata,
-                                &err.path,
-                                &err.err,
-                            );
+    let overflow_notice = if worker_output_was_truncated {
+        overflow_notice_worker_truncated()
+    } else {
+        match overflow_store {
+            Some(store) => {
+                let overflow_path = store.overflow_path(overflow_metadata);
+                match write_overflow_response_file(
+                    store,
+                    overflow_metadata,
+                    &overflow_path,
+                    &contents,
+                ) {
+                    Ok(mut persisted_image_paths) => {
+                        persisted_image_paths.push(overflow_path.clone());
+                        for path in persisted_image_paths {
+                            let kind = if path == overflow_path {
+                                RetainedOverflowPathKind::ResponseFile
+                            } else {
+                                RetainedOverflowPathKind::ArtifactFile
+                            };
+                            if let Err(err) =
+                                store.retain_written_file(path.clone(), overflow_metadata, kind)
+                            {
+                                log_overflow_retention_failure(
+                                    Some(store.root_path()),
+                                    overflow_metadata,
+                                    &err.path,
+                                    &err.err,
+                                );
+                            }
                         }
+                        overflow_notice_prefix(Some(&overflow_path))
                     }
-                    overflow_notice_prefix(Some(&overflow_path))
-                }
-                Err(err) => {
-                    log_overflow_write_failure(Some(store.root_path()), overflow_metadata, &err);
-                    overflow_notice_prefix(None)
+                    Err(err) => {
+                        log_overflow_write_failure(
+                            Some(store.root_path()),
+                            overflow_metadata,
+                            &err,
+                        );
+                        overflow_notice_prefix(None)
+                    }
                 }
             }
+            None => overflow_notice_prefix(None),
         }
-        None => overflow_notice_prefix(None),
     };
     let overflow_notice =
         utf8_prefix_by_bytes(&overflow_notice, INLINE_TEXT_LIMIT_BYTES).to_string();
@@ -587,6 +604,11 @@ fn overflow_notice_prefix(overflow_path: Option<&Path>) -> String {
                 + "\n"
         }
     }
+}
+
+fn overflow_notice_worker_truncated() -> String {
+    "[repl] output truncated; full response unavailable because older output was already dropped by the worker\n\n"
+        .to_string()
 }
 
 fn image_overflow_notice(image_index: usize, path: &Path) -> String {
