@@ -6,6 +6,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD;
 use serde::{Deserialize, Serialize};
 
 use crate::backend::Backend;
@@ -16,6 +18,7 @@ pub const CLAUDE_ENV_FILE_ENV: &str = "CLAUDE_ENV_FILE";
 
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const STATE_SUBDIR: &str = "mcp-repl/claude-clear";
+const CLAUDE_SESSION_ID_MARKER_PREFIX: &str = "# mcp-repl-session-id-b64=";
 static NEXT_TMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -242,7 +245,12 @@ fn handle_session_start(input: &HookInput) -> Result<(), Box<dyn std::error::Err
     if needs_separator {
         writeln!(file)?;
     }
-    writeln!(file, "export {CLAUDE_SESSION_ID_ENV}={session_id}")?;
+    let encoded_session_id = STANDARD.encode(session_id);
+    writeln!(
+        file,
+        "export {CLAUDE_SESSION_ID_ENV}={} {CLAUDE_SESSION_ID_MARKER_PREFIX}{encoded_session_id}",
+        shell_escape_posix(session_id)
+    )?;
     Ok(())
 }
 
@@ -290,6 +298,9 @@ fn read_session_id_from_env_file(path: Option<&Path>) -> Option<String> {
     let raw = fs::read_to_string(path).ok()?;
     for line in raw.lines().rev() {
         let line = line.trim();
+        if let Some(session_id) = decode_session_id_marker(line) {
+            return Some(session_id);
+        }
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -338,6 +349,26 @@ fn env_file_needs_separator(path: &Path) -> io::Result<bool> {
         return Ok(false);
     };
     Ok(!raw.is_empty() && !raw.ends_with(b"\n"))
+}
+
+fn decode_session_id_marker(line: &str) -> Option<String> {
+    let start = line.rfind(CLAUDE_SESSION_ID_MARKER_PREFIX)?;
+    let encoded = &line[start + CLAUDE_SESSION_ID_MARKER_PREFIX.len()..];
+    let decoded = STANDARD.decode(encoded.trim()).ok()?;
+    String::from_utf8(decoded).ok()
+}
+
+fn shell_escape_posix(raw: &str) -> String {
+    if raw.is_empty() {
+        return "''".to_string();
+    }
+    if raw
+        .bytes()
+        .all(|byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'/' | b'.' | b'_' | b'-' | b':'))
+    {
+        return raw.to_string();
+    }
+    format!("'{}'", raw.replace('\'', "'\"'\"'"))
 }
 
 fn load_instance_records_for_binding(
