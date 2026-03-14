@@ -786,17 +786,18 @@ fn existing_claude_hook_commands(
         };
         let base_args =
             strip_install_interpreter_arg(&existing_args).unwrap_or_else(|| existing_args.clone());
-        let hook_args = strip_implicit_claude_sandbox_arg(&base_args);
-        out.insert(claude_hook_command(
-            existing_command,
-            &hook_args,
-            "session-start",
-        ));
-        out.insert(claude_hook_command(
-            existing_command,
-            &hook_args,
-            "session-end",
-        ));
+        for hook_args in candidate_claude_hook_args(&base_args) {
+            out.insert(claude_hook_command(
+                existing_command,
+                &hook_args,
+                "session-start",
+            ));
+            out.insert(claude_hook_command(
+                existing_command,
+                &hook_args,
+                "session-end",
+            ));
+        }
     }
 
     Ok(out.into_iter().collect())
@@ -833,7 +834,17 @@ fn strip_install_interpreter_arg(args: &[String]) -> Option<Vec<String>> {
     removed.then_some(out)
 }
 
-fn strip_implicit_claude_sandbox_arg(args: &[String]) -> Vec<String> {
+fn candidate_claude_hook_args(args: &[String]) -> Vec<Vec<String>> {
+    let mut out = vec![args.to_vec()];
+    if let Some(stripped) = strip_first_workspace_write_sandbox_arg(args)
+        && stripped != args
+    {
+        out.push(stripped);
+    }
+    out
+}
+
+fn strip_first_workspace_write_sandbox_arg(args: &[String]) -> Option<Vec<String>> {
     let mut out = Vec::with_capacity(args.len());
     let mut idx = 0;
     let mut removed = false;
@@ -856,7 +867,7 @@ fn strip_implicit_claude_sandbox_arg(args: &[String]) -> Vec<String> {
         out.push(arg.clone());
         idx += 1;
     }
-    out
+    removed.then_some(out)
 }
 
 fn new_hook_entry(matcher: Option<&str>, command: &str) -> JsonValue {
