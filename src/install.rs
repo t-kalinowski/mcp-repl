@@ -129,8 +129,7 @@ pub fn run(options: InstallOptions) -> Result<(), Box<dyn std::error::Error>> {
                 let config_path = root.join(".claude.json");
                 let settings_dir = root.join(".claude");
                 let settings_path = settings_dir.join("settings.json");
-                let stale_hook_commands =
-                    existing_claude_hook_commands(&config_path, &server_specs)?;
+                let stale_hook_commands = existing_claude_hook_commands(&config_path)?;
                 if !settings_dir.is_dir() {
                     fs::create_dir_all(&settings_dir)?;
                 }
@@ -616,6 +615,7 @@ fn upsert_claude_settings_hooks(
     let Some(root_obj) = root.as_object_mut() else {
         return Err("claude settings root must be a JSON object".into());
     };
+    normalize_claude_settings_hooks_root(root_obj)?;
 
     let session_start_command = claude_hook_command(command, args, "session-start");
     let session_end_command = claude_hook_command(command, args, "session-end");
@@ -640,6 +640,32 @@ fn upsert_claude_settings_hooks(
 
     let serialized = serde_json::to_string_pretty(&root)?;
     atomic_write(settings_path, &format!("{serialized}\n"))?;
+    Ok(())
+}
+
+fn normalize_claude_settings_hooks_root(
+    root_obj: &mut JsonMap<String, JsonValue>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let Some(wrapper) = root_obj.remove("hooks") else {
+        return Ok(());
+    };
+    let Some(wrapper_obj) = wrapper.as_object() else {
+        return Err("claude settings `hooks` must be an object".into());
+    };
+
+    for (event, entries) in wrapper_obj {
+        let Some(entries_arr) = entries.as_array() else {
+            return Err(format!("claude settings `hooks.{event}` must be an array").into());
+        };
+        let root_entries = root_obj
+            .entry(event.clone())
+            .or_insert_with(|| JsonValue::Array(Vec::new()));
+        let Some(root_entries_arr) = root_entries.as_array_mut() else {
+            return Err(format!("claude settings `{event}` must be an array").into());
+        };
+        root_entries_arr.extend(entries_arr.iter().cloned());
+    }
+
     Ok(())
 }
 
@@ -795,7 +821,6 @@ fn replace_claude_hook_command(
 
 fn existing_claude_hook_commands(
     config_path: &Path,
-    server_specs: &[(String, InstallInterpreter)],
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     if !config_path.is_file() {
         return Ok(Vec::new());
@@ -818,10 +843,7 @@ fn existing_claude_hook_commands(
     };
 
     let mut out = BTreeSet::new();
-    for (server_name, _) in server_specs {
-        let Some(server_obj) = mcp_obj.get(server_name).and_then(JsonValue::as_object) else {
-            continue;
-        };
+    for server_obj in mcp_obj.values().filter_map(JsonValue::as_object) {
         let Some(existing_command) = server_obj.get("command").and_then(JsonValue::as_str) else {
             continue;
         };
@@ -835,8 +857,9 @@ fn existing_claude_hook_commands(
         else {
             continue;
         };
-        let base_args =
-            strip_install_interpreter_arg(&existing_args).unwrap_or_else(|| existing_args.clone());
+        let Some(base_args) = strip_install_interpreter_arg(&existing_args) else {
+            continue;
+        };
         for hook_args in candidate_claude_hook_args(&base_args) {
             out.insert(claude_hook_command(
                 existing_command,
