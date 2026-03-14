@@ -4,7 +4,7 @@
 
 **Goal:** Replace ring-based unread tracking and transport-coupled overflow retention with server-owned unread batching, destructive drains, and per-reply overflow artifacts that match the redesign spec.
 
-**Architecture:** Move unread capture ownership into a server-owned `PendingOutput` store that survives idle periods and worker exit/respawn. Keep the existing always-on stdout/stderr reader threads, but append into `PendingOutput` instead of the global ring. Rebuild reply formatting around one drained batch per `repl(...)` call: small batches stay inline, oversized batches get a total-budget head-and-tail preview plus a self-contained retained artifact for that reply only.
+**Architecture:** Move unread capture ownership into a server-owned `PendingOutput` store that survives idle periods and session lifecycle transitions until the next tool response drains it. Keep the existing always-on stdout/stderr reader threads, but append into `PendingOutput` instead of the global ring. Rebuild reply formatting around one drained batch per tool call: send the request, wait until the REPL is idle or timed out, then format all output collected since the previous tool response. Small batches stay inline; oversized batches get a total-budget head-and-tail preview plus a self-contained retained artifact for that reply only.
 
 **Tech Stack:** Rust, Tokio, rmcp, tempfile, serde, integration tests in `tests/*.rs`, snapshot tests via insta
 
@@ -12,11 +12,13 @@
 
 ## File Map
 
-- Create: `src/pending_output.rs` — server-owned unread-output store, in-memory/spill states, destructive drain API, worker-generation fencing, latched capture-failure state
+- Create: `src/pending_output.rs` — server-owned unread-output store, in-memory/spill states, destructive drain API, internal stale-reader guard, latched capture-failure state
 - Create: `src/server/reply_batch.rs` — turn one drained batch into MCP content, head-and-tail preview builder, input echo and prompt cleanup integration, preserved echo-collapse behavior
 - Create: `src/server/overflow_artifacts.rs` — retained per-reply artifact writer and eviction policy
+- Modify: `src/main.rs` — register the new `pending_output` module
 - Modify: `src/server.rs` — own `PendingOutput` and overflow artifacts, simplify `repl` request lifecycle, keep `codex/overflow-response-consumed` as a no-op
-- Modify: `src/worker_process.rs` — route reader-thread output into `PendingOutput`, fence appends by worker generation, preserve echo-collapse behavior, simplify `write_stdin`/poll/control-byte behavior around wait-for-idle and destructive drains
+- Modify: `src/debug_repl.rs` — keep the standalone debug REPL compiling if `WorkerManager::new(...)` or reply formatting ownership changes
+- Modify: `src/worker_process.rs` — route reader-thread output into `PendingOutput`, preserve echo-collapse behavior, keep lifecycle requests on the same unread-drain path, and simplify `write_stdin`/poll/control-byte behavior around wait-for-idle and destructive drains
 - Modify: `src/worker_protocol.rs` — remove reply fields that only exist to describe ring truncation
 - Delete: `src/output_capture.rs` — old ring-buffer capture and replay-gap truncation logic
 - Delete: `src/server/response.rs` — move surviving logic into `reply_batch.rs` and `overflow_artifacts.rs`
@@ -24,14 +26,15 @@
 - Modify: `tests/write_stdin_batch.rs` — non-overlapping batch, background output, poll/wait semantics, huge echo preservation
 - Modify: `tests/interrupt.rs` — combined `\u0003`/`\u0004` plus remaining-input semantics
 - Modify: `tests/session_endings.rs` — session-end output and respawn output in one later reply
-- Modify: `tests/manage_session_behavior.rs` — respawn/reset generation-boundary semantics
-- Modify: `tests/repl_surface.rs` — `repl_reset` unread-clearing semantics
+- Modify: `tests/manage_session_behavior.rs` — respawn/reset lifecycle semantics and unread co-batching
+- Modify: `tests/repl_surface.rs` — `repl_reset` lifecycle semantics on the same unread-drain path
 - Modify: `tests/plot_images.rs` — oversized reply artifact/retention behavior and head-and-tail previews
 - Modify: `tests/python_plot_images.rs` — long-line preview slicing and image-path preview rules
 - Modify: `tests/python_backend.rs` — replace the old truncation-contract assertion with the new spill-backed unread contract
 - Modify: `tests/r_file_show.rs` — visible overflow wording if file-overflow assertions need updating
 - Modify: `docs/tool-descriptions/repl_tool_r.md`
 - Modify: `docs/tool-descriptions/repl_tool_python.md`
+- Modify: `docs/tool-descriptions/repl_reset_tool.md`
 
 ## Chunk 1: Server-Owned Unread Output And Request Semantics
 
@@ -97,7 +100,7 @@ async fn session_end_notice_and_respawn_output_can_share_one_reply() -> TestResu
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn repl_reset_discards_unread_output_from_the_previous_worker_generation() -> TestResult<()> {
+async fn repl_reset_includes_unread_output_in_its_reply() -> TestResult<()> {
     let mut session = common::spawn_server().await?;
 
     let _ = session
@@ -106,13 +109,12 @@ async fn repl_reset_discards_unread_output_from_the_previous_worker_generation()
             Some(10.0),
         )
         .await?;
-    let _ = session.call_tool_raw("repl_reset", serde_json::json!({})).await?;
     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
 
-    let result = session.write_stdin_raw_with("cat('NEW\\n')", Some(10.0)).await?;
+    let result = session.call_tool_raw("repl_reset", serde_json::json!({})).await?;
     let text = collect_text(&result);
-    assert!(!text.contains("OLD"));
-    assert!(text.contains("NEW"));
+    assert!(text.contains("OLD"));
+    assert!(text.contains("new session started"));
     Ok(())
 }
 ```
@@ -127,10 +129,10 @@ Run:
 cargo test --test write_stdin_batch write_stdin_background_output_while_idle_prefixes_next_reply -- --exact
 cargo test --test interrupt interrupt_then_run_returns_one_combined_batch -- --exact
 cargo test --test session_endings session_end_notice_and_respawn_output_can_share_one_reply -- --exact
-cargo test --test repl_surface repl_reset_discards_unread_output_from_the_previous_worker_generation -- --exact
+cargo test --test repl_surface repl_reset_includes_unread_output_in_its_reply -- --exact
 ```
 
-Expected: FAIL because the current ring/poll logic still discards or splits these batches according to the old semantics, and reset currently has no server-owned unread-generation boundary to enforce.
+Expected: FAIL because the current ring/poll logic still discards or splits these batches according to the old semantics. In particular, lifecycle requests do not yet consistently return all output collected since the previous tool response.
 
 - [ ] **Step 3: Commit the red tests**
 
@@ -143,9 +145,10 @@ git commit -m "test: lock in unread-output redesign semantics"
 
 **Files:**
 - Create: `src/pending_output.rs`
-- Modify: `src/server.rs`
-- Modify: `src/worker_process.rs`
 - Modify: `src/main.rs`
+- Modify: `src/server.rs`
+- Modify: `src/debug_repl.rs`
+- Modify: `src/worker_process.rs`
 
 - [ ] **Step 1: Create the new unread-output store**
 
@@ -160,15 +163,13 @@ pub(crate) enum PendingItem {
 pub(crate) struct DrainedBatch {
     pub items: Vec<PendingItem>,
     pub capture_failed: bool,
-    pub worker_generation: u64,
 }
 
 pub(crate) struct PendingOutput { /* in-memory or spilled */ }
 
 impl PendingOutput {
-    pub(crate) fn begin_generation(&self) -> u64;
-    pub(crate) fn append_text_for_generation(&self, generation: u64, text: String, stream: TextStream) -> Result<(), PendingOutputError>;
-    pub(crate) fn append_image_for_generation(&self, generation: u64, id: String, mime_type: String, data: String, is_new: bool) -> Result<(), PendingOutputError>;
+    pub(crate) fn append_text(&self, text: String, stream: TextStream) -> Result<(), PendingOutputError>;
+    pub(crate) fn append_image(&self, id: String, mime_type: String, data: String, is_new: bool) -> Result<(), PendingOutputError>;
     pub(crate) fn has_unread(&self) -> bool;
     pub(crate) fn drain(&self) -> DrainedBatch;
     pub(crate) fn mark_capture_failed(&self, message: String);
@@ -183,10 +184,14 @@ Keep this module focused on unread storage only:
 
 Semantics to lock in here:
 - unread storage is server-owned and may spill instead of truncating
-- appends from an older worker generation are ignored once a reset/restart/spawn advances the generation
-- `repl_reset` starts a fresh generation and clears unread output from the old one
+- lifecycle requests do not clear unread output; the next response drains everything collected since the previous tool response
+- if an internal stale-reader guard is needed to avoid double-appends after teardown, keep it private to the implementation and do not make process identity part of the public drain semantics
 
-- [ ] **Step 2: Run the new module through a failing build**
+- [ ] **Step 2: Register the new module in the crate**
+
+Add `mod pending_output;` in `src/main.rs` and import the new types at the first call sites that will own or consume them.
+
+- [ ] **Step 3: Run the partially wired tree through a failing build**
 
 Run:
 
@@ -194,17 +199,25 @@ Run:
 cargo check
 ```
 
-Expected: FAIL with unresolved imports and call sites until the server and worker wiring is updated.
+Expected: FAIL with unresolved imports or constructor/call-site mismatches until the server, debug REPL, and worker wiring is updated.
 
-- [ ] **Step 3: Make the server own the buffer**
+- [ ] **Step 4: Make the server own the buffer**
 
 Modify `src/server.rs` so `SharedServer` owns `Arc<PendingOutput>` and passes it into `WorkerManager::new(...)`. Keep `codex/overflow-response-consumed` accepted, but reduce it to a no-op log path instead of reply-lifetime bookkeeping.
 
-- [ ] **Step 4: Port the reader-thread append path**
+- [ ] **Step 5: Update the other direct `WorkerManager` constructor callers**
 
-Modify `src/worker_process.rs` so the existing stdout/stderr/image reader path appends directly into `PendingOutput` instead of `OutputTimeline`/`OutputBuffer`. Preserve the existing always-on reader-thread behavior while the worker is idle, but capture the current worker generation in each reader closure and drop late appends from stale generations.
+If `WorkerManager::new(...)` takes `PendingOutput` (or a factory for it), update the direct non-server callers too:
+- `src/debug_repl.rs`
+- unit tests in `src/worker_process.rs`
 
-- [ ] **Step 5: Preserve the public echo-collapse behavior before deleting the ring helpers**
+Do not leave the debug REPL on a stale constructor shape while the server compiles.
+
+- [ ] **Step 6: Port the reader-thread append path**
+
+Modify `src/worker_process.rs` so the existing stdout/stderr/image reader path appends directly into `PendingOutput` instead of `OutputTimeline`/`OutputBuffer`. Preserve the existing always-on reader-thread behavior while the worker is idle. If you need an internal stale-reader guard to prevent duplicate appends after teardown, keep it as an implementation detail and do not let it drop output that should still be surfaced by the next tool response.
+
+- [ ] **Step 7: Preserve the public echo-collapse behavior before deleting the ring helpers**
 
 Before removing `OutputBuffer`-based snapshots, move or rewrite the current `IpcEchoEvent`-driven behaviors so they still run over one drained batch:
 - drop pure echo-only output for large silent inputs
@@ -213,23 +226,24 @@ Before removing `OutputBuffer`-based snapshots, move or rewrite the current `Ipc
 
 Do not regress the existing public tests in `tests/write_stdin_batch.rs` that cover large echo handling.
 
-- [ ] **Step 6: Re-run the focused tests**
+- [ ] **Step 8: Re-run the focused tests**
 
 Run:
 
 ```bash
 cargo test --test write_stdin_batch write_stdin_background_output_while_idle_prefixes_next_reply -- --exact
 cargo test --test session_endings session_end_notice_and_respawn_output_can_share_one_reply -- --exact
+cargo test --test repl_surface repl_reset_includes_unread_output_in_its_reply -- --exact
 cargo test --test write_stdin_batch write_stdin_drops_huge_echo_only_inputs -- --exact
 cargo test --test write_stdin_batch write_stdin_collapses_huge_echo_with_output_attribution -- --exact
 ```
 
 Expected: still FAIL on request formatting and drain semantics, but compile and append path should now be using `PendingOutput` and the echo-focused tests should still be exercising the new path.
 
-- [ ] **Step 7: Commit the wiring work**
+- [ ] **Step 9: Commit the wiring work**
 
 ```bash
-git add src/pending_output.rs src/server.rs src/worker_process.rs src/main.rs
+git add src/pending_output.rs src/main.rs src/server.rs src/debug_repl.rs src/worker_process.rs
 git commit -m "refactor: introduce server-owned pending output store"
 ```
 
@@ -257,7 +271,7 @@ In `src/worker_process.rs`:
 - keep plain non-empty input rejected while busy unless it starts with `\u0003` or `\u0004`
 - preserve the one-deadline behavior for `\u0003`/`\u0004` plus remaining input
 - preserve unread prefix output across `\u0003`, `\u0004`, worker exit, and respawn
-- preserve the public distinction between "same worker generation unread output prefixes the next reply" and "`repl_reset` starts a fresh generation and does not replay stale unread output"
+- preserve the single public invariant for lifecycle requests too: send the request, wait for idle or timeout, then return all output collected since the previous tool response
 
 - [ ] **Step 3: Update the public truncation contract**
 
@@ -278,10 +292,11 @@ cargo test --test interrupt interrupt_then_run_returns_one_combined_batch -- --e
 cargo test --test session_endings session_end_notice_and_respawn_output_can_share_one_reply -- --exact
 cargo test --test manage_session_behavior restart_while_busy_resets_session -- --exact
 cargo test --test repl_surface repl_reset_clears_state -- --exact
+cargo test --test repl_surface repl_reset_includes_unread_output_in_its_reply -- --exact
 cargo test --test python_backend python_truncated_pending_prefix_spills_to_server_owned_artifact -- --exact
 ```
 
-Expected: PASS for the new semantics, including generation-boundary behavior. Snapshots may still fail later because the formatter still uses the old overflow presentation.
+Expected: PASS for the new semantics, including lifecycle consistency. Snapshots may still fail later because the formatter still uses the old overflow presentation.
 
 - [ ] **Step 6: Commit the semantic cut-over**
 
@@ -328,9 +343,8 @@ async fn oversized_single_line_respects_total_budget() -> TestResult<()> {
 #[tokio::test(flavor = "multi_thread")]
 async fn preview_never_shows_partial_full_image_path_notice() -> TestResult<()> {
     let mut session = common::spawn_python_server().await?;
-    let result = session
-        .write_stdin_raw_with("from test_plot_fixture import emit_many_large_plots; emit_many_large_plots()", Some(10.0))
-        .await?;
+    let input = fake_plot_image_script(240, 10_000, 12_000);
+    let result = session.write_stdin_raw_with(&input, Some(120.0)).await?;
     let text = collect_text(&result);
     for path in extract_all_paths(&text, "full image at ") {
         assert!(path.exists(), "expected complete visible path: {path:?}");
@@ -364,7 +378,7 @@ async fn overflow_write_failure_returns_bounded_preview_with_notice() -> TestRes
 }
 ```
 
-If the overflow write-failure case cannot be driven with the current harness, add a server startup env var such as `MCP_CONSOLE_OVERFLOW_ROOT` and use `spawn_server_with_env_vars(...)` to point the server at a read-only directory. Do not add a test-only constructor to the product code.
+Reuse the existing `fake_plot_image_script(...)` helper in `tests/python_plot_images.rs` for the path-notice case; do not introduce a separate `test_plot_fixture` module just for this test. If the overflow write-failure case cannot be driven with the current harness, add a server startup env var such as `MCP_CONSOLE_OVERFLOW_ROOT` and use `spawn_server_with_env_vars(...)` to point the server at a read-only directory. Do not add a test-only constructor to the product code.
 
 - [ ] **Step 2: Run the targeted overflow tests to verify they fail**
 
@@ -461,6 +475,7 @@ git commit -m "refactor: rewrite repl overflow formatting per reply batch"
 - Modify: `tests/python_plot_images.rs`
 - Modify: `docs/tool-descriptions/repl_tool_r.md`
 - Modify: `docs/tool-descriptions/repl_tool_python.md`
+- Modify: `docs/tool-descriptions/repl_reset_tool.md`
 
 - [ ] **Step 1: Delete internal-only tests that exercised removed helpers**
 
@@ -470,8 +485,9 @@ Remove the `src/server/response.rs` unit tests and any `src/output_capture.rs` t
 
 Before accepting snapshots:
 - rename/update the old truncation-contract test in `tests/python_backend.rs`
-- keep or add public assertions for huge echoed input handling, reset generation boundaries, and retained-artifact behavior
+- keep or add public assertions for huge echoed input handling, lifecycle-request consistency, and retained-artifact behavior
 - verify the docs describe server-owned unread batching rather than worker-side truncation/acknowledgement
+- update `docs/tool-descriptions/repl_reset_tool.md` so it no longer promises a reset reply that contains only the new-session status line if unread output is now co-batched into that response
 
 Run:
 
@@ -507,6 +523,6 @@ Expected: all commands succeed cleanly.
 - [ ] **Step 5: Commit the cleanup and verification pass**
 
 ```bash
-git add docs/tool-descriptions/repl_tool_r.md docs/tool-descriptions/repl_tool_python.md tests src
+git add docs/tool-descriptions/repl_tool_r.md docs/tool-descriptions/repl_tool_python.md docs/tool-descriptions/repl_reset_tool.md tests src
 git commit -m "cleanup: remove ring-based repl output machinery"
 ```
