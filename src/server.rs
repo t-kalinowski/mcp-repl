@@ -24,6 +24,7 @@ use self::timeouts::{
 };
 
 use crate::backend::Backend;
+use crate::claude::ClaudeClearBinding;
 use crate::sandbox::{SANDBOX_STATE_CAPABILITY, SANDBOX_STATE_METHOD, SandboxStateUpdate};
 use crate::sandbox_cli::SandboxCliPlan;
 use crate::worker_process::{WorkerError, WorkerManager};
@@ -38,13 +39,19 @@ fn repl_tool_description_for_backend(backend: Backend) -> &'static str {
 
 #[derive(Clone)]
 struct SharedServer {
+    backend: Backend,
     worker: Arc<Mutex<WorkerManager>>,
+    claude_clear_binding: Arc<Mutex<Option<ClaudeClearBinding>>>,
 }
 
 impl SharedServer {
     fn new(backend: Backend, sandbox_plan: SandboxCliPlan) -> Result<Self, WorkerError> {
         Ok(Self {
+            backend,
             worker: Arc::new(Mutex::new(WorkerManager::new(backend, sandbox_plan)?)),
+            claude_clear_binding: Arc::new(Mutex::new(ClaudeClearBinding::maybe_register(
+                backend,
+            )?)),
         })
     }
 
@@ -58,12 +65,30 @@ impl SharedServer {
         T: Send + 'static,
     {
         let worker = self.worker.clone();
+        let claude_clear_binding = self.claude_clear_binding.clone();
+        let backend = self.backend;
         tokio::task::spawn_blocking(move || {
             let mut worker = worker.lock().unwrap();
-            f(&mut worker)
+            let awaiting_initial_sandbox_state_update =
+                worker.awaiting_initial_sandbox_state_update();
+            {
+                let mut claude_clear_binding = claude_clear_binding
+                    .lock()
+                    .expect("claude clear binding mutex poisoned");
+                if claude_clear_binding.is_none() {
+                    *claude_clear_binding = ClaudeClearBinding::maybe_register_late(backend)?;
+                }
+                if !awaiting_initial_sandbox_state_update
+                    && let Some(binding) = claude_clear_binding.as_ref()
+                {
+                    binding.sync(&mut worker)?;
+                }
+            }
+            Ok::<T, WorkerError>(f(&mut worker))
         })
         .await
         .map_err(|err| McpError::internal_error(err.to_string(), None))
+        .and_then(|result| result.map_err(|err| McpError::internal_error(err.to_string(), None)))
     }
 
     async fn run_write_input(

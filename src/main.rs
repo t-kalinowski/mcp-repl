@@ -1,4 +1,5 @@
 mod backend;
+mod claude;
 mod debug_repl;
 mod diagnostics;
 mod event_log;
@@ -32,6 +33,7 @@ use crate::sandbox_cli::{
 enum CliCommand {
     RunServer(CliOptions),
     Install(install::InstallOptions),
+    ClaudeHook(claude::HookCommand),
 }
 
 #[derive(Debug, Clone)]
@@ -96,6 +98,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             server::run(options.backend, options.sandbox_plan).await
         }
         CliCommand::Install(options) => install::run(options),
+        CliCommand::ClaudeHook(command) => claude::run_hook(command),
     }
 }
 
@@ -107,13 +110,22 @@ fn ignore_sigpipe() {
 }
 
 fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
-    let mut parser = ArgParser::new();
+    parse_cli_args_with_parser(ArgParser::new())
+}
+
+fn parse_cli_args_with_parser(
+    mut parser: ArgParser,
+) -> Result<CliCommand, Box<dyn std::error::Error>> {
     if parser.peek() == Some("install") {
         parser.next();
         return Ok(CliCommand::Install(parse_install_args(
             &mut parser,
             Vec::new(),
         )?));
+    }
+    if parser.args.len() >= 2 && parser.args[parser.args.len() - 2] == "claude-hook" {
+        parser.index = parser.args.len() - 1;
+        return Ok(CliCommand::ClaudeHook(parse_claude_hook_args(&mut parser)?));
     }
 
     let mut sandbox_args = SandboxCliArgs::default();
@@ -241,6 +253,24 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
         backend: backend.unwrap_or(Backend::R),
         debug_events_dir,
     }))
+}
+
+fn parse_claude_hook_args(
+    parser: &mut ArgParser,
+) -> Result<claude::HookCommand, Box<dyn std::error::Error>> {
+    let Some(subcommand) = parser.next() else {
+        return Err("missing claude-hook subcommand (expected session-start|session-end)".into());
+    };
+    if matches!(subcommand.as_str(), "-h" | "--help") {
+        print_usage();
+        std::process::exit(0);
+    }
+    let command = claude::HookCommand::parse(&subcommand)
+        .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
+    if let Some(extra) = parser.next() {
+        return Err(format!("unexpected claude-hook argument: {extra}").into());
+    }
+    Ok(command)
 }
 
 fn parse_backend_arg(
@@ -457,6 +487,7 @@ fn print_usage() {
         "Usage:\n\
 mcp-repl [--debug-repl] [--interpreter <r|python>] [--sandbox <inherit|read-only|workspace-write|danger-full-access>] [--add-writable-root <abs-path>] [--add-allowed-domain <domain>] [--config <key=value>]...\n\
 mcp-repl install [codex] [claude] [--client <codex|claude>]... [--interpreter <r|python>[,r|python]...]... [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
+mcp-repl claude-hook <session-start|session-end>\n\n\
 --debug-repl: run an interactive debug REPL over stdio\n\
 --debug-events-dir: optional directory for per-startup JSONL debug event logs (env: MCP_REPL_DEBUG_EVENTS_DIR)\n\
 --interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER, compatibility env MCP_REPL_BACKEND)\n\
@@ -487,6 +518,49 @@ mod tests {
     use super::*;
     use crate::sandbox::{SandboxPolicy, SandboxState};
     use crate::sandbox_cli::{SandboxConfigOperation, resolve_effective_sandbox_state};
+
+    #[test]
+    fn parse_claude_hook_args_accepts_session_start() {
+        let mut parser = ArgParser {
+            args: vec!["session-start".to_string()],
+            index: 0,
+        };
+        let parsed = parse_claude_hook_args(&mut parser).expect("parse claude hook args");
+        assert_eq!(parsed, crate::claude::HookCommand::SessionStart);
+    }
+
+    #[test]
+    fn parse_cli_args_accepts_claude_hook_after_passthrough_args() {
+        let parsed = parse_cli_args_with_parser(ArgParser {
+            args: vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "claude-hook".to_string(),
+                "session-end".to_string(),
+            ],
+            index: 0,
+        })
+        .expect("parse cli args");
+        assert!(matches!(
+            parsed,
+            CliCommand::ClaudeHook(crate::claude::HookCommand::SessionEnd)
+        ));
+    }
+
+    #[test]
+    fn parse_cli_args_does_not_treat_non_trailing_claude_hook_token_as_hook_mode() {
+        let parsed = parse_cli_args_with_parser(ArgParser {
+            args: vec!["--debug-events-dir".to_string(), "claude-hook".to_string()],
+            index: 0,
+        })
+        .expect("parse cli args");
+        match parsed {
+            CliCommand::RunServer(options) => {
+                assert_eq!(options.debug_events_dir, Some(PathBuf::from("claude-hook")));
+            }
+            _ => panic!("expected RunServer"),
+        }
+    }
 
     #[test]
     fn parse_backend_arg_accepts_interpreter_flag_forms() {
