@@ -343,10 +343,10 @@ fn marker_belongs_to_multiline_export(lines: &[&str], marker_idx: usize) -> bool
             continue;
         };
         let Some((key, value_start)) = export_line.split_once('=') else {
-            return false;
+            continue;
         };
         if key.trim() != CLAUDE_SESSION_ID_ENV {
-            return false;
+            continue;
         }
 
         let mut assignment = String::from(value_start);

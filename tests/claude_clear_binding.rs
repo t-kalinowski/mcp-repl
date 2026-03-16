@@ -332,6 +332,69 @@ async fn claude_clear_matches_multiline_session_ids_with_plaintext_continuations
     Ok(())
 }
 
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_clear_matches_multiline_session_ids_with_export_like_continuations()
+-> TestResult<()> {
+    let _guard = test_guard();
+    let temp = tempfile::tempdir()?;
+    let env_file = temp.path().join("claude.env");
+    let exe = resolve_exe()?;
+    let session_id = "sess-first-line\nexport FOO=bar\ncontinued tail";
+
+    run_session_start(&exe, temp.path(), &env_file, session_id)?;
+
+    let sourced_session_id = source_session_id_from_env_file(&env_file)?;
+    assert_eq!(
+        sourced_session_id, session_id,
+        "expected sourced env file to preserve the export-like multiline session id"
+    );
+
+    let mut session =
+        common::spawn_server_with_env_vars(claude_env_vars(temp.path(), &env_file)).await?;
+
+    let first_request = match repl_text(
+        &mut session,
+        "export_like_bound <- 1; print(exists(\"export_like_bound\"))",
+        "during export-like continuation binding",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session.cancel().await?;
+            return Ok(());
+        }
+    };
+    assert!(
+        first_request.contains("TRUE"),
+        "expected first request after export-like continuation binding to create state, got: {first_request:?}"
+    );
+
+    run_session_end_clear(&exe, temp.path(), &env_file, session_id)?;
+
+    let after_clear = match repl_text(
+        &mut session,
+        "print(exists(\"export_like_bound\"))",
+        "after export-like continuation clear",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session.cancel().await?;
+            return Ok(());
+        }
+    };
+
+    session.cancel().await?;
+    assert!(
+        after_clear.contains("FALSE"),
+        "expected clear for the export-like continuation session to reset bound state, got: {after_clear:?}"
+    );
+    Ok(())
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn claude_clear_restart_binds_after_session_start_hook() -> TestResult<()> {
     let _guard = test_guard();
