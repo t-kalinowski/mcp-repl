@@ -299,12 +299,12 @@ fn read_session_id_from_env_file(path: Option<&Path>) -> Option<String> {
     let lines: Vec<&str> = raw.lines().collect();
     for (idx, line) in lines.iter().enumerate().rev() {
         let line = line.trim();
+        if let Some(session_id) = decode_session_id_marker(line)
+            && marker_belongs_to_multiline_export(&lines, idx)
+        {
+            return Some(session_id);
+        }
         if line.is_empty() || line.starts_with('#') {
-            if let Some(session_id) = decode_session_id_marker(line)
-                && marker_belongs_to_multiline_export(&lines, idx)
-            {
-                return Some(session_id);
-            }
             continue;
         }
         let Some(line) = line.strip_prefix("export ") else {
