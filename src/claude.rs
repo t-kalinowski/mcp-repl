@@ -95,6 +95,7 @@ struct ControlRequest {
 }
 
 impl ClaudeClearBinding {
+    #[cfg(test)]
     pub fn maybe_register(backend: Backend) -> Result<Option<Self>, WorkerError> {
         Self::maybe_register_with_initial_seq(backend, 0)
     }
@@ -241,7 +242,7 @@ fn handle_session_start(input: &HookInput) -> Result<(), Box<dyn std::error::Err
         fs::create_dir_all(parent)?;
     }
     let needs_separator = env_file_needs_separator(&path)?;
-    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
     if needs_separator {
         writeln!(file)?;
     }

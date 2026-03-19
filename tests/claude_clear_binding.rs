@@ -446,6 +446,67 @@ async fn claude_clear_late_session_binding_restarts_prebound_worker_state() -> T
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn claude_clear_retargets_stale_startup_binding_before_next_clear() -> TestResult<()> {
+    let _guard = common::lock_test_mutex()?;
+    let temp = tempfile::tempdir()?;
+    let env_file = temp.path().join("claude.env");
+    let exe = common::resolve_test_binary()?;
+
+    let encoded = URL_SAFE_NO_PAD.encode("sess-stale");
+    std::fs::write(
+        &env_file,
+        format!("export MCP_REPL_CLAUDE_SESSION_ID={SESSION_ID_TOKEN_PREFIX}{encoded}\n"),
+    )?;
+
+    let mut session =
+        common::spawn_server_with_env_vars(claude_env_vars(temp.path(), &env_file)).await?;
+
+    run_session_start(&exe, temp.path(), &env_file, "sess-current")?;
+
+    let before_clear = match repl_text(
+        &mut session,
+        "x <- 1; print(exists(\"x\"))",
+        "after startup session start and before clear",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session.cancel().await?;
+            return Ok(());
+        }
+    };
+    assert!(
+        before_clear.contains("TRUE"),
+        "expected current session to create state before clear, got: {before_clear:?}"
+    );
+
+    run_session_end_clear(&exe, temp.path(), &env_file, "sess-current")?;
+    run_session_start(&exe, temp.path(), &env_file, "sess-next")?;
+
+    let after_clear = match repl_text(
+        &mut session,
+        "print(exists(\"x\"))",
+        "after clearing a stale startup binding",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session.cancel().await?;
+            return Ok(());
+        }
+    };
+
+    session.cancel().await?;
+    assert!(
+        after_clear.contains("FALSE"),
+        "expected clear to reset state after startup rebinding, got: {after_clear:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn claude_clear_matches_exact_env_file_and_session() -> TestResult<()> {
     let _guard = common::lock_test_mutex()?;
     let temp = tempfile::tempdir()?;

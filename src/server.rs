@@ -49,9 +49,7 @@ impl SharedServer {
         Ok(Self {
             backend,
             worker: Arc::new(Mutex::new(WorkerManager::new(backend, sandbox_plan)?)),
-            claude_clear_binding: Arc::new(Mutex::new(ClaudeClearBinding::maybe_register(
-                backend,
-            )?)),
+            claude_clear_binding: Arc::new(Mutex::new(None)),
         })
     }
 
