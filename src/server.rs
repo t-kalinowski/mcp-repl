@@ -9,6 +9,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -24,7 +25,7 @@ use self::timeouts::{
 };
 
 use crate::backend::Backend;
-use crate::claude::ClaudeClearBinding;
+use crate::claude::{ClaudeClearBinding, ClaudeClientContext};
 use crate::sandbox::{SANDBOX_STATE_CAPABILITY, SANDBOX_STATE_METHOD, SandboxStateUpdate};
 use crate::sandbox_cli::SandboxCliPlan;
 use crate::worker_process::{WorkerError, WorkerManager};
@@ -41,7 +42,9 @@ fn repl_tool_description_for_backend(backend: Backend) -> &'static str {
 struct SharedServer {
     backend: Backend,
     worker: Arc<Mutex<WorkerManager>>,
+    claude_client_context: Option<ClaudeClientContext>,
     claude_clear_binding: Arc<Mutex<Option<ClaudeClearBinding>>>,
+    claude_prune_started: Arc<AtomicBool>,
 }
 
 impl SharedServer {
@@ -49,7 +52,9 @@ impl SharedServer {
         Ok(Self {
             backend,
             worker: Arc::new(Mutex::new(WorkerManager::new(backend, sandbox_plan)?)),
+            claude_client_context: crate::claude::detect_client_context(),
             claude_clear_binding: Arc::new(Mutex::new(None)),
+            claude_prune_started: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -63,18 +68,20 @@ impl SharedServer {
         T: Send + 'static,
     {
         let worker = self.worker.clone();
+        let claude_client_context = self.claude_client_context.clone();
         let claude_clear_binding = self.claude_clear_binding.clone();
         let backend = self.backend;
         tokio::task::spawn_blocking(move || {
             let mut worker = worker.lock().unwrap();
             let awaiting_initial_sandbox_state_update =
                 worker.awaiting_initial_sandbox_state_update();
-            {
+            if let Some(claude_client_context) = claude_client_context.as_ref() {
                 let mut claude_clear_binding = claude_clear_binding
                     .lock()
                     .expect("claude clear binding mutex poisoned");
                 if claude_clear_binding.is_none() {
-                    *claude_clear_binding = ClaudeClearBinding::maybe_register_late(backend)?;
+                    *claude_clear_binding =
+                        ClaudeClearBinding::maybe_register_late(backend, claude_client_context)?;
                 }
                 if !awaiting_initial_sandbox_state_update
                     && let Some(binding) = claude_clear_binding.as_ref()
@@ -87,6 +94,32 @@ impl SharedServer {
         .await
         .map_err(|err| McpError::internal_error(err.to_string(), None))
         .and_then(|result| result.map_err(|err| McpError::internal_error(err.to_string(), None)))
+    }
+
+    fn on_initialized(&self) {
+        if self.claude_client_context.is_none() {
+            return;
+        }
+        if self.claude_prune_started.swap(true, Ordering::Relaxed) {
+            return;
+        }
+
+        tokio::task::spawn_blocking(|| {
+            crate::event_log::log("claude_state_prune_begin", json!({}));
+            match crate::claude::prune_stale_state() {
+                Ok(()) => crate::event_log::log("claude_state_prune_end", json!({"status": "ok"})),
+                Err(err) => {
+                    eprintln!("claude state prune error: {err}");
+                    crate::event_log::log(
+                        "claude_state_prune_end",
+                        json!({
+                            "status": "error",
+                            "error": err.to_string(),
+                        }),
+                    );
+                }
+            }
+        });
     }
 
     async fn run_write_input(
@@ -382,6 +415,13 @@ macro_rules! define_backend_tool_server {
                 _context: rmcp::service::NotificationContext<RoleServer>,
             ) {
                 self.shared.on_custom_notification(notification).await
+            }
+
+            async fn on_initialized(
+                &self,
+                _context: rmcp::service::NotificationContext<RoleServer>,
+            ) {
+                self.shared.on_initialized();
             }
         }
     };

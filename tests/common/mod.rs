@@ -920,18 +920,35 @@ pub async fn spawn_server() -> TestResult<McpTestSession> {
 }
 
 pub async fn spawn_server_with_pager_page_chars(page_bytes: u64) -> TestResult<McpTestSession> {
-    spawn_server_with_args_env_and_pager_page_chars(Vec::new(), Vec::new(), page_bytes).await
+    spawn_server_with_args_env_cleared_and_pager_page_chars(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        page_bytes,
+    )
+    .await
 }
 
 pub async fn spawn_server_with_env_vars(
     env_vars: Vec<(String, String)>,
 ) -> TestResult<McpTestSession> {
-    spawn_server_with_args_env_and_pager_page_chars(Vec::new(), env_vars, TEST_PAGER_PAGE_CHARS)
-        .await
+    spawn_server_with_args_env_cleared_and_pager_page_chars(
+        Vec::new(),
+        env_vars,
+        Vec::new(),
+        TEST_PAGER_PAGE_CHARS,
+    )
+    .await
 }
 
 pub async fn spawn_server_with_args(args: Vec<String>) -> TestResult<McpTestSession> {
-    spawn_server_with_args_env_and_pager_page_chars(args, Vec::new(), TEST_PAGER_PAGE_CHARS).await
+    spawn_server_with_args_env_cleared_and_pager_page_chars(
+        args,
+        Vec::new(),
+        Vec::new(),
+        TEST_PAGER_PAGE_CHARS,
+    )
+    .await
 }
 
 pub async fn spawn_python_server() -> TestResult<McpTestSession> {
@@ -978,8 +995,19 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
     env_vars: Vec<(String, String)>,
     page_bytes: u64,
 ) -> TestResult<McpTestSession> {
+    spawn_server_with_args_env_cleared_and_pager_page_chars(args, env_vars, Vec::new(), page_bytes)
+        .await
+}
+
+pub async fn spawn_server_with_args_env_cleared_and_pager_page_chars(
+    args: Vec<String>,
+    env_vars: Vec<(String, String)>,
+    cleared_env_vars: Vec<String>,
+    page_bytes: u64,
+) -> TestResult<McpTestSession> {
     let exe = resolve_server_path()?;
     let env_vars = env_vars.clone();
+    let cleared_env_vars = cleared_env_vars.clone();
     let backend = parse_backend_from_args(&args);
     let mut args = args.clone();
     if !sandbox_exec_available()
@@ -996,6 +1024,9 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
         cmd.env_remove("R_ENVIRON");
         cmd.env_remove("R_ENVIRON_USER");
         cmd.env_remove("MCP_CONSOLE_UPDATE_PLOT_IMAGES");
+        for key in &cleared_env_vars {
+            cmd.env_remove(key);
+        }
         cmd.env(PAGER_PAGE_CHARS_ENV, page_bytes.to_string());
         cmd.args(&args);
         for (key, value) in &env_vars {

@@ -32,6 +32,11 @@ pub enum HookCommand {
     SessionEnd,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaudeClientContext {
+    scope_pid: Option<u32>,
+}
+
 impl HookCommand {
     pub fn parse(raw: &str) -> Result<Self, String> {
         match raw {
@@ -122,19 +127,25 @@ struct ControlRequest {
 impl ClaudeClearBinding {
     #[cfg(test)]
     pub fn maybe_register(backend: Backend) -> Result<Option<Self>, WorkerError> {
-        Self::maybe_register_with_initial_seq(backend, 0)
+        let Some(context) = detect_client_context() else {
+            return Ok(None);
+        };
+        Self::maybe_register_with_initial_seq(backend, 0, &context)
     }
 
-    pub fn maybe_register_late(backend: Backend) -> Result<Option<Self>, WorkerError> {
-        Self::maybe_register_with_initial_seq(backend, 1)
+    pub fn maybe_register_late(
+        backend: Backend,
+        context: &ClaudeClientContext,
+    ) -> Result<Option<Self>, WorkerError> {
+        Self::maybe_register_with_initial_seq(backend, 1, context)
     }
 
     fn maybe_register_with_initial_seq(
         backend: Backend,
         initial_control_seq: u64,
+        context: &ClaudeClientContext,
     ) -> Result<Option<Self>, WorkerError> {
-        prune_stale_claude_state().map_err(WorkerError::Io)?;
-        let Some(binding_session) = current_claude_session_binding() else {
+        let Some(binding_session) = current_claude_session_binding(context) else {
             return Ok(None);
         };
 
@@ -240,6 +251,19 @@ impl ClaudeClearBinding {
     }
 }
 
+pub fn detect_client_context() -> Option<ClaudeClientContext> {
+    if test_scope_key_env().is_some() || current_claude_env_file_path().is_some() {
+        return Some(ClaudeClientContext { scope_pid: None });
+    }
+    current_claude_process_pid().map(|scope_pid| ClaudeClientContext {
+        scope_pid: Some(scope_pid),
+    })
+}
+
+pub fn prune_stale_state() -> io::Result<()> {
+    prune_stale_claude_state()
+}
+
 impl Drop for ClaudeClearBindingInner {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.record_path);
@@ -267,7 +291,7 @@ fn handle_session_start(input: &HookInput) -> Result<(), Box<dyn std::error::Err
         return Ok(());
     }
     prune_stale_claude_state()?;
-    if let Some(scope_key) = current_claude_scope_key() {
+    if let Some(scope_key) = current_claude_scope_key(None) {
         write_session_state(&scope_key, session_id)?;
     }
     if let Some(path) = current_claude_env_file_path() {
@@ -290,7 +314,7 @@ fn handle_session_end(input: &HookInput) -> Result<(), Box<dyn std::error::Error
     prune_stale_claude_state()?;
 
     let mut matched_any = false;
-    if let Some(scope_key) = current_claude_scope_key() {
+    if let Some(scope_key) = current_claude_scope_key(None) {
         for record in load_instance_records_for_scope(&scope_key, session_id)? {
             let path = PathBuf::from(record.control_path);
             request_restart(&path)?;
@@ -313,8 +337,8 @@ fn handle_session_end(input: &HookInput) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-fn current_claude_session_binding() -> Option<ClaudeSessionBinding> {
-    if let Some(scope_key) = current_claude_scope_key()
+fn current_claude_session_binding(context: &ClaudeClientContext) -> Option<ClaudeSessionBinding> {
+    if let Some(scope_key) = current_claude_scope_key(context.scope_pid)
         && let Some(state) = read_session_state(&scope_key)
     {
         let session_id = state.session_id.trim().to_string();
@@ -345,15 +369,21 @@ fn current_claude_env_file_path() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
-fn current_claude_scope_key() -> Option<String> {
+fn test_scope_key_env() -> Option<String> {
     if let Ok(scope_key) = env::var(CLAUDE_TEST_SCOPE_KEY_ENV)
         && !scope_key.trim().is_empty()
     {
         return Some(scope_key);
     }
+    None
+}
 
+fn current_claude_scope_key(scope_pid: Option<u32>) -> Option<String> {
+    if let Some(scope_key) = test_scope_key_env() {
+        return Some(scope_key);
+    }
     let cwd = current_claude_project_dir()?;
-    let claude_pid = current_claude_process_pid()?;
+    let claude_pid = scope_pid.or_else(current_claude_process_pid)?;
     let mut input = Vec::new();
     input.extend_from_slice(CLAUDE_SCOPE_KEY_VERSION);
     input.push(0);
@@ -745,6 +775,45 @@ mod tests {
             "export {CLAUDE_SESSION_ID_ENV}={CLAUDE_SESSION_ID_TOKEN_PREFIX}{}\n",
             URL_SAFE_NO_PAD.encode(session_id)
         )
+    }
+
+    #[test]
+    fn detect_client_context_is_none_without_claude_markers() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        unsafe {
+            env::remove_var(CLAUDE_ENV_FILE_ENV);
+            env::remove_var(CLAUDE_TEST_SCOPE_KEY_ENV);
+            env::remove_var(CLAUDE_PROJECT_DIR_ENV);
+        }
+
+        let context = detect_client_context();
+        assert!(
+            context.is_none(),
+            "expected no Claude client context without Claude markers, got: {context:?}"
+        );
+    }
+
+    #[test]
+    fn detect_client_context_uses_claude_env_file_without_parent_claude() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let temp = test_tempdir("claude-context-env-file-");
+        let env_file = temp.path().join("claude.env");
+        unsafe {
+            env::set_var(CLAUDE_ENV_FILE_ENV, &env_file);
+            env::remove_var(CLAUDE_TEST_SCOPE_KEY_ENV);
+            env::remove_var(CLAUDE_PROJECT_DIR_ENV);
+        }
+
+        let context = detect_client_context();
+        assert_eq!(
+            context,
+            Some(ClaudeClientContext { scope_pid: None }),
+            "expected CLAUDE_ENV_FILE to activate Claude client context"
+        );
+
+        unsafe {
+            env::remove_var(CLAUDE_ENV_FILE_ENV);
+        }
     }
 
     #[test]
