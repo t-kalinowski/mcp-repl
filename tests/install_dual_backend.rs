@@ -16,25 +16,13 @@ fn claude_hook_entries<'a>(settings_root: &'a JsonValue, event: &str) -> &'a [Js
         .expect("expected Claude hooks event array")
 }
 
-fn claude_session_env_file(home: &Path) -> String {
-    home.join(".claude")
-        .join("mcp-repl")
-        .join("session.env")
-        .display()
-        .to_string()
-}
-
-fn installed_claude_hook_command(home: &Path, command: &str, args: &[&str], hook: &str) -> String {
-    let base = std::iter::once(command)
+fn installed_claude_hook_command(_home: &Path, command: &str, args: &[&str], hook: &str) -> String {
+    std::iter::once(command)
         .chain(args.iter().copied())
         .chain(["claude-hook", hook])
         .map(posix_escape)
         .collect::<Vec<_>>()
-        .join(" ");
-    format!(
-        "CLAUDE_ENV_FILE={} {base}",
-        posix_escape(&claude_session_env_file(home))
-    )
+        .join(" ")
 }
 
 fn all_claude_hook_commands(settings_root: &JsonValue) -> Vec<&str> {
@@ -199,16 +187,13 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
         py_has_interpreter_python,
         "expected python args to include python interpreter selection"
     );
-    let expected_env_file = claude_session_env_file(temp.path());
-    assert_eq!(
-        root["mcpServers"]["r"]["env"]["CLAUDE_ENV_FILE"].as_str(),
-        Some(expected_env_file.as_str()),
-        "expected r server to receive CLAUDE_ENV_FILE"
+    assert!(
+        root["mcpServers"]["r"].get("env").is_none(),
+        "expected r server config not to depend on a session env file passthrough"
     );
-    assert_eq!(
-        root["mcpServers"]["python"]["env"]["CLAUDE_ENV_FILE"].as_str(),
-        Some(expected_env_file.as_str()),
-        "expected python server to receive CLAUDE_ENV_FILE"
+    assert!(
+        root["mcpServers"]["python"].get("env").is_none(),
+        "expected python server config not to depend on a session env file passthrough"
     );
 
     let settings_path = temp.path().join(".claude/settings.json");
@@ -249,6 +234,64 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
     assert!(
         settings_root.get("hooks").is_some(),
         "expected Claude settings to store hooks under the hooks object"
+    );
+
+    Ok(())
+}
+
+#[test]
+fn install_claude_target_does_not_hardcode_shared_session_env_file() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let exe = common::resolve_test_binary()?;
+
+    let status = Command::new(exe)
+        .arg("install")
+        .arg("--client")
+        .arg("claude")
+        .arg("--command")
+        .arg("/usr/local/bin/mcp-repl")
+        .env("HOME", temp.path())
+        .status()?;
+    assert!(
+        status.success(),
+        "install --client claude failed with status {status}"
+    );
+
+    let config_path = temp.path().join(".claude.json");
+    let text = std::fs::read_to_string(config_path)?;
+    let root: JsonValue = serde_json::from_str(&text)?;
+    for server_name in ["r", "python"] {
+        let server = root["mcpServers"][server_name]
+            .as_object()
+            .expect("expected Claude server object");
+        assert!(
+            server.get("env").is_none(),
+            "expected {server_name} server config not to depend on a session env file passthrough"
+        );
+    }
+
+    let settings_path = temp.path().join(".claude/settings.json");
+    let settings_text = std::fs::read_to_string(settings_path)?;
+    let settings_root: JsonValue = serde_json::from_str(&settings_text)?;
+    let session_start_commands = all_claude_hook_commands(&settings_root)
+        .into_iter()
+        .filter(|command| command.contains("claude-hook session-start"))
+        .collect::<Vec<_>>();
+    let session_end_commands = all_claude_hook_commands(&settings_root)
+        .into_iter()
+        .filter(|command| command.contains("claude-hook session-end"))
+        .collect::<Vec<_>>();
+    assert!(
+        session_start_commands
+            .iter()
+            .all(|command| !command.contains("CLAUDE_ENV_FILE=")),
+        "expected SessionStart hooks not to prefix a shared CLAUDE_ENV_FILE"
+    );
+    assert!(
+        session_end_commands
+            .iter()
+            .all(|command| !command.contains("CLAUDE_ENV_FILE=")),
+        "expected SessionEnd hooks not to prefix a shared CLAUDE_ENV_FILE"
     );
 
     Ok(())

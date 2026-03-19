@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -9,6 +10,7 @@ use std::time::Duration;
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use serde::{Deserialize, Serialize};
+use sysinfo::{Pid, ProcessesToUpdate, System};
 
 use crate::backend::Backend;
 use crate::worker_process::{WorkerError, WorkerManager};
@@ -19,6 +21,9 @@ pub const CLAUDE_ENV_FILE_ENV: &str = "CLAUDE_ENV_FILE";
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const STATE_SUBDIR: &str = "mcp-repl/claude-clear";
 const CLAUDE_SESSION_ID_TOKEN_PREFIX: &str = "mcp_repl_session_id_b64_";
+const CLAUDE_PROJECT_DIR_ENV: &str = "CLAUDE_PROJECT_DIR";
+const CLAUDE_TEST_SCOPE_KEY_ENV: &str = "MCP_REPL_CLAUDE_TEST_SCOPE_KEY";
+const CLAUDE_SCOPE_KEY_VERSION: &[u8] = b"mcp-repl-claude-scope-v1";
 static NEXT_TMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,15 +75,35 @@ struct InstanceRecordTemplate {
 
 #[derive(Debug, Clone)]
 struct ClaudeSessionBinding {
-    env_file_path: PathBuf,
+    identity: ClaudeSessionIdentity,
     session_id: String,
+}
+
+#[derive(Debug, Clone)]
+enum ClaudeSessionIdentity {
+    ScopeKey(String),
+    EnvFile(PathBuf),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaudeSessionState {
+    session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    claude_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+    updated_unix_ms: u128,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InstanceRecord {
     claude_session_id: String,
-    env_file_path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    env_file_path: Option<String>,
     backend: String,
     pid: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -108,7 +133,8 @@ impl ClaudeClearBinding {
         backend: Backend,
         initial_control_seq: u64,
     ) -> Result<Option<Self>, WorkerError> {
-        let Some(binding_session) = current_claude_session_from_env_file() else {
+        prune_stale_claude_state().map_err(WorkerError::Io)?;
+        let Some(binding_session) = current_claude_session_binding() else {
             return Ok(None);
         };
 
@@ -194,9 +220,16 @@ impl ClaudeClearBinding {
         binding_session: &ClaudeSessionBinding,
         template: &InstanceRecordTemplate,
     ) -> io::Result<()> {
+        let (scope_key, env_file_path) = match &binding_session.identity {
+            ClaudeSessionIdentity::ScopeKey(scope_key) => (Some(scope_key.clone()), None),
+            ClaudeSessionIdentity::EnvFile(path) => {
+                (None, Some(path.to_string_lossy().to_string()))
+            }
+        };
         let record = InstanceRecord {
             claude_session_id: binding_session.session_id.clone(),
-            env_file_path: binding_session.env_file_path.to_string_lossy().to_string(),
+            scope_key,
+            env_file_path,
             backend: template.backend.clone(),
             pid: template.pid,
             cwd: template.cwd.clone(),
@@ -233,24 +266,13 @@ fn handle_session_start(input: &HookInput) -> Result<(), Box<dyn std::error::Err
     if input.hook_event_name.as_deref() != Some("SessionStart") {
         return Ok(());
     }
-    let Some(path) = env::var_os(CLAUDE_ENV_FILE_ENV).map(PathBuf::from) else {
-        return Ok(());
-    };
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent)?;
+    prune_stale_claude_state()?;
+    if let Some(scope_key) = current_claude_scope_key() {
+        write_session_state(&scope_key, session_id)?;
     }
-    let needs_separator = env_file_needs_separator(&path)?;
-    let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
-    if needs_separator {
-        writeln!(file)?;
+    if let Some(path) = current_claude_env_file_path() {
+        append_session_id_export(&path, session_id)?;
     }
-    let encoded_session_id = URL_SAFE_NO_PAD.encode(session_id);
-    writeln!(
-        file,
-        "export {CLAUDE_SESSION_ID_ENV}={CLAUDE_SESSION_ID_TOKEN_PREFIX}{encoded_session_id}"
-    )?;
     Ok(())
 }
 
@@ -265,22 +287,46 @@ fn handle_session_end(input: &HookInput) -> Result<(), Box<dyn std::error::Error
     if input.reason.as_deref() != Some("clear") {
         return Ok(());
     }
-    let Some(env_file_path) = env::var_os(CLAUDE_ENV_FILE_ENV).map(PathBuf::from) else {
-        return Ok(());
-    };
-    if fs::read_to_string(&env_file_path).is_err() {
+    prune_stale_claude_state()?;
+
+    let mut matched_any = false;
+    if let Some(scope_key) = current_claude_scope_key() {
+        for record in load_instance_records_for_scope(&scope_key, session_id)? {
+            let path = PathBuf::from(record.control_path);
+            request_restart(&path)?;
+            matched_any = true;
+        }
+    }
+    if matched_any {
         return Ok(());
     }
 
-    for record in load_instance_records_for_binding(&env_file_path, session_id)? {
-        let path = PathBuf::from(record.control_path);
-        request_restart(&path)?;
+    if let Some(env_file_path) = current_claude_env_file_path() {
+        if fs::read_to_string(&env_file_path).is_err() {
+            return Ok(());
+        }
+        for record in load_instance_records_for_env_file(&env_file_path, session_id)? {
+            let path = PathBuf::from(record.control_path);
+            request_restart(&path)?;
+        }
     }
     Ok(())
 }
 
-fn current_claude_session_from_env_file() -> Option<ClaudeSessionBinding> {
-    let env_file_path = env::var_os(CLAUDE_ENV_FILE_ENV).map(PathBuf::from)?;
+fn current_claude_session_binding() -> Option<ClaudeSessionBinding> {
+    if let Some(scope_key) = current_claude_scope_key()
+        && let Some(state) = read_session_state(&scope_key)
+    {
+        let session_id = state.session_id.trim().to_string();
+        if !session_id.is_empty() {
+            return Some(ClaudeSessionBinding {
+                identity: ClaudeSessionIdentity::ScopeKey(scope_key),
+                session_id,
+            });
+        }
+    }
+
+    let env_file_path = current_claude_env_file_path()?;
     let session_id = read_session_id_from_env_file(Some(&env_file_path))?
         .trim()
         .to_string();
@@ -288,9 +334,87 @@ fn current_claude_session_from_env_file() -> Option<ClaudeSessionBinding> {
         return None;
     }
     Some(ClaudeSessionBinding {
-        env_file_path,
+        identity: ClaudeSessionIdentity::EnvFile(env_file_path),
         session_id,
     })
+}
+
+fn current_claude_env_file_path() -> Option<PathBuf> {
+    env::var_os(CLAUDE_ENV_FILE_ENV)
+        .filter(|raw| !raw.is_empty())
+        .map(PathBuf::from)
+}
+
+fn current_claude_scope_key() -> Option<String> {
+    if let Ok(scope_key) = env::var(CLAUDE_TEST_SCOPE_KEY_ENV)
+        && !scope_key.trim().is_empty()
+    {
+        return Some(scope_key);
+    }
+
+    let cwd = current_claude_project_dir()?;
+    let claude_pid = current_claude_process_pid()?;
+    let mut input = Vec::new();
+    input.extend_from_slice(CLAUDE_SCOPE_KEY_VERSION);
+    input.push(0);
+    input.extend_from_slice(cwd.to_string_lossy().as_bytes());
+    input.push(0);
+    input.extend_from_slice(claude_pid.to_string().as_bytes());
+    Some(blake3::hash(&input).to_hex().to_string())
+}
+
+fn current_claude_project_dir() -> Option<PathBuf> {
+    env::var_os(CLAUDE_PROJECT_DIR_ENV)
+        .filter(|raw| !raw.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| env::current_dir().ok())
+}
+
+fn current_claude_process_pid() -> Option<u32> {
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    let mut pid = Pid::from_u32(std::process::id());
+    for _ in 0..64 {
+        let process = system.process(pid)?;
+        let parent = process.parent()?;
+        let parent_process = system.process(parent)?;
+        let name = parent_process.name().to_string_lossy();
+        if is_claude_process_name(&name) {
+            return Some(parent.as_u32());
+        }
+        pid = parent;
+    }
+    None
+}
+
+fn is_claude_process_name(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "claude" | "claude.exe" | "claude-code" | "claude code"
+    )
+}
+
+fn read_session_state(scope_key: &str) -> Option<ClaudeSessionState> {
+    let path = claude_session_state_path(scope_key).ok()?;
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn write_session_state(scope_key: &str, session_id: &str) -> io::Result<()> {
+    let state = ClaudeSessionState {
+        session_id: session_id.to_string(),
+        claude_pid: current_claude_process_pid(),
+        cwd: current_claude_project_dir().map(|path| path.to_string_lossy().to_string()),
+        updated_unix_ms: unix_ms_now(),
+    };
+    let path = claude_session_state_path(scope_key)?;
+    write_json_atomic(&path, &state)
+}
+
+fn claude_session_state_path(scope_key: &str) -> io::Result<PathBuf> {
+    Ok(claude_clear_state_dir()?
+        .join("sessions")
+        .join(format!("{scope_key}.json")))
 }
 
 fn read_session_id_from_env_file(path: Option<&Path>) -> Option<String> {
@@ -323,6 +447,25 @@ fn decode_session_id_token(value: &str) -> Option<String> {
     String::from_utf8(decoded).ok()
 }
 
+fn append_session_id_export(path: &Path, session_id: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)?;
+    }
+    let needs_separator = env_file_needs_separator(path)?;
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    if needs_separator {
+        writeln!(file)?;
+    }
+    let encoded_session_id = URL_SAFE_NO_PAD.encode(session_id);
+    writeln!(
+        file,
+        "export {CLAUDE_SESSION_ID_ENV}={CLAUDE_SESSION_ID_TOKEN_PREFIX}{encoded_session_id}"
+    )?;
+    Ok(())
+}
+
 fn request_restart(path: &Path) -> io::Result<()> {
     let next_seq = read_control_request(path)
         .map(|request| request.seq.saturating_add(1))
@@ -353,14 +496,30 @@ fn env_file_needs_separator(path: &Path) -> io::Result<bool> {
     Ok(!raw.is_empty() && !raw.ends_with(b"\n"))
 }
 
-fn load_instance_records_for_binding(
+fn load_instance_records_for_scope(
+    scope_key: &str,
+    session_id: &str,
+) -> io::Result<Vec<InstanceRecord>> {
+    let mut out = Vec::new();
+    for record in load_instance_records()? {
+        if record.claude_session_id == session_id && record.scope_key.as_deref() == Some(scope_key)
+        {
+            out.push(record);
+        }
+    }
+    Ok(out)
+}
+
+fn load_instance_records_for_env_file(
     env_file_path: &Path,
     session_id: &str,
 ) -> io::Result<Vec<InstanceRecord>> {
     let env_file_path = env_file_path.to_string_lossy().to_string();
     let mut out = Vec::new();
     for record in load_instance_records()? {
-        if record.claude_session_id == session_id && record.env_file_path == env_file_path {
+        if record.claude_session_id == session_id
+            && record.env_file_path.as_deref() == Some(env_file_path.as_str())
+        {
             out.push(record);
         }
     }
@@ -388,6 +547,72 @@ fn load_instance_records() -> io::Result<Vec<InstanceRecord>> {
         out.push(record);
     }
     Ok(out)
+}
+
+fn prune_stale_claude_state() -> io::Result<()> {
+    let live_pids = live_process_ids();
+    prune_stale_claude_session_states(&live_pids)?;
+    prune_stale_claude_instance_records(&live_pids)?;
+    Ok(())
+}
+
+fn prune_stale_claude_session_states(live_pids: &HashSet<u32>) -> io::Result<()> {
+    let sessions_dir = claude_clear_state_dir()?.join("sessions");
+    if !sessions_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(sessions_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(state) = serde_json::from_str::<ClaudeSessionState>(&raw) else {
+            continue;
+        };
+        if state
+            .claude_pid
+            .is_some_and(|pid| !live_pids.contains(&pid))
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+    Ok(())
+}
+
+fn prune_stale_claude_instance_records(live_pids: &HashSet<u32>) -> io::Result<()> {
+    let instances_dir = claude_clear_state_dir()?.join("instances");
+    if !instances_dir.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(instances_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Ok(raw) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<InstanceRecord>(&raw) else {
+            continue;
+        };
+        if live_pids.contains(&record.pid) {
+            continue;
+        }
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(PathBuf::from(record.control_path));
+    }
+    Ok(())
+}
+
+fn live_process_ids() -> HashSet<u32> {
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    system.processes().keys().map(|pid| pid.as_u32()).collect()
 }
 
 fn unique_instance_id(
@@ -604,6 +829,7 @@ mod tests {
         let controls_dir = state_root.join("controls");
         fs::create_dir_all(&instances_dir).expect("create instances dir");
         fs::create_dir_all(&controls_dir).expect("create controls dir");
+        let live_pid = std::process::id();
 
         let control_a = controls_dir.join("r-a.json");
         let control_b = controls_dir.join("r-b.json");
@@ -629,9 +855,10 @@ mod tests {
             &instances_dir.join("r-a.json"),
             &InstanceRecord {
                 claude_session_id: "sess-shared".to_string(),
-                env_file_path: env_file_a.to_string_lossy().to_string(),
+                scope_key: None,
+                env_file_path: Some(env_file_a.to_string_lossy().to_string()),
                 backend: "r".to_string(),
-                pid: 1,
+                pid: live_pid,
                 cwd: None,
                 control_path: control_a.to_string_lossy().to_string(),
                 started_unix_ms: 1,
@@ -642,9 +869,10 @@ mod tests {
             &instances_dir.join("r-b.json"),
             &InstanceRecord {
                 claude_session_id: "sess-shared".to_string(),
-                env_file_path: env_file_b.to_string_lossy().to_string(),
+                scope_key: None,
+                env_file_path: Some(env_file_b.to_string_lossy().to_string()),
                 backend: "r".to_string(),
-                pid: 2,
+                pid: live_pid,
                 cwd: None,
                 control_path: control_b.to_string_lossy().to_string(),
                 started_unix_ms: 1,
@@ -694,7 +922,10 @@ mod tests {
         let binding_session =
             current_claude_session_from_env_file_with_path(&env_file).expect("binding session");
         assert_eq!(binding_session.session_id, "sess-latest");
-        assert_eq!(binding_session.env_file_path, env_file);
+        assert!(matches!(
+            binding_session.identity,
+            ClaudeSessionIdentity::EnvFile(ref path) if path == &env_file
+        ));
     }
 
     #[test]
@@ -827,7 +1058,7 @@ mod tests {
             return None;
         }
         Some(ClaudeSessionBinding {
-            env_file_path: path.to_path_buf(),
+            identity: ClaudeSessionIdentity::EnvFile(path.to_path_buf()),
             session_id,
         })
     }

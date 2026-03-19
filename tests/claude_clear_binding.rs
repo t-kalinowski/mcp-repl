@@ -23,6 +23,19 @@ fn claude_env_vars(state_home: &Path, env_file: &Path) -> Vec<(String, String)> 
     ]
 }
 
+fn claude_scope_env_vars(state_home: &Path, scope_key: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            "XDG_STATE_HOME".to_string(),
+            state_home.to_string_lossy().to_string(),
+        ),
+        (
+            "MCP_REPL_CLAUDE_TEST_SCOPE_KEY".to_string(),
+            scope_key.to_string(),
+        ),
+    ]
+}
+
 #[cfg(not(windows))]
 fn source_session_id_from_env_file(env_file: &Path) -> TestResult<String> {
     let output = Command::new("sh")
@@ -75,6 +88,39 @@ fn run_session_end_clear(
     common::run_claude_hook(
         exe,
         &env_vars,
+        "session-end",
+        json!({
+            "hook_event_name": "SessionEnd",
+            "session_id": session_id,
+            "reason": "clear",
+        }),
+    )
+}
+
+fn run_session_start_with_env(
+    exe: &Path,
+    env_vars: &[(String, String)],
+    session_id: &str,
+) -> TestResult<()> {
+    common::run_claude_hook(
+        exe,
+        env_vars,
+        "session-start",
+        json!({
+            "hook_event_name": "SessionStart",
+            "session_id": session_id,
+        }),
+    )
+}
+
+fn run_session_end_clear_with_env(
+    exe: &Path,
+    env_vars: &[(String, String)],
+    session_id: &str,
+) -> TestResult<()> {
+    common::run_claude_hook(
+        exe,
+        env_vars,
         "session-end",
         json!({
             "hook_event_name": "SessionEnd",
@@ -750,6 +796,59 @@ async fn claude_clear_concurrent_same_directory_sessions_do_not_reset_each_other
     assert!(
         b_after_a_clear.contains("TRUE"),
         "expected clear for session A not to reset concurrent session B, got: {b_after_a_clear:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_clear_scope_binding_works_without_claude_env_file() -> TestResult<()> {
+    let _guard = common::lock_test_mutex()?;
+    let temp = tempfile::tempdir()?;
+    let exe = common::resolve_test_binary()?;
+    let env_vars = claude_scope_env_vars(temp.path(), "scope-without-env-file");
+
+    run_session_start_with_env(&exe, &env_vars, "sess-scope")?;
+
+    let mut session = common::spawn_server_with_env_vars(env_vars.clone()).await?;
+
+    let first_request = match repl_text(
+        &mut session,
+        "scope_bound <- 1; print(exists(\"scope_bound\"))",
+        "during scope binding without CLAUDE_ENV_FILE",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session.cancel().await?;
+            return Ok(());
+        }
+    };
+    assert!(
+        first_request.contains("TRUE"),
+        "expected scope-bound request to create state, got: {first_request:?}"
+    );
+
+    run_session_end_clear_with_env(&exe, &env_vars, "sess-scope")?;
+
+    let after_clear = match repl_text(
+        &mut session,
+        "print(exists(\"scope_bound\"))",
+        "after scope-based clear without CLAUDE_ENV_FILE",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session.cancel().await?;
+            return Ok(());
+        }
+    };
+
+    session.cancel().await?;
+    assert!(
+        after_clear.contains("FALSE"),
+        "expected scope-based clear to reset state without CLAUDE_ENV_FILE, got: {after_clear:?}"
     );
     Ok(())
 }

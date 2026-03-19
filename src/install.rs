@@ -148,13 +148,7 @@ pub fn run(options: InstallOptions) -> Result<(), Box<dyn std::error::Error>> {
                 }
                 for (server_name, interpreter) in &server_specs {
                     let server_args = with_interpreter_arg(&claude_args, *interpreter);
-                    upsert_claude_mcp_server(
-                        &config_path,
-                        server_name,
-                        &command,
-                        &server_args,
-                        &claude_env_file,
-                    )?;
+                    upsert_claude_mcp_server(&config_path, server_name, &command, &server_args)?;
                     upsert_claude_settings_permission(&settings_path, server_name)?;
                 }
                 upsert_claude_settings_hooks(
@@ -162,7 +156,6 @@ pub fn run(options: InstallOptions) -> Result<(), Box<dyn std::error::Error>> {
                     &command,
                     &options.args,
                     &stale_hook_commands,
-                    &claude_env_file,
                 )?;
                 println!("Updated claude MCP config: {}", config_path.display());
                 println!("Updated claude permissions: {}", settings_path.display());
@@ -529,7 +522,6 @@ fn upsert_claude_mcp_server(
     server_name: &str,
     command: &str,
     args: &[String],
-    env_file: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut root = if config_path.is_file() {
         let raw = fs::read_to_string(config_path)?;
@@ -562,13 +554,6 @@ fn upsert_claude_mcp_server(
             (
                 "args".to_string(),
                 JsonValue::Array(args.iter().cloned().map(JsonValue::String).collect()),
-            ),
-            (
-                "env".to_string(),
-                JsonValue::Object(JsonMap::from_iter([(
-                    CLAUDE_ENV_FILE_ENV.to_string(),
-                    JsonValue::String(env_file.display().to_string()),
-                )])),
             ),
         ])),
     );
@@ -627,7 +612,6 @@ fn upsert_claude_settings_hooks(
     command: &str,
     args: &[String],
     stale_hook_commands: &[String],
-    env_file: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut root = if settings_path.is_file() {
         let raw = fs::read_to_string(settings_path)?;
@@ -646,10 +630,8 @@ fn upsert_claude_settings_hooks(
     };
     let hooks_obj = normalize_claude_settings_hooks_root(root_obj)?;
 
-    let session_start_command =
-        claude_hook_command_with_env(command, args, "session-start", Some(env_file));
-    let session_end_command =
-        claude_hook_command_with_env(command, args, "session-end", Some(env_file));
+    let session_start_command = claude_hook_command(command, args, "session-start");
+    let session_end_command = claude_hook_command(command, args, "session-end");
     for matcher in CLAUDE_HOOK_SESSION_START_MATCHERS {
         upsert_claude_hook_command(
             hooks_obj,
@@ -1631,7 +1613,6 @@ name="demo"
     fn upsert_claude_mcp_server_does_not_add_sandbox_comment_field() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = dir.path().join("settings.json");
-        let env_file = dir.path().join("session.env");
         upsert_claude_mcp_server(
             &config,
             "repl",
@@ -1642,7 +1623,6 @@ name="demo"
                 "--sandbox".to_string(),
                 "workspace-write".to_string(),
             ],
-            &env_file,
         )
         .expect("upsert claude");
 
@@ -1681,11 +1661,9 @@ name="demo"
             server.get("_comment_sandbox_state").is_none(),
             "did not expect sandbox comment field in claude config"
         );
-        let env_file_text = env_file.display().to_string();
-        assert_eq!(
-            server["env"][CLAUDE_ENV_FILE_ENV].as_str(),
-            Some(env_file_text.as_str()),
-            "expected CLAUDE_ENV_FILE on claude server entry"
+        assert!(
+            server.get("env").is_none(),
+            "did not expect Claude config to depend on a session env file passthrough"
         );
     }
 
@@ -1842,21 +1820,12 @@ name="demo"
     fn upsert_claude_settings_hooks_adds_session_start_and_session_end_hooks() {
         let dir = tempfile::tempdir().expect("tempdir");
         let settings = dir.path().join("settings.json");
-        let env_file = claude_session_env_file(dir.path());
-        let expected_session_start = claude_hook_command_with_env(
-            "/usr/local/bin/mcp-repl",
-            &[],
-            "session-start",
-            Some(&env_file),
-        );
-        let expected_session_end = claude_hook_command_with_env(
-            "/usr/local/bin/mcp-repl",
-            &[],
-            "session-end",
-            Some(&env_file),
-        );
+        let expected_session_start =
+            claude_hook_command_with_env("/usr/local/bin/mcp-repl", &[], "session-start", None);
+        let expected_session_end =
+            claude_hook_command_with_env("/usr/local/bin/mcp-repl", &[], "session-end", None);
 
-        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl", &[], &[], &env_file)
+        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl", &[], &[])
             .expect("upsert hooks");
 
         let text = fs::read_to_string(&settings).expect("read settings");
@@ -1889,17 +1858,12 @@ name="demo"
     fn upsert_claude_settings_hooks_does_not_duplicate_existing_commands() {
         let dir = tempfile::tempdir().expect("tempdir");
         let settings = dir.path().join("settings.json");
-        let env_file = claude_session_env_file(dir.path());
-        let expected_session_start = claude_hook_command_with_env(
-            "/usr/local/bin/mcp-repl",
-            &[],
-            "session-start",
-            Some(&env_file),
-        );
+        let expected_session_start =
+            claude_hook_command_with_env("/usr/local/bin/mcp-repl", &[], "session-start", None);
 
-        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl", &[], &[], &env_file)
+        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl", &[], &[])
             .expect("first upsert");
-        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl", &[], &[], &env_file)
+        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl", &[], &[])
             .expect("second upsert");
 
         let text = fs::read_to_string(&settings).expect("read settings");
@@ -1921,13 +1885,8 @@ name="demo"
     fn upsert_claude_settings_hooks_replaces_existing_mcp_repl_command_for_matcher() {
         let dir = tempfile::tempdir().expect("tempdir");
         let settings = dir.path().join("settings.json");
-        let env_file = claude_session_env_file(dir.path());
-        let expected_session_start = claude_hook_command_with_env(
-            "/usr/local/bin/mcp-repl",
-            &[],
-            "session-start",
-            Some(&env_file),
-        );
+        let expected_session_start =
+            claude_hook_command_with_env("/usr/local/bin/mcp-repl", &[], "session-start", None);
 
         let stale = serde_json::json!({
             "SessionStart": [
@@ -1951,7 +1910,6 @@ name="demo"
             "/usr/local/bin/mcp-repl",
             &[],
             &[String::from("/opt/old/mcp-repl claude-hook session-start")],
-            &env_file,
         )
         .expect("upsert hooks");
 
