@@ -404,6 +404,12 @@ mod unix_impl {
         if text.contains("WARN codex_core::shell_snapshot: Failed to delete shell snapshot") {
             return String::new();
         }
+        if text.contains("responses_websocket: failed to connect to websocket")
+            || text.contains("Reconnecting... ")
+            || text.contains("Falling back from WebSockets to HTTPS transport.")
+        {
+            return String::new();
+        }
         let workspace_display = workspace.display().to_string();
         let codex_home_display = codex_home.display().to_string();
         let workspace_private = format!("/private{workspace_display}");
@@ -420,6 +426,7 @@ mod unix_impl {
         }
 
         let mut text = normalize_temp_paths(&normalize_codex_home_path(&text));
+        text = normalize_exec_item_ids(&text);
         text = normalize_json_string_field(&text, "thread_id", "<THREAD_ID>");
         text = normalize_json_number_field(&text, "input_tokens", "\"<N>\"");
         text = normalize_json_number_field(&text, "cached_input_tokens", "\"<N>\"");
@@ -443,6 +450,67 @@ mod unix_impl {
             text = format!("<TIMESTAMP>{}", &text[text.find(" WARN ").unwrap_or(0)..]);
         }
         text
+    }
+
+    fn normalize_exec_item_ids(text: &str) -> String {
+        let needle = "\"id\":\"item_";
+        let mut out = String::with_capacity(text.len());
+        let mut idx = 0;
+        while let Some(pos) = text[idx..].find(needle) {
+            let abs = idx + pos;
+            out.push_str(&text[idx..abs]);
+            out.push_str("\"id\":\"item_<N>");
+            let mut end = abs + needle.len();
+            while end < text.len() && text.as_bytes()[end].is_ascii_digit() {
+                end += 1;
+            }
+            if end < text.len() && text.as_bytes()[end] == b'"' {
+                out.push('"');
+                end += 1;
+            }
+            idx = end;
+        }
+        out.push_str(&text[idx..]);
+        out
+    }
+
+    #[test]
+    fn normalize_exec_text_drops_websocket_fallback_noise() {
+        let workspace = Path::new("/tmp/workspace");
+        let codex_home = Path::new("/tmp/codex-home");
+
+        assert!(
+            normalize_exec_text(
+                "2026-03-19T22:02:11.800078Z ERROR codex_api::endpoint::responses_websocket: failed to connect to websocket: HTTP error: 404 Not Found",
+                workspace,
+                codex_home,
+            )
+            .is_empty()
+        );
+        assert!(
+            normalize_exec_text(
+                "{\"type\":\"error\",\"message\":\"Reconnecting... 2/5 (unexpected status 404 Not Found)\"}",
+                workspace,
+                codex_home,
+            )
+            .is_empty()
+        );
+        assert!(
+            normalize_exec_text(
+                "{\"type\":\"item.completed\",\"item\":{\"id\":\"item_0\",\"type\":\"error\",\"message\":\"Falling back from WebSockets to HTTPS transport. unexpected status 404 Not Found\"}}",
+                workspace,
+                codex_home,
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            normalize_exec_text(
+                "{\"type\":\"item.started\",\"item\":{\"id\":\"item_42\",\"type\":\"mcp_tool_call\"}}",
+                workspace,
+                codex_home,
+            ),
+            "{\"type\":\"item.started\",\"item\":{\"id\":\"item_<N>\",\"type\":\"mcp_tool_call\"}}"
+        );
     }
 
     fn normalize_ms_duration(text: &str) -> String {

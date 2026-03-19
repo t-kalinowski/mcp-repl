@@ -340,12 +340,21 @@ fn handle_session_start(input: &HookInput) -> Result<(), Box<dyn std::error::Err
     if input.hook_event_name.as_deref() != Some("SessionStart") {
         return Ok(());
     }
-    prune_stale_claude_state()?;
-    if let Some(scope_key) = current_claude_scope_key(None) {
-        upsert_scope_session_state(&scope_key, session_id)?;
+    let env_file_path = current_claude_env_file_path();
+    if let Some(path) = env_file_path.as_ref() {
+        append_session_id_export(path, session_id)?;
     }
-    if let Some(path) = current_claude_env_file_path() {
-        append_session_id_export(&path, session_id)?;
+    let scope_key = current_claude_scope_key(None);
+    if let Err(err) = prune_stale_claude_state()
+        && !(err.kind() == io::ErrorKind::NotFound && env_file_path.is_some())
+    {
+        return Err(err.into());
+    }
+    if let Some(scope_key) = scope_key
+        && let Err(err) = upsert_scope_session_state(&scope_key, session_id)
+        && !(err.kind() == io::ErrorKind::NotFound && env_file_path.is_some())
+    {
+        return Err(err.into());
     }
     Ok(())
 }
@@ -373,6 +382,10 @@ fn handle_session_end(input: &HookInput) -> Result<(), Box<dyn std::error::Error
 
     if let Some(env_file_path) = current_claude_env_file_path() {
         for record in load_instance_records_for_env_file(&env_file_path, session_id)? {
+            restart_paths.insert(record.path);
+        }
+    } else {
+        for record in load_instance_records_for_env_file_session(session_id)? {
             restart_paths.insert(record.path);
         }
     }
@@ -711,6 +724,18 @@ fn load_instance_records_for_env_file(
         if record.record.claude_session_id == session_id
             && record.record.env_file_path.as_deref() == Some(env_file_path.as_str())
         {
+            out.push(record);
+        }
+    }
+    Ok(out)
+}
+
+fn load_instance_records_for_env_file_session(
+    session_id: &str,
+) -> io::Result<Vec<LoadedInstanceRecord>> {
+    let mut out = Vec::new();
+    for record in load_instance_records()? {
+        if record.record.claude_session_id == session_id && record.record.env_file_path.is_some() {
             out.push(record);
         }
     }
@@ -1251,6 +1276,92 @@ mod tests {
         unsafe {
             env::remove_var("XDG_STATE_HOME");
             env::remove_var(CLAUDE_ENV_FILE_ENV);
+        }
+    }
+
+    #[test]
+    fn session_end_hook_queues_restart_for_matching_env_file_session_without_claude_env_file() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let temp = test_tempdir("claude-session-end-without-env-var-");
+        let env_file = temp.path().join("claude.env");
+        unsafe {
+            env::set_var("XDG_STATE_HOME", temp.path());
+            env::remove_var(CLAUDE_ENV_FILE_ENV);
+        }
+        let state_root = claude_clear_state_dir().expect("state root");
+        let instances_dir = state_root.join("instances");
+        fs::create_dir_all(&instances_dir).expect("create instances dir");
+
+        let record_path = instances_dir.join("r-without-env-var.json");
+        write_json_atomic(
+            &record_path,
+            &InstanceRecord {
+                claude_session_id: "sess-without-env-var".to_string(),
+                scope_key: None,
+                env_file_path: Some(env_file.to_string_lossy().to_string()),
+                backend: "r".to_string(),
+                pid: std::process::id(),
+                cwd: None,
+                started_unix_ms: 1,
+                control_seq: 0,
+            },
+        )
+        .expect("write record");
+
+        handle_session_end(&HookInput {
+            hook_event_name: Some("SessionEnd".to_string()),
+            session_id: "sess-without-env-var".to_string(),
+            reason: Some("clear".to_string()),
+        })
+        .expect("handle session end");
+
+        let request = read_full_instance_record(&record_path).expect("read record");
+        assert_eq!(
+            request.control_seq, 1,
+            "missing CLAUDE_ENV_FILE should still restart the matching env-file-bound session"
+        );
+
+        unsafe {
+            env::remove_var("XDG_STATE_HOME");
+        }
+    }
+
+    #[test]
+    fn session_start_hook_appends_session_id_without_state_home_when_env_file_is_available() {
+        let _guard = ENV_LOCK.lock().expect("env lock");
+        let temp = test_tempdir("claude-session-start-no-state-home-");
+        let env_file = temp.path().join("claude.env");
+        let home = env::var_os("HOME");
+        let xdg_state_home = env::var_os("XDG_STATE_HOME");
+        unsafe {
+            env::remove_var("XDG_STATE_HOME");
+            env::remove_var("HOME");
+            env::set_var(CLAUDE_ENV_FILE_ENV, &env_file);
+            env::remove_var(CLAUDE_TEST_SCOPE_KEY_ENV);
+            env::remove_var(CLAUDE_PROJECT_DIR_ENV);
+        }
+
+        handle_session_start(&HookInput {
+            hook_event_name: Some("SessionStart".to_string()),
+            session_id: "sess-no-state-home".to_string(),
+            reason: None,
+        })
+        .expect("handle session start");
+
+        let raw = fs::read_to_string(&env_file).expect("read env file");
+        assert!(
+            raw.contains("export MCP_REPL_CLAUDE_SESSION_ID=mcp_repl_session_id_b64_"),
+            "expected session start to append the env-file token without HOME/XDG_STATE_HOME"
+        );
+
+        unsafe {
+            env::remove_var(CLAUDE_ENV_FILE_ENV);
+            if let Some(home) = home {
+                env::set_var("HOME", home);
+            }
+            if let Some(xdg_state_home) = xdg_state_home {
+                env::set_var("XDG_STATE_HOME", xdg_state_home);
+            }
         }
     }
 
