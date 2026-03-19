@@ -1,5 +1,6 @@
 mod common;
 
+use std::path::Path;
 use std::process::Command;
 
 use common::TestResult;
@@ -7,6 +8,66 @@ use serde_json::Value as JsonValue;
 use toml_edit::DocumentMut;
 
 const CLAUDE_SESSION_END_MATCHERS: &[&str] = &["clear", "prompt_input_exit", "other"];
+
+fn claude_hook_entries<'a>(settings_root: &'a JsonValue, event: &str) -> &'a [JsonValue] {
+    settings_root["hooks"][event]
+        .as_array()
+        .map(Vec::as_slice)
+        .expect("expected Claude hooks event array")
+}
+
+fn claude_session_env_file(home: &Path) -> String {
+    home.join(".claude")
+        .join("mcp-repl")
+        .join("session.env")
+        .display()
+        .to_string()
+}
+
+fn installed_claude_hook_command(home: &Path, command: &str, args: &[&str], hook: &str) -> String {
+    let base = std::iter::once(command)
+        .chain(args.iter().copied())
+        .chain(["claude-hook", hook])
+        .map(posix_escape)
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("CLAUDE_ENV_FILE={} {base}", posix_escape(&claude_session_env_file(home)))
+}
+
+fn all_claude_hook_commands(settings_root: &JsonValue) -> Vec<&str> {
+    settings_root["hooks"]
+        .as_object()
+        .into_iter()
+        .flat_map(|events| events.values())
+        .filter_map(JsonValue::as_array)
+        .flatten()
+        .filter_map(|entry| entry["hooks"].as_array())
+        .flatten()
+        .filter_map(|hook| hook["command"].as_str())
+        .collect()
+}
+
+fn posix_escape(raw: &str) -> String {
+    if raw.is_empty() {
+        return "''".to_string();
+    }
+    if raw.bytes().all(|byte| {
+        matches!(
+            byte,
+            b'A'..=b'Z'
+                | b'a'..=b'z'
+                | b'0'..=b'9'
+                | b'/'
+                | b'.'
+                | b'_'
+                | b'-'
+                | b':'
+        )
+    }) {
+        return raw.to_string();
+    }
+    format!("'{}'", raw.replace('\'', "'\"'\"'"))
+}
 
 #[test]
 fn install_codex_target_defaults_to_r_and_python_servers() -> TestResult<()> {
@@ -135,29 +196,39 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
         py_has_interpreter_python,
         "expected python args to include python interpreter selection"
     );
+    let expected_env_file = claude_session_env_file(temp.path());
+    assert_eq!(
+        root["mcpServers"]["r"]["env"]["CLAUDE_ENV_FILE"].as_str(),
+        Some(expected_env_file.as_str()),
+        "expected r server to receive CLAUDE_ENV_FILE"
+    );
+    assert_eq!(
+        root["mcpServers"]["python"]["env"]["CLAUDE_ENV_FILE"].as_str(),
+        Some(expected_env_file.as_str()),
+        "expected python server to receive CLAUDE_ENV_FILE"
+    );
 
     let settings_path = temp.path().join(".claude/settings.json");
     let settings_text = std::fs::read_to_string(settings_path)?;
     let settings_root: JsonValue = serde_json::from_str(&settings_text)?;
-    let session_start = settings_root["SessionStart"]
-        .as_array()
-        .expect("expected SessionStart hooks array");
+    let expected_session_start =
+        installed_claude_hook_command(temp.path(), "/usr/local/bin/mcp-repl", &[], "session-start");
+    let session_start = claude_hook_entries(&settings_root, "SessionStart");
     assert!(
         session_start.iter().any(|entry| {
             entry["matcher"].as_str() == Some("startup")
                 && entry["hooks"].as_array().is_some_and(|hooks| {
                     hooks.iter().any(|hook| {
                         hook["type"].as_str() == Some("command")
-                            && hook["command"].as_str()
-                                == Some("/usr/local/bin/mcp-repl claude-hook session-start")
+                            && hook["command"].as_str() == Some(expected_session_start.as_str())
                     })
                 })
         }),
         "expected startup SessionStart hook"
     );
-    let session_end = settings_root["SessionEnd"]
-        .as_array()
-        .expect("expected SessionEnd hooks array");
+    let session_end = claude_hook_entries(&settings_root, "SessionEnd");
+    let expected_session_end =
+        installed_claude_hook_command(temp.path(), "/usr/local/bin/mcp-repl", &[], "session-end");
     for matcher in CLAUDE_SESSION_END_MATCHERS {
         assert!(
             session_end.iter().any(|entry| {
@@ -165,8 +236,7 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
                     && entry["hooks"].as_array().is_some_and(|hooks| {
                         hooks.iter().any(|hook| {
                             hook["type"].as_str() == Some("command")
-                                && hook["command"].as_str()
-                                    == Some("/usr/local/bin/mcp-repl claude-hook session-end")
+                                && hook["command"].as_str() == Some(expected_session_end.as_str())
                         })
                     })
             }),
@@ -174,8 +244,8 @@ fn install_claude_target_defaults_to_r_and_python_servers() -> TestResult<()> {
         );
     }
     assert!(
-        settings_root.get("hooks").is_none(),
-        "did not expect plugin-style top-level hooks wrapper in Claude settings"
+        settings_root.get("hooks").is_some(),
+        "expected Claude settings to store hooks under the hooks object"
     );
 
     Ok(())
@@ -218,9 +288,7 @@ fn install_claude_reinstall_with_custom_command_replaces_hook_commands() -> Test
     let settings_text = std::fs::read_to_string(settings_path)?;
     let settings_root: JsonValue = serde_json::from_str(&settings_text)?;
 
-    let session_start = settings_root["SessionStart"]
-        .as_array()
-        .expect("expected SessionStart hooks array");
+    let session_start = claude_hook_entries(&settings_root, "SessionStart");
     for matcher in ["startup", "resume"] {
         let entry = session_start
             .iter()
@@ -232,7 +300,8 @@ fn install_claude_reinstall_with_custom_command_replaces_hook_commands() -> Test
             .filter_map(|hook| hook["command"].as_str())
             .filter(|command| command.contains("claude-hook session-start"))
             .collect();
-        let expected = format!("{new_command} claude-hook session-start");
+        let expected =
+            installed_claude_hook_command(temp.path(), new_command, &[], "session-start");
         assert_eq!(
             commands,
             vec![expected.as_str()],
@@ -240,10 +309,9 @@ fn install_claude_reinstall_with_custom_command_replaces_hook_commands() -> Test
         );
     }
 
-    let session_end = settings_root["SessionEnd"]
-        .as_array()
-        .expect("expected SessionEnd hooks array");
-    let expected_session_end = format!("{new_command} claude-hook session-end");
+    let session_end = claude_hook_entries(&settings_root, "SessionEnd");
+    let expected_session_end =
+        installed_claude_hook_command(temp.path(), new_command, &[], "session-end");
     for matcher in CLAUDE_SESSION_END_MATCHERS {
         let entry = session_end
             .iter()
@@ -266,16 +334,7 @@ fn install_claude_reinstall_with_custom_command_replaces_hook_commands() -> Test
 
     let stale_session_start = format!("{old_command} claude-hook session-start");
     let stale_session_end = format!("{old_command} claude-hook session-end");
-    let all_commands: Vec<&str> = settings_root
-        .as_object()
-        .expect("expected settings object")
-        .values()
-        .filter_map(JsonValue::as_array)
-        .flatten()
-        .filter_map(|entry| entry["hooks"].as_array())
-        .flatten()
-        .filter_map(|hook| hook["command"].as_str())
-        .collect();
+    let all_commands = all_claude_hook_commands(&settings_root);
     assert!(
         !all_commands.contains(&stale_session_start.as_str()),
         "expected stale SessionStart command to be removed"
@@ -285,8 +344,8 @@ fn install_claude_reinstall_with_custom_command_replaces_hook_commands() -> Test
         "expected stale SessionEnd command to be removed"
     );
     assert!(
-        settings_root.get("hooks").is_none(),
-        "did not expect plugin-style top-level hooks wrapper in Claude settings"
+        settings_root.get("hooks").is_some(),
+        "expected Claude settings to keep hooks under the hooks object"
     );
 
     Ok(())
@@ -351,11 +410,10 @@ fn install_claude_updates_existing_top_level_hook_commands() -> TestResult<()> {
 
     let settings_text = std::fs::read_to_string(settings_path)?;
     let settings_root: JsonValue = serde_json::from_str(&settings_text)?;
-    let expected_session_start = format!("{new_command} claude-hook session-start");
+    let expected_session_start =
+        installed_claude_hook_command(temp.path(), new_command, &[], "session-start");
     let stale_session_start = format!("{old_command} claude-hook session-start");
-    let session_start = settings_root["SessionStart"]
-        .as_array()
-        .expect("expected SessionStart hooks array");
+    let session_start = claude_hook_entries(&settings_root, "SessionStart");
     let startup = session_start
         .iter()
         .find(|entry| entry["matcher"].as_str() == Some("startup"))
@@ -379,10 +437,9 @@ fn install_claude_updates_existing_top_level_hook_commands() -> TestResult<()> {
         "expected stale SessionStart command to be removed"
     );
 
-    let expected_session_end = format!("{new_command} claude-hook session-end");
-    let session_end = settings_root["SessionEnd"]
-        .as_array()
-        .expect("expected SessionEnd hooks array");
+    let expected_session_end =
+        installed_claude_hook_command(temp.path(), new_command, &[], "session-end");
+    let session_end = claude_hook_entries(&settings_root, "SessionEnd");
     let clear = session_end
         .iter()
         .find(|entry| entry["matcher"].as_str() == Some("clear"))
@@ -459,12 +516,12 @@ fn install_claude_reinstall_replaces_old_hook_commands_when_server_names_change(
 
     let settings_text = std::fs::read_to_string(settings_path)?;
     let settings_root: JsonValue = serde_json::from_str(&settings_text)?;
-    let expected_session_start = format!("{new_command} claude-hook session-start");
-    let expected_session_end = format!("{new_command} claude-hook session-end");
+    let expected_session_start =
+        installed_claude_hook_command(temp.path(), new_command, &[], "session-start");
+    let expected_session_end =
+        installed_claude_hook_command(temp.path(), new_command, &[], "session-end");
 
-    let startup = settings_root["SessionStart"]
-        .as_array()
-        .expect("expected SessionStart hooks array")
+    let startup = claude_hook_entries(&settings_root, "SessionStart")
         .iter()
         .find(|entry| entry["matcher"].as_str() == Some("startup"))
         .expect("expected startup SessionStart matcher");
@@ -480,9 +537,7 @@ fn install_claude_reinstall_replaces_old_hook_commands_when_server_names_change(
         "expected stale SessionStart hook from old server name to be replaced"
     );
 
-    let clear = settings_root["SessionEnd"]
-        .as_array()
-        .expect("expected SessionEnd hooks array")
+    let clear = claude_hook_entries(&settings_root, "SessionEnd")
         .iter()
         .find(|entry| entry["matcher"].as_str() == Some("clear"))
         .expect("expected clear SessionEnd matcher");
@@ -564,17 +619,17 @@ fn install_claude_migrates_wrapper_style_hook_settings() -> TestResult<()> {
 
     let settings_text = std::fs::read_to_string(settings_path)?;
     let settings_root: JsonValue = serde_json::from_str(&settings_text)?;
-    let expected_session_start = format!("{new_command} claude-hook session-start");
-    let expected_session_end = format!("{new_command} claude-hook session-end");
+    let expected_session_start =
+        installed_claude_hook_command(temp.path(), new_command, &[], "session-start");
+    let expected_session_end =
+        installed_claude_hook_command(temp.path(), new_command, &[], "session-end");
 
     assert!(
-        settings_root.get("hooks").is_none(),
-        "expected wrapper-style hooks object to be migrated away"
+        settings_root.get("hooks").is_some(),
+        "expected wrapper-style hooks object to remain the canonical hook location"
     );
 
-    let startup = settings_root["SessionStart"]
-        .as_array()
-        .expect("expected SessionStart hooks array")
+    let startup = claude_hook_entries(&settings_root, "SessionStart")
         .iter()
         .find(|entry| entry["matcher"].as_str() == Some("startup"))
         .expect("expected startup SessionStart matcher");
@@ -597,9 +652,7 @@ fn install_claude_migrates_wrapper_style_hook_settings() -> TestResult<()> {
         "expected stale wrapped SessionStart command to be removed"
     );
 
-    let clear = settings_root["SessionEnd"]
-        .as_array()
-        .expect("expected SessionEnd hooks array")
+    let clear = claude_hook_entries(&settings_root, "SessionEnd")
         .iter()
         .find(|entry| entry["matcher"].as_str() == Some("clear"))
         .expect("expected clear SessionEnd matcher");
@@ -671,9 +724,7 @@ fn install_claude_reinstall_preserves_unrelated_commands_that_only_mention_hook_
 
     let settings_text = std::fs::read_to_string(settings_path)?;
     let settings_root: JsonValue = serde_json::from_str(&settings_text)?;
-    let startup = settings_root["SessionStart"]
-        .as_array()
-        .expect("expected SessionStart hooks array")
+    let startup = claude_hook_entries(&settings_root, "SessionStart")
         .iter()
         .find(|entry| entry["matcher"].as_str() == Some("startup"))
         .expect("expected startup SessionStart matcher");
@@ -683,7 +734,8 @@ fn install_claude_reinstall_preserves_unrelated_commands_that_only_mention_hook_
         .iter()
         .filter_map(|hook| hook["command"].as_str())
         .collect();
-    let expected_session_start = format!("{new_command} claude-hook session-start");
+    let expected_session_start =
+        installed_claude_hook_command(temp.path(), new_command, &[], "session-start");
     let stale_session_start = format!("{old_command} claude-hook session-start");
 
     assert!(
@@ -773,14 +825,20 @@ fn install_claude_reinstall_replaces_old_explicit_workspace_write_hook_commands(
 
     let settings_text = std::fs::read_to_string(settings_path)?;
     let settings_root: JsonValue = serde_json::from_str(&settings_text)?;
-    let expected_session_start =
-        format!("{new_command} --sandbox workspace-write claude-hook session-start");
-    let expected_session_end =
-        format!("{new_command} --sandbox workspace-write claude-hook session-end");
+    let expected_session_start = installed_claude_hook_command(
+        temp.path(),
+        new_command,
+        &["--sandbox", "workspace-write"],
+        "session-start",
+    );
+    let expected_session_end = installed_claude_hook_command(
+        temp.path(),
+        new_command,
+        &["--sandbox", "workspace-write"],
+        "session-end",
+    );
 
-    let startup = settings_root["SessionStart"]
-        .as_array()
-        .expect("expected SessionStart hooks array")
+    let startup = claude_hook_entries(&settings_root, "SessionStart")
         .iter()
         .find(|entry| entry["matcher"].as_str() == Some("startup"))
         .expect("expected startup SessionStart matcher");
@@ -796,9 +854,7 @@ fn install_claude_reinstall_replaces_old_explicit_workspace_write_hook_commands(
         "expected explicit workspace-write SessionStart hook to be replaced"
     );
 
-    let clear = settings_root["SessionEnd"]
-        .as_array()
-        .expect("expected SessionEnd hooks array")
+    let clear = claude_hook_entries(&settings_root, "SessionEnd")
         .iter()
         .find(|entry| entry["matcher"].as_str() == Some("clear"))
         .expect("expected clear SessionEnd matcher");
@@ -880,14 +936,20 @@ fn install_claude_reinstall_replaces_old_hook_commands_without_interpreter_args(
 
     let settings_text = std::fs::read_to_string(settings_path)?;
     let settings_root: JsonValue = serde_json::from_str(&settings_text)?;
-    let expected_session_start =
-        format!("{new_command} --sandbox workspace-write claude-hook session-start");
-    let expected_session_end =
-        format!("{new_command} --sandbox workspace-write claude-hook session-end");
+    let expected_session_start = installed_claude_hook_command(
+        temp.path(),
+        new_command,
+        &["--sandbox", "workspace-write"],
+        "session-start",
+    );
+    let expected_session_end = installed_claude_hook_command(
+        temp.path(),
+        new_command,
+        &["--sandbox", "workspace-write"],
+        "session-end",
+    );
 
-    let startup = settings_root["SessionStart"]
-        .as_array()
-        .expect("expected SessionStart hooks array")
+    let startup = claude_hook_entries(&settings_root, "SessionStart")
         .iter()
         .find(|entry| entry["matcher"].as_str() == Some("startup"))
         .expect("expected startup SessionStart matcher");
@@ -903,9 +965,7 @@ fn install_claude_reinstall_replaces_old_hook_commands_without_interpreter_args(
         "expected stale SessionStart hook without interpreter args to be replaced"
     );
 
-    let clear = settings_root["SessionEnd"]
-        .as_array()
-        .expect("expected SessionEnd hooks array")
+    let clear = claude_hook_entries(&settings_root, "SessionEnd")
         .iter()
         .find(|entry| entry["matcher"].as_str() == Some("clear"))
         .expect("expected clear SessionEnd matcher");
@@ -1000,12 +1060,12 @@ fn install_claude_reinstall_deduplicates_matching_hook_entries() -> TestResult<(
 
     let settings_text = std::fs::read_to_string(settings_path)?;
     let settings_root: JsonValue = serde_json::from_str(&settings_text)?;
-    let expected_session_start = format!("{new_command} claude-hook session-start");
-    let expected_session_end = format!("{new_command} claude-hook session-end");
+    let expected_session_start =
+        installed_claude_hook_command(temp.path(), new_command, &[], "session-start");
+    let expected_session_end =
+        installed_claude_hook_command(temp.path(), new_command, &[], "session-end");
 
-    let startup_entries: Vec<&JsonValue> = settings_root["SessionStart"]
-        .as_array()
-        .expect("expected SessionStart hooks array")
+    let startup_entries: Vec<&JsonValue> = claude_hook_entries(&settings_root, "SessionStart")
         .iter()
         .filter(|entry| entry["matcher"].as_str() == Some("startup"))
         .collect();
@@ -1037,9 +1097,7 @@ fn install_claude_reinstall_deduplicates_matching_hook_entries() -> TestResult<(
         "expected stale SessionStart command to be removed from merged entry"
     );
 
-    let clear_entries: Vec<&JsonValue> = settings_root["SessionEnd"]
-        .as_array()
-        .expect("expected SessionEnd hooks array")
+    let clear_entries: Vec<&JsonValue> = claude_hook_entries(&settings_root, "SessionEnd")
         .iter()
         .filter(|entry| entry["matcher"].as_str() == Some("clear"))
         .collect();

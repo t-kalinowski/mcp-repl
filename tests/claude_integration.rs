@@ -7,11 +7,22 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io::{Read, Write};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::io::ErrorKind;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use vt100::Parser;
 
 const SNAPSHOT_NAME: &str = "claude_live_integration";
 const CLAUDE_TIMEOUT: Duration = Duration::from_secs(120);
@@ -20,6 +31,14 @@ const CLAUDE_PERMISSION_MODE: &str = "dontAsk";
 const TOOL_INPUT: &str = "cat(\"CLAUDE_MCP_OK\\n\")";
 const FINAL_RESULT: &str = "DONE";
 const CLAUDE_PROMPT: &str = "Use the mcp__r__repl tool exactly once. Send this exact R code: cat(\"CLAUDE_MCP_OK\\n\") Then answer with exactly DONE, with no punctuation or extra text.\n";
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const CLEAR_TEST_SET_MARKER: &str = "3047";
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const CLEAR_TEST_SET_DONE: &str = "CLAUDE_CLEAR_SET_DONE";
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const CLEAR_TEST_CHECK_PRESENT: &str = "9001";
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const CLEAR_TEST_CHECK_MISSING: &str = "9002";
 
 #[derive(Debug)]
 struct StagedClaudeEnv {
@@ -28,6 +47,7 @@ struct StagedClaudeEnv {
     home: PathBuf,
     settings_path: PathBuf,
     mcp_config_path: PathBuf,
+    debug_path: PathBuf,
     child_env: Vec<(String, String)>,
 }
 
@@ -85,6 +105,54 @@ fn claude_live_integration() -> TestResult<()> {
         insta::assert_snapshot!(SNAPSHOT_NAME, transcript);
     });
 
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn claude_clear_restarts_repl_session() -> TestResult<()> {
+    if !claude_available() {
+        eprintln!("claude not found on PATH; skipping");
+        return Ok(());
+    }
+
+    let mcp_console = resolve_mcp_console_path()?;
+    let Some(staged) = stage_installed_claude_env(&mcp_console)? else {
+        return Ok(());
+    };
+
+    let mut driver = ClaudePtyDriver::spawn(&staged)?;
+    driver.wait_for_idle(Duration::from_secs(20))?;
+
+    driver.send_line(
+        "Use the mcp__r__repl tool exactly once. Send this exact R code: x <- 1; cat(3000 + 47, \"\\n\") Then answer with exactly CLAUDE_CLEAR_SET_DONE.",
+    )?;
+    driver.wait_for_contains(CLEAR_TEST_SET_MARKER, Duration::from_secs(60))?;
+    driver.wait_for_contains(CLEAR_TEST_SET_DONE, Duration::from_secs(60))?;
+
+    driver.send_line("/clear")?;
+    driver.wait_for_idle(Duration::from_secs(10))?;
+
+    driver.send_line(
+        "Use the mcp__r__repl tool exactly once. Send this exact R code: if (exists(\"x\")) { cat(9000 + 1, \"\\n\") } else { cat(9000 + 2, \"\\n\") } Then answer with exactly CLAUDE_CLEAR_CHECK_DONE.",
+    )?;
+    driver.wait_for_any_contains(
+        &[CLEAR_TEST_CHECK_PRESENT, CLEAR_TEST_CHECK_MISSING],
+        Duration::from_secs(60),
+    )?;
+
+    let screen = normalize_screen(&driver.snapshot_screen());
+    let debug_log = read_debug_log(&staged.debug_path);
+    driver.kill()?;
+
+    assert!(
+        screen.contains(CLEAR_TEST_CHECK_MISSING),
+        "expected /clear to restart the REPL session before the next Claude request\nscreen:\n{screen}\n\ndebug:\n{debug_log}"
+    );
+    assert!(
+        !screen.contains(CLEAR_TEST_CHECK_PRESENT),
+        "expected /clear to remove x from the REPL session before the next Claude request\nscreen:\n{screen}\n\ndebug:\n{debug_log}"
+    );
     Ok(())
 }
 
@@ -269,6 +337,7 @@ fn stage_claude_env(mcp_console: &Path) -> TestResult<Option<StagedClaudeEnv>> {
 
     let settings_path = temp_dir.path().join("settings.json");
     let mcp_config_path = temp_dir.path().join("mcp.json");
+    let debug_path = temp_dir.path().join("debug-live.log");
 
     let mut child_env = Vec::new();
     let mut settings_env = JsonMap::new();
@@ -335,8 +404,119 @@ fn stage_claude_env(mcp_console: &Path) -> TestResult<Option<StagedClaudeEnv>> {
         home,
         settings_path,
         mcp_config_path,
+        debug_path,
         child_env,
     }))
+}
+
+fn stage_installed_claude_env(mcp_console: &Path) -> TestResult<Option<StagedClaudeEnv>> {
+    let temp_dir = tempfile::tempdir()?;
+    let workspace = temp_dir.path().join("workspace");
+    let home = temp_dir.path().join("home");
+    let claude_dir = home.join(".claude");
+    fs::create_dir_all(&workspace)?;
+    fs::create_dir_all(&claude_dir)?;
+
+    let settings_path = claude_dir.join("settings.json");
+    let mcp_config_path = home.join(".claude.json");
+    let debug_path = claude_dir.join("debug-integration.log");
+
+    let mut child_env = Vec::new();
+    let mut settings_env = JsonMap::new();
+
+    if let Some(api_key) = nonempty_env("ANTHROPIC_API_KEY") {
+        child_env.push(("ANTHROPIC_API_KEY".to_string(), api_key));
+    } else {
+        let host_settings_env = load_host_claude_settings_env()?;
+        let Some(bedrock_env) = stage_bedrock_env(&home, &host_settings_env)? else {
+            eprintln!("no supported Claude auth staging available; skipping");
+            return Ok(None);
+        };
+        for (key, value) in bedrock_env {
+            child_env.push((key.clone(), value.clone()));
+            settings_env.insert(key, JsonValue::String(value));
+        }
+    }
+
+    let seeded_settings = JsonValue::Object(JsonMap::from_iter([
+        (
+            "enabledPlugins".to_string(),
+            JsonValue::Object(JsonMap::new()),
+        ),
+        ("env".to_string(), JsonValue::Object(settings_env)),
+    ]));
+    fs::write(&settings_path, serde_json::to_string_pretty(&seeded_settings)?)?;
+    seed_claude_stats_cache(&claude_dir.join("stats-cache.json"), &workspace)?;
+
+    let status = Command::new(mcp_console)
+        .arg("install")
+        .arg("--client")
+        .arg("claude")
+        .arg("--interpreter")
+        .arg("r")
+        .arg("--command")
+        .arg(mcp_console)
+        .env("HOME", &home)
+        .status()?;
+    if !status.success() {
+        return Err(format!("install --client claude failed with status {status}").into());
+    }
+
+    Ok(Some(StagedClaudeEnv {
+        _temp_dir: temp_dir,
+        workspace,
+        home,
+        settings_path,
+        mcp_config_path,
+        debug_path,
+        child_env,
+    }))
+}
+
+fn seed_claude_stats_cache(path: &Path, workspace: &Path) -> TestResult<()> {
+    let project_state = JsonValue::Object(JsonMap::from_iter([
+        ("allowedTools".to_string(), JsonValue::Array(Vec::new())),
+        ("mcpContextUris".to_string(), JsonValue::Array(Vec::new())),
+        ("mcpServers".to_string(), JsonValue::Object(JsonMap::new())),
+        (
+            "enabledMcpjsonServers".to_string(),
+            JsonValue::Array(Vec::new()),
+        ),
+        (
+            "disabledMcpjsonServers".to_string(),
+            JsonValue::Array(Vec::new()),
+        ),
+        (
+            "hasTrustDialogAccepted".to_string(),
+            JsonValue::Bool(true),
+        ),
+        (
+            "projectOnboardingSeenCount".to_string(),
+            JsonValue::Number(1.into()),
+        ),
+        (
+            "hasCompletedProjectOnboarding".to_string(),
+            JsonValue::Bool(true),
+        ),
+    ]));
+    let workspace_display = workspace.display().to_string();
+    let workspace_private = format!("/private{workspace_display}");
+    let stats = JsonValue::Object(JsonMap::from_iter([
+        ("hasCompletedOnboarding".to_string(), JsonValue::Bool(true)),
+        (
+            "lastOnboardingVersion".to_string(),
+            JsonValue::String("2.1.79".to_string()),
+        ),
+        (
+            "projects".to_string(),
+            JsonValue::Object(JsonMap::from_iter([
+                (workspace_display, project_state.clone()),
+                (workspace_private, project_state),
+            ])),
+        ),
+    ]));
+    fs::write(path, serde_json::to_string_pretty(&stats)?)?;
+    Ok(())
 }
 
 fn stage_bedrock_env(
@@ -495,6 +675,279 @@ fn parse_snapshot(stdout: &str, workspace: &Path) -> TestResult<Option<ClaudeSna
         final_text,
         result,
     }))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct ClaudePtyDriver {
+    child: Box<dyn portable_pty::Child + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    rx: Receiver<Vec<u8>>,
+    parser: Parser,
+    accepted_theme: bool,
+    accepted_enter_continue: bool,
+    accepted_trust_prompt: bool,
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+    _slave: Box<dyn portable_pty::SlavePty + Send>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl ClaudePtyDriver {
+    fn spawn(staged: &StagedClaudeEnv) -> TestResult<Self> {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 40,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|err| format!("openpty failed: {err}"))?;
+
+        let mut cmd = CommandBuilder::new("sh");
+        let mut env_prefix = String::new();
+        for (key, value) in &staged.child_env {
+            if !env_prefix.is_empty() {
+                env_prefix.push(' ');
+            }
+            env_prefix.push_str(key);
+            env_prefix.push('=');
+            env_prefix.push_str(&sh_single_quote(value));
+        }
+        let shell_script = if env_prefix.is_empty() {
+            format!(
+                "HOME={} TERM=xterm-256color LANG=C claude --setting-sources local --settings {} --mcp-config {} --strict-mcp-config --debug-file {} --model {} --permission-mode {} --tools \"\"",
+                sh_single_quote(&staged.home.display().to_string()),
+                sh_single_quote(&staged.settings_path.display().to_string()),
+                sh_single_quote(&staged.mcp_config_path.display().to_string()),
+                sh_single_quote(&staged.debug_path.display().to_string()),
+                sh_single_quote(CLAUDE_MODEL),
+                sh_single_quote(CLAUDE_PERMISSION_MODE),
+            )
+        } else {
+            format!(
+                "HOME={} TERM=xterm-256color LANG=C {} claude --setting-sources local --settings {} --mcp-config {} --strict-mcp-config --debug-file {} --model {} --permission-mode {} --tools \"\"",
+                sh_single_quote(&staged.home.display().to_string()),
+                env_prefix,
+                sh_single_quote(&staged.settings_path.display().to_string()),
+                sh_single_quote(&staged.mcp_config_path.display().to_string()),
+                sh_single_quote(&staged.debug_path.display().to_string()),
+                sh_single_quote(CLAUDE_MODEL),
+                sh_single_quote(CLAUDE_PERMISSION_MODE),
+            )
+        };
+        cmd.arg("-c");
+        cmd.arg(shell_script);
+        cmd.cwd(staged.workspace.clone());
+
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|err| format!("spawn claude failed: {err}"))?;
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|err| format!("clone reader failed: {err}"))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|err| format!("take writer failed: {err}"))?;
+        let writer = Arc::new(Mutex::new(writer));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Ok(Self {
+            child,
+            writer,
+            rx,
+            parser: Parser::new(40, 120, 0),
+            accepted_theme: false,
+            accepted_enter_continue: false,
+            accepted_trust_prompt: false,
+            _master: pair.master,
+            _slave: pair.slave,
+        })
+    }
+
+    fn send(&mut self, text: &str) -> TestResult<()> {
+        let mut writer = self.writer.lock().map_err(|_| "pty lock failed")?;
+        writer
+            .write_all(text.as_bytes())
+            .map_err(|err| format!("pty write failed: {err}"))?;
+        writer
+            .flush()
+            .map_err(|err| format!("pty flush failed: {err}"))?;
+        Ok(())
+    }
+
+    fn send_line(&mut self, text: &str) -> TestResult<()> {
+        self.send(text)?;
+        self.send("\r")?;
+        Ok(())
+    }
+
+    fn drain(&mut self, duration: Duration) {
+        let deadline = Instant::now() + duration;
+        while Instant::now() < deadline {
+            match self.rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(chunk) => {
+                    self.parser.process(&chunk);
+                    let _ = self.handle_startup_prompts();
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn wait_for_contains(&mut self, needle: &str, timeout: Duration) -> TestResult<()> {
+        let ok = self.wait_for_screen(timeout, |screen| screen.contains(needle));
+        if ok {
+            return Ok(());
+        }
+        Err(format!(
+            "timeout waiting for screen to contain {needle}\n{}",
+            normalize_screen(&self.snapshot_screen())
+        )
+        .into())
+    }
+
+    fn wait_for_any_contains(&mut self, needles: &[&str], timeout: Duration) -> TestResult<()> {
+        let ok = self.wait_for_screen(timeout, |screen| {
+            needles.iter().any(|needle| screen.contains(needle))
+        });
+        if ok {
+            return Ok(());
+        }
+        Err(format!(
+            "timeout waiting for screen to contain one of {:?}\n{}",
+            needles,
+            normalize_screen(&self.snapshot_screen())
+        )
+        .into())
+    }
+
+    fn wait_for_idle(&mut self, timeout: Duration) -> TestResult<()> {
+        let deadline = Instant::now() + timeout;
+        let mut stable_iterations = 0;
+        let mut last = String::new();
+        loop {
+            self.ensure_running("while waiting for idle")?;
+            self.drain(Duration::from_millis(200));
+            self.handle_startup_prompts()?;
+            let current = normalize_screen(&self.snapshot_screen());
+            if current == last && !current.trim().is_empty() {
+                stable_iterations += 1;
+                if stable_iterations >= 3 {
+                    return Ok(());
+                }
+            } else {
+                stable_iterations = 0;
+                last = current;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timeout waiting for Claude to become idle\n{}",
+                    normalize_screen(&self.snapshot_screen())
+                )
+                .into());
+            }
+        }
+    }
+
+    fn wait_for_screen(
+        &mut self,
+        timeout: Duration,
+        mut predicate: impl FnMut(&str) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.drain(Duration::from_millis(100));
+            let snapshot = self.snapshot_screen();
+            if predicate(&snapshot) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+        }
+    }
+
+    fn snapshot_screen(&self) -> String {
+        self.parser.screen().contents()
+    }
+
+    fn handle_startup_prompts(&mut self) -> TestResult<()> {
+        let screen = self.snapshot_screen();
+        if !self.accepted_theme
+            && screen.contains("Choose the text style that looks best with your terminal")
+        {
+            self.send("\r")?;
+            self.accepted_theme = true;
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        if !self.accepted_enter_continue
+            && (screen.contains("Press Enter to continue")
+                || screen.contains("Press Enter to continue…"))
+        {
+            self.send("\r")?;
+            self.accepted_enter_continue = true;
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        if !self.accepted_trust_prompt
+            && (screen.contains("Do you trust this folder")
+                || screen.contains("Do you trust this workspace")
+                || screen.contains("Trust this folder")
+                || screen.contains("Trust this workspace")
+                || screen.contains("Yes, I trust this folder")
+                || screen.contains("Yes, I trust this workspace")
+                || screen.contains("Quick safety check"))
+        {
+            self.send("\r")?;
+            self.accepted_trust_prompt = true;
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        Ok(())
+    }
+
+    fn ensure_running(&mut self, context: &str) -> TestResult<()> {
+        if let Some(status) = self
+            .child
+            .try_wait()
+            .map_err(|err| format!("claude wait failed: {err}"))?
+        {
+            return Err(format!(
+                "claude exited {context}: {status:?}\n{}",
+                normalize_screen(&self.snapshot_screen())
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn kill(mut self) -> TestResult<()> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        Ok(())
+    }
 }
 
 fn extract_tool_call(events: &[JsonValue]) -> TestResult<ClaudeToolCallSnapshot> {
@@ -713,6 +1166,27 @@ fn normalize_done_text(text: &str) -> String {
         "DONE." => FINAL_RESULT.to_string(),
         other => other.to_string(),
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn normalize_screen(screen: &str) -> String {
+    screen
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sh_single_quote(raw: &str) -> String {
+    if raw.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", raw.replace('\'', "'\"'\"'"))
+}
+
+fn read_debug_log(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|_| "<missing debug log>".to_string())
 }
 
 fn host_home_dir() -> TestResult<PathBuf> {
