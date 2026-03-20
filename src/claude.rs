@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
@@ -35,6 +35,12 @@ pub enum HookCommand {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaudeClientContext {
     scope_pid: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ProcessIdentity {
+    pid: u32,
+    started_unix_ms: u128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,6 +123,8 @@ struct ClaudeSessionState {
     sessions: Vec<ClaudeScopeSessionState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_started_unix_ms: Option<u128>,
     #[serde(skip_serializing_if = "Option::is_none")]
     claude_pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -214,19 +222,18 @@ impl ClaudeClearBinding {
         initial_control_seq: u64,
         context: &ClaudeClientContext,
     ) -> Result<Option<Self>, WorkerError> {
-        let pid = std::process::id();
-        let started_unix_ms = unix_ms_now();
+        let process_identity = current_process_identity().map_err(WorkerError::Io)?;
         let backend_label = match backend {
             Backend::R => "r",
             Backend::Python => "python",
         };
         let record_template = InstanceRecordTemplate {
             backend: backend_label.to_string(),
-            pid,
+            pid: process_identity.pid,
             cwd: env::current_dir()
                 .ok()
                 .map(|path| path.to_string_lossy().to_string()),
-            started_unix_ms,
+            started_unix_ms: process_identity.started_unix_ms,
         };
         let runtime = ClaudeRuntimeMode::detect(context.scope_pid).map_err(WorkerError::Io)?;
         let Some(binding_session) =
@@ -240,8 +247,13 @@ impl ClaudeClearBinding {
         };
         let instances_dir = state_root.join("instances");
         fs::create_dir_all(&instances_dir)?;
-        let instance_id = unique_instance_id(&instances_dir, backend_label, pid, started_unix_ms)
-            .map_err(WorkerError::Io)?;
+        let instance_id = unique_instance_id(
+            &instances_dir,
+            backend_label,
+            process_identity.pid,
+            process_identity.started_unix_ms,
+        )
+        .map_err(WorkerError::Io)?;
         let record_path = instances_dir.join(format!("{instance_id}.json"));
 
         let binding = Self {
@@ -363,8 +375,8 @@ pub fn detect_client_context() -> Option<ClaudeClientContext> {
     if test_scope_key_env().is_some() || current_claude_env_file_path().is_some() {
         return Some(ClaudeClientContext { scope_pid: None });
     }
-    current_claude_process_pid().map(|scope_pid| ClaudeClientContext {
-        scope_pid: Some(scope_pid),
+    current_claude_process_identity().map(|identity| ClaudeClientContext {
+        scope_pid: Some(identity.pid),
     })
 }
 
@@ -508,7 +520,8 @@ fn current_claude_scope_key(scope_pid: Option<u32>) -> Option<String> {
         return Some(scope_key);
     }
     let cwd = current_claude_project_dir()?;
-    let claude_pid = scope_pid.or_else(current_claude_process_pid)?;
+    let claude_pid =
+        scope_pid.or_else(|| current_claude_process_identity().map(|identity| identity.pid))?;
     let mut input = Vec::new();
     input.extend_from_slice(CLAUDE_SCOPE_KEY_VERSION);
     input.push(0);
@@ -526,7 +539,7 @@ fn current_claude_project_dir() -> Option<PathBuf> {
         .map(canonicalize_or_identity)
 }
 
-fn current_claude_process_pid() -> Option<u32> {
+fn current_claude_process_identity() -> Option<ProcessIdentity> {
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::All, true);
     let mut pid = Pid::from_u32(std::process::id());
@@ -536,11 +549,27 @@ fn current_claude_process_pid() -> Option<u32> {
         let parent_process = system.process(parent)?;
         let name = parent_process.name().to_string_lossy();
         if is_claude_process_name(&name) {
-            return Some(parent.as_u32());
+            return Some(ProcessIdentity {
+                pid: parent.as_u32(),
+                started_unix_ms: u128::from(parent_process.start_time()) * 1000,
+            });
         }
         pid = parent;
     }
     None
+}
+
+fn current_process_identity() -> io::Result<ProcessIdentity> {
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    let pid = Pid::from_u32(std::process::id());
+    let process = system
+        .process(pid)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "current process not found"))?;
+    Ok(ProcessIdentity {
+        pid: pid.as_u32(),
+        started_unix_ms: u128::from(process.start_time()) * 1000,
+    })
 }
 
 fn is_claude_process_name(name: &str) -> bool {
@@ -573,8 +602,10 @@ fn upsert_scope_session_state_in(
     session_id: &str,
 ) -> io::Result<()> {
     let now = unix_ms_now();
+    let claude_process = current_claude_process_identity();
     update_session_state_in(state_root, scope_key, move |state| {
-        state.claude_pid = current_claude_process_pid();
+        state.claude_pid = claude_process.map(|process| process.pid);
+        state.claude_started_unix_ms = claude_process.map(|process| process.started_unix_ms);
         state.cwd = current_claude_project_dir().map(|path| path.to_string_lossy().to_string());
         state.updated_unix_ms = now;
         state.session_id = Some(session_id.to_string());
@@ -633,6 +664,7 @@ fn update_session_state_in(
     let mut state = read_session_state_in(state_root, scope_key).unwrap_or(ClaudeSessionState {
         sessions: Vec::new(),
         session_id: None,
+        claude_started_unix_ms: None,
         claude_pid: None,
         cwd: None,
         updated_unix_ms: unix_ms_now(),
@@ -674,11 +706,27 @@ fn resolve_scope_session_id_in(
         return Ok(Some(current_binding.session_id.clone()));
     }
 
-    let live_pids = live_process_ids();
+    let current_session_id = state
+        .session_id
+        .as_ref()
+        .filter(|session_id| {
+            active_sessions
+                .iter()
+                .any(|entry| entry.session_id == session_id.as_str())
+        })
+        .cloned()
+        .unwrap_or_else(|| {
+            active_sessions
+                .last()
+                .expect("active sessions")
+                .session_id
+                .clone()
+        });
+    let live_processes = live_process_start_times();
     let current_path = current_binding.map(|(path, _)| path.to_path_buf());
     let live_scope_records = load_instance_records_in(state_root)?
         .into_iter()
-        .filter(|record| live_pids.contains(&record.record.pid))
+        .filter(|record| instance_record_is_live(&record.record, &live_processes))
         .filter(|record| record.record.scope_key.as_deref() == Some(scope_key))
         .filter(|record| current_path.as_ref() != Some(&record.path))
         .collect::<Vec<_>>();
@@ -687,16 +735,14 @@ fn resolve_scope_session_id_in(
         .filter(|record| record.record.backend == record_template.backend)
         .map(|record| record.record.claude_session_id.clone())
         .collect::<HashSet<_>>();
-    let prefer_current_unclaimed =
-        claimed_active_sessions.is_empty() && !live_scope_records.is_empty();
-    let session_iter: Box<dyn Iterator<Item = &ClaudeScopeSessionState>> =
-        if prefer_current_unclaimed {
-            Box::new(active_sessions.iter().rev())
-        } else {
-            Box::new(active_sessions.iter())
-        };
+    if !claimed_active_sessions.contains(&current_session_id) {
+        return Ok(Some(current_session_id.clone()));
+    }
 
-    for session in session_iter {
+    for session in &active_sessions {
+        if session.session_id == current_session_id {
+            continue;
+        }
         if !claimed_active_sessions.contains(&session.session_id) {
             return Ok(Some(session.session_id.clone()));
         }
@@ -708,9 +754,7 @@ fn resolve_scope_session_id_in(
         return Ok(None);
     }
 
-    Ok(active_sessions
-        .last()
-        .map(|session| session.session_id.clone()))
+    Ok(Some(current_session_id))
 }
 
 fn missing_state_home_is_allowed(err: &io::Error, env_file_path: Option<&Path>) -> bool {
@@ -886,15 +930,15 @@ fn prune_stale_claude_state() -> io::Result<()> {
 }
 
 fn prune_stale_claude_state_in(state_root: &Path) -> io::Result<()> {
-    let live_pids = live_process_ids();
-    prune_stale_claude_session_states_in(state_root, &live_pids)?;
-    prune_stale_claude_instance_records_in(state_root, &live_pids)?;
+    let live_processes = live_process_start_times();
+    prune_stale_claude_session_states_in(state_root, &live_processes)?;
+    prune_stale_claude_instance_records_in(state_root, &live_processes)?;
     Ok(())
 }
 
 fn prune_stale_claude_session_states_in(
     state_root: &Path,
-    live_pids: &HashSet<u32>,
+    live_processes: &HashMap<u32, u64>,
 ) -> io::Result<()> {
     let sessions_dir = state_root.join("sessions");
     if !sessions_dir.is_dir() {
@@ -912,10 +956,7 @@ fn prune_stale_claude_session_states_in(
         let Ok(state) = serde_json::from_str::<ClaudeSessionState>(&raw) else {
             continue;
         };
-        if state
-            .claude_pid
-            .is_some_and(|pid| !live_pids.contains(&pid))
-        {
+        if !claude_session_state_is_live(&state, live_processes) {
             let _ = fs::remove_file(path);
         }
     }
@@ -924,7 +965,7 @@ fn prune_stale_claude_session_states_in(
 
 fn prune_stale_claude_instance_records_in(
     state_root: &Path,
-    live_pids: &HashSet<u32>,
+    live_processes: &HashMap<u32, u64>,
 ) -> io::Result<()> {
     let instances_dir = state_root.join("instances");
     if !instances_dir.is_dir() {
@@ -942,7 +983,7 @@ fn prune_stale_claude_instance_records_in(
         let Ok(record) = serde_json::from_str::<InstanceRecord>(&raw) else {
             continue;
         };
-        if live_pids.contains(&record.pid) {
+        if instance_record_is_live(&record, live_processes) {
             continue;
         }
         let _ = fs::remove_file(&path);
@@ -1059,10 +1100,37 @@ impl Drop for RecordLockGuard {
     }
 }
 
-fn live_process_ids() -> HashSet<u32> {
+fn live_process_start_times() -> HashMap<u32, u64> {
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::All, true);
-    system.processes().keys().map(|pid| pid.as_u32()).collect()
+    system
+        .processes()
+        .iter()
+        .map(|(pid, process)| (pid.as_u32(), process.start_time()))
+        .collect()
+}
+
+fn claude_session_state_is_live(
+    state: &ClaudeSessionState,
+    live_processes: &HashMap<u32, u64>,
+) -> bool {
+    let Some(pid) = state.claude_pid else {
+        return true;
+    };
+    let Some(live_started_unix_s) = live_processes.get(&pid) else {
+        return false;
+    };
+    state
+        .claude_started_unix_ms
+        .is_none_or(|started_unix_ms| started_unix_ms / 1000 == u128::from(*live_started_unix_s))
+}
+
+fn instance_record_is_live(record: &InstanceRecord, live_processes: &HashMap<u32, u64>) -> bool {
+    live_processes
+        .get(&record.pid)
+        .is_some_and(|live_started_unix_s| {
+            record.started_unix_ms / 1000 == u128::from(*live_started_unix_s)
+        })
 }
 
 fn unique_instance_id(
@@ -1201,6 +1269,10 @@ mod tests {
         )
     }
 
+    fn live_test_process_identity() -> ProcessIdentity {
+        current_process_identity().expect("current process identity")
+    }
+
     #[test]
     fn detect_client_context_is_none_without_claude_markers() {
         let _guard = ENV_LOCK.lock().expect("env lock");
@@ -1320,7 +1392,7 @@ mod tests {
         let state_root = claude_clear_state_dir().expect("state root");
         let instances_dir = state_root.join("instances");
         fs::create_dir_all(&instances_dir).expect("create instances dir");
-        let live_pid = std::process::id();
+        let live_process = live_test_process_identity();
 
         let record_a_path = instances_dir.join("r-a.json");
         let record_b_path = instances_dir.join("r-b.json");
@@ -1331,9 +1403,9 @@ mod tests {
                 scope_key: None,
                 env_file_path: Some(env_file_a.to_string_lossy().to_string()),
                 backend: "r".to_string(),
-                pid: live_pid,
+                pid: live_process.pid,
                 cwd: None,
-                started_unix_ms: 1,
+                started_unix_ms: live_process.started_unix_ms,
                 control_seq: 0,
             },
         )
@@ -1345,9 +1417,9 @@ mod tests {
                 scope_key: None,
                 env_file_path: Some(env_file_b.to_string_lossy().to_string()),
                 backend: "r".to_string(),
-                pid: live_pid,
+                pid: live_process.pid,
                 cwd: None,
-                started_unix_ms: 1,
+                started_unix_ms: live_process.started_unix_ms,
                 control_seq: 0,
             },
         )
@@ -1382,6 +1454,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let temp = test_tempdir("claude-session-end-missing-env-file-");
         let env_file = temp.path().join("claude-missing.env");
+        let live_process = live_test_process_identity();
         unsafe {
             env::set_var("XDG_STATE_HOME", temp.path());
             env::set_var(CLAUDE_ENV_FILE_ENV, &env_file);
@@ -1398,9 +1471,9 @@ mod tests {
                 scope_key: None,
                 env_file_path: Some(env_file.to_string_lossy().to_string()),
                 backend: "r".to_string(),
-                pid: std::process::id(),
+                pid: live_process.pid,
                 cwd: None,
-                started_unix_ms: 1,
+                started_unix_ms: live_process.started_unix_ms,
                 control_seq: 0,
             },
         )
@@ -1430,6 +1503,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let temp = test_tempdir("claude-session-end-without-env-var-");
         let env_file = temp.path().join("claude.env");
+        let live_process = live_test_process_identity();
         unsafe {
             env::set_var("XDG_STATE_HOME", temp.path());
             env::remove_var(CLAUDE_ENV_FILE_ENV);
@@ -1446,9 +1520,9 @@ mod tests {
                 scope_key: None,
                 env_file_path: Some(env_file.to_string_lossy().to_string()),
                 backend: "r".to_string(),
-                pid: std::process::id(),
+                pid: live_process.pid,
                 cwd: None,
-                started_unix_ms: 1,
+                started_unix_ms: live_process.started_unix_ms,
                 control_seq: 0,
             },
         )
@@ -1537,6 +1611,7 @@ mod tests {
                     },
                 ],
                 session_id: Some("sess-new".to_string()),
+                claude_started_unix_ms: None,
                 claude_pid: None,
                 cwd: None,
                 updated_unix_ms: 2,
@@ -1723,6 +1798,7 @@ mod tests {
     fn scope_session_claims_are_backend_specific() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let temp = test_tempdir("claude-backend-specific-claims-");
+        let live_process = live_test_process_identity();
         unsafe {
             env::set_var("XDG_STATE_HOME", temp.path());
             env::remove_var(CLAUDE_ENV_FILE_ENV);
@@ -1743,6 +1819,7 @@ mod tests {
                     },
                 ],
                 session_id: Some("sess-b".to_string()),
+                claude_started_unix_ms: None,
                 claude_pid: None,
                 cwd: None,
                 updated_unix_ms: 2,
@@ -1760,9 +1837,9 @@ mod tests {
                 scope_key: Some(scope_key.clone()),
                 env_file_path: None,
                 backend: "r".to_string(),
-                pid: std::process::id(),
+                pid: live_process.pid,
                 cwd: None,
-                started_unix_ms: 1,
+                started_unix_ms: live_process.started_unix_ms,
                 control_seq: 0,
             },
         )
@@ -1801,6 +1878,7 @@ mod tests {
     fn scope_binding_prefers_current_scope_session_when_backend_is_unclaimed() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let temp = test_tempdir("claude-current-scope-session-");
+        let live_process = live_test_process_identity();
         unsafe {
             env::set_var("XDG_STATE_HOME", temp.path());
             env::remove_var(CLAUDE_ENV_FILE_ENV);
@@ -1821,6 +1899,7 @@ mod tests {
                     },
                 ],
                 session_id: Some("sess-current".to_string()),
+                claude_started_unix_ms: None,
                 claude_pid: None,
                 cwd: None,
                 updated_unix_ms: 2,
@@ -1838,9 +1917,9 @@ mod tests {
                 scope_key: Some(scope_key.clone()),
                 env_file_path: None,
                 backend: "r".to_string(),
-                pid: std::process::id(),
+                pid: live_process.pid,
                 cwd: None,
-                started_unix_ms: 1,
+                started_unix_ms: live_process.started_unix_ms,
                 control_seq: 0,
             },
         )
@@ -1876,7 +1955,7 @@ mod tests {
     }
 
     #[test]
-    fn scope_binding_prefers_oldest_unclaimed_session_before_any_scope_binding_exists() {
+    fn scope_binding_prefers_current_scope_session_before_any_scope_binding_exists() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let temp = test_tempdir("claude-oldest-scope-session-");
         unsafe {
@@ -1899,6 +1978,7 @@ mod tests {
                     },
                 ],
                 session_id: Some("sess-current".to_string()),
+                claude_started_unix_ms: None,
                 claude_pid: None,
                 cwd: None,
                 updated_unix_ms: 2,
@@ -1924,9 +2004,9 @@ mod tests {
             binding,
             ClaudeSessionBinding {
                 identity: ClaudeSessionIdentity::ScopeKey(scope_key),
-                session_id: "sess-old".to_string(),
+                session_id: "sess-current".to_string(),
             },
-            "expected first scope-bound worker to claim the oldest unclaimed session"
+            "expected first scope-bound worker to claim the current scope session"
         );
 
         unsafe {
@@ -1939,6 +2019,7 @@ mod tests {
     fn scope_binding_falls_back_to_current_scope_session_when_all_are_claimed() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let temp = test_tempdir("claude-current-claimed-session-");
+        let live_process = live_test_process_identity();
         unsafe {
             env::set_var("XDG_STATE_HOME", temp.path());
             env::remove_var(CLAUDE_ENV_FILE_ENV);
@@ -1959,6 +2040,7 @@ mod tests {
                     },
                 ],
                 session_id: Some("sess-current".to_string()),
+                claude_started_unix_ms: None,
                 claude_pid: None,
                 cwd: None,
                 updated_unix_ms: 2,
@@ -1980,9 +2062,9 @@ mod tests {
                     scope_key: Some(scope_key.clone()),
                     env_file_path: None,
                     backend: "python".to_string(),
-                    pid: std::process::id(),
+                    pid: live_process.pid,
                     cwd: None,
-                    started_unix_ms: 1,
+                    started_unix_ms: live_process.started_unix_ms,
                     control_seq: 0,
                 },
             )
@@ -2022,6 +2104,7 @@ mod tests {
     fn session_end_hook_prunes_scope_session_for_non_clear_reason_without_restarting() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let temp = test_tempdir("claude-session-end-other-");
+        let live_process = live_test_process_identity();
         unsafe {
             env::set_var("XDG_STATE_HOME", temp.path());
             env::set_var(CLAUDE_TEST_SCOPE_KEY_ENV, "scope-end-other");
@@ -2039,9 +2122,9 @@ mod tests {
                 scope_key: Some(scope_key.clone()),
                 env_file_path: None,
                 backend: "r".to_string(),
-                pid: std::process::id(),
+                pid: live_process.pid,
                 cwd: None,
-                started_unix_ms: 1,
+                started_unix_ms: live_process.started_unix_ms,
                 control_seq: 0,
             },
         )

@@ -909,6 +909,61 @@ async fn claude_clear_scope_binding_works_without_claude_env_file() -> TestResul
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn claude_clear_scope_binding_prefers_current_session_before_first_worker_starts()
+-> TestResult<()> {
+    let _guard = common::lock_test_mutex()?;
+    let temp = tempfile::tempdir()?;
+    let exe = common::resolve_test_binary()?;
+    let env_vars = claude_scope_env_vars(temp.path(), "scope-lazy-current");
+
+    run_session_start_with_env(&exe, &env_vars, "sess-a")?;
+    run_session_start_with_env(&exe, &env_vars, "sess-b")?;
+
+    let mut session = common::spawn_server_with_env_vars(env_vars.clone()).await?;
+
+    let before_clear = match repl_text(
+        &mut session,
+        "scope_lazy_current <- 1; print(exists(\"scope_lazy_current\"))",
+        "before lazy scope clear on current session",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session.cancel().await?;
+            return Ok(());
+        }
+    };
+    assert!(
+        before_clear.contains("TRUE"),
+        "expected current scope session state before clear, got: {before_clear:?}"
+    );
+
+    run_session_end_clear_with_env(&exe, &env_vars, "sess-b")?;
+
+    let after_clear = match repl_text(
+        &mut session,
+        "print(exists(\"scope_lazy_current\"))",
+        "after lazy scope clear on current session",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session.cancel().await?;
+            return Ok(());
+        }
+    };
+
+    session.cancel().await?;
+    assert!(
+        after_clear.contains("FALSE"),
+        "expected current scope session clear to reset the lazily bound worker, got: {after_clear:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn claude_clear_scope_bound_concurrent_sessions_do_not_reset_each_other() -> TestResult<()> {
     let _guard = common::lock_test_mutex()?;
     let temp = tempfile::tempdir()?;
@@ -917,11 +972,8 @@ async fn claude_clear_scope_bound_concurrent_sessions_do_not_reset_each_other() 
     let env_vars_b = claude_scope_env_vars(temp.path(), "scope-concurrent");
 
     run_session_start_with_env(&exe, &env_vars_a, "sess-a")?;
-    run_session_start_with_env(&exe, &env_vars_b, "sess-b")?;
 
     let mut session_a = common::spawn_server_with_env_vars(env_vars_a.clone()).await?;
-    let mut session_b = common::spawn_server_with_env_vars(env_vars_b.clone()).await?;
-
     let a_ready = match repl_text(
         &mut session_a,
         "scope_a_state <- 1; print(exists(\"scope_a_state\"))",
@@ -932,10 +984,13 @@ async fn claude_clear_scope_bound_concurrent_sessions_do_not_reset_each_other() 
         Some(text) => text,
         None => {
             session_a.cancel().await?;
-            session_b.cancel().await?;
             return Ok(());
         }
     };
+
+    run_session_start_with_env(&exe, &env_vars_b, "sess-b")?;
+
+    let mut session_b = common::spawn_server_with_env_vars(env_vars_b.clone()).await?;
     let b_ready = match repl_text(
         &mut session_b,
         "scope_b_state <- 1; print(exists(\"scope_b_state\"))",
@@ -999,6 +1054,76 @@ async fn claude_clear_scope_bound_concurrent_sessions_do_not_reset_each_other() 
     assert!(
         b_after_a_clear.contains("TRUE"),
         "expected scope-only clear for session A not to reset concurrent session B, got: {b_after_a_clear:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_clear_ignores_stale_scope_record_with_reused_pid() -> TestResult<()> {
+    let _guard = common::lock_test_mutex()?;
+    let temp = tempfile::tempdir()?;
+    let exe = common::resolve_test_binary()?;
+    let scope_key = "scope-stale-record";
+    let env_vars = claude_scope_env_vars(temp.path(), scope_key);
+
+    run_session_start_with_env(&exe, &env_vars, "sess-a")?;
+    run_session_start_with_env(&exe, &env_vars, "sess-b")?;
+
+    let instances_dir = temp.path().join("mcp-repl/claude-clear/instances");
+    std::fs::create_dir_all(&instances_dir)?;
+    std::fs::write(
+        instances_dir.join("stale-r.json"),
+        serde_json::to_vec_pretty(&json!({
+            "claude_session_id": "sess-b",
+            "scope_key": scope_key,
+            "backend": "r",
+            "pid": std::process::id(),
+            "cwd": null,
+            "started_unix_ms": 1u128,
+            "control_seq": 0u64
+        }))?,
+    )?;
+
+    let mut session = common::spawn_server_with_env_vars(env_vars.clone()).await?;
+
+    let before_clear = match repl_text(
+        &mut session,
+        "scope_stale_pid <- 1; print(exists(\"scope_stale_pid\"))",
+        "before clear with stale reused pid record",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session.cancel().await?;
+            return Ok(());
+        }
+    };
+    assert!(
+        before_clear.contains("TRUE"),
+        "expected current scope session state before clear, got: {before_clear:?}"
+    );
+
+    run_session_end_clear_with_env(&exe, &env_vars, "sess-b")?;
+
+    let after_clear = match repl_text(
+        &mut session,
+        "print(exists(\"scope_stale_pid\"))",
+        "after clear with stale reused pid record",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session.cancel().await?;
+            return Ok(());
+        }
+    };
+
+    session.cancel().await?;
+    assert!(
+        after_clear.contains("FALSE"),
+        "expected stale reused-pid record not to block current-session clear, got: {after_clear:?}"
     );
     Ok(())
 }
