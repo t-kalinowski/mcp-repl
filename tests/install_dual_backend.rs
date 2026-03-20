@@ -256,6 +256,32 @@ fn install_rejects_command_flag() -> TestResult<()> {
 }
 
 #[test]
+fn install_rejects_backend_in_passthrough_args() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let codex_home = temp.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home)?;
+    let exe = resolve_exe()?;
+
+    let status = Command::new(&exe)
+        .arg("install")
+        .arg("--client")
+        .arg("codex")
+        .arg("--arg")
+        .arg("--backend")
+        .arg("--arg")
+        .arg("python")
+        .env("CODEX_HOME", &codex_home)
+        .status()?;
+
+    assert!(
+        !status.success(),
+        "expected install with --arg --backend to fail"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn install_rejects_positional_target_selector() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let codex_home = temp.path().join("codex-home");

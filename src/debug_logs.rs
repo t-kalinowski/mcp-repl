@@ -113,23 +113,25 @@ where
     I::Item: Into<std::ffi::OsString>,
 {
     let mut args = args.into_iter().map(Into::into);
+    let mut parsed = None;
     while let Some(arg) = args.next() {
         if arg == "--debug-dir" {
             let value = args.next()?;
             if value.is_empty() {
                 return None;
             }
-            return Some(PathBuf::from(value));
+            parsed = Some(PathBuf::from(value));
+            continue;
         }
         let arg = arg.to_string_lossy();
         if let Some(value) = arg.strip_prefix("--debug-dir=") {
             if value.is_empty() {
                 return None;
             }
-            return Some(PathBuf::from(value));
+            parsed = Some(PathBuf::from(value));
         }
     }
-    None
+    parsed
 }
 
 fn create_unique_session_dir(base_dir: &Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
@@ -187,6 +189,12 @@ mod tests {
     fn find_debug_dir_from_equals_arg_parses_path() {
         let parsed = parse_debug_dir_arg(["--debug-dir=/tmp/mcp-repl-debug"]);
         assert_eq!(parsed, Some(PathBuf::from("/tmp/mcp-repl-debug")));
+    }
+
+    #[test]
+    fn parse_debug_dir_arg_uses_last_occurrence() {
+        let parsed = parse_debug_dir_arg(["--debug-dir=/tmp/first", "--debug-dir", "/tmp/final"]);
+        assert_eq!(parsed, Some(PathBuf::from("/tmp/final")));
     }
 
     #[test]

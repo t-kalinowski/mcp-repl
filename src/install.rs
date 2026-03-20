@@ -286,8 +286,11 @@ fn is_sandbox_config_override(raw: &str) -> bool {
 }
 
 fn has_interpreter_config_arg(args: &[String]) -> bool {
-    args.iter()
-        .any(|arg| matches!(arg.as_str(), "--interpreter") || arg.starts_with("--interpreter="))
+    args.iter().any(|arg| {
+        matches!(arg.as_str(), "--interpreter" | "--backend")
+            || arg.starts_with("--interpreter=")
+            || arg.starts_with("--backend=")
+    })
 }
 
 fn has_interpreter_value(args: &[String], target: &str) -> bool {
