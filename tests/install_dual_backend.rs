@@ -212,6 +212,32 @@ fn install_rejects_empty_client_selector() -> TestResult<()> {
 }
 
 #[test]
+fn install_rejects_server_name_flag() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let codex_home = temp.path().join("codex-home");
+    std::fs::create_dir_all(&codex_home)?;
+    let exe = resolve_exe()?;
+
+    let status = Command::new(&exe)
+        .arg("install")
+        .arg("--client")
+        .arg("codex")
+        .arg("--server-name")
+        .arg("custom")
+        .arg("--command")
+        .arg("/usr/local/bin/mcp-repl")
+        .env("CODEX_HOME", &codex_home)
+        .status()?;
+
+    assert!(
+        !status.success(),
+        "expected install with --server-name to fail"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn install_subcommands_are_rejected() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let codex_home = temp.path().join("codex-home");
