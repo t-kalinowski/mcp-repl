@@ -18,6 +18,7 @@ pub const DEFAULT_R_SERVER_NAME: &str = "r";
 pub const DEFAULT_PYTHON_SERVER_NAME: &str = "python";
 const CLAUDE_HOOK_SESSION_START_MATCHERS: &[&str] = &["startup", "resume", "clear", "compact"];
 const CLAUDE_HOOK_SESSION_END_MATCHERS: &[&str] = &["clear", "prompt_input_exit", "other"];
+const MANAGED_CLAUDE_HOOK_KEY: &str = "mcpReplManaged";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstallInterpreter {
@@ -648,6 +649,8 @@ fn upsert_claude_settings_hooks(
             "SessionStart",
             Some(matcher),
             &session_start_command,
+            command,
+            args,
             "session-start",
         )?;
     }
@@ -657,6 +660,8 @@ fn upsert_claude_settings_hooks(
             "SessionEnd",
             Some(matcher),
             &session_end_command,
+            command,
+            args,
             "session-end",
         )?;
     }
@@ -682,6 +687,8 @@ fn upsert_claude_hook_command(
     event: &str,
     matcher: Option<&str>,
     command: &str,
+    command_program: &str,
+    command_args: &[String],
     hook_subcommand: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let entries = hooks_obj
@@ -700,7 +707,12 @@ fn upsert_claude_hook_command(
     let primary_idx = match matching_indexes.as_slice() {
         [first, rest @ ..] => {
             for idx in rest {
-                remove_managed_claude_hook_commands(&mut entries_arr[*idx], hook_subcommand)?;
+                remove_managed_claude_hook_commands(
+                    &mut entries_arr[*idx],
+                    command_program,
+                    command_args,
+                    hook_subcommand,
+                )?;
             }
             *first
         }
@@ -709,7 +721,13 @@ fn upsert_claude_hook_command(
             entries_arr.len() - 1
         }
     };
-    replace_claude_hook_command(&mut entries_arr[primary_idx], command, hook_subcommand)?;
+    replace_claude_hook_command(
+        &mut entries_arr[primary_idx],
+        command,
+        command_program,
+        command_args,
+        hook_subcommand,
+    )?;
     Ok(())
 }
 
@@ -726,6 +744,8 @@ fn hook_entry_matches(entry: &JsonValue, matcher: Option<&str>) -> bool {
 fn replace_claude_hook_command(
     entry: &mut JsonValue,
     command: &str,
+    command_program: &str,
+    command_args: &[String],
     hook_subcommand: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(obj) = entry.as_object_mut() else {
@@ -756,7 +776,13 @@ fn replace_claude_hook_command(
             command_present = true;
             return true;
         }
-        !is_managed_claude_hook_command(existing_command, hook_subcommand)
+        !is_managed_claude_hook_command(
+            hook_obj,
+            existing_command,
+            command_program,
+            command_args,
+            hook_subcommand,
+        )
     });
 
     if !command_present {
@@ -767,6 +793,8 @@ fn replace_claude_hook_command(
 
 fn remove_managed_claude_hook_commands(
     entry: &mut JsonValue,
+    command_program: &str,
+    command_args: &[String],
     hook_subcommand: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let Some(obj) = entry.as_object_mut() else {
@@ -789,15 +817,83 @@ fn remove_managed_claude_hook_commands(
         let Some(existing_command) = hook_obj.get("command").and_then(JsonValue::as_str) else {
             return true;
         };
-        !is_managed_claude_hook_command(existing_command, hook_subcommand)
+        !is_managed_claude_hook_command(
+            hook_obj,
+            existing_command,
+            command_program,
+            command_args,
+            hook_subcommand,
+        )
     });
     Ok(())
 }
 
-fn is_managed_claude_hook_command(command: &str, hook_subcommand: &str) -> bool {
-    command
-        .trim_end()
-        .ends_with(&format!(" claude-hook {hook_subcommand}"))
+fn is_managed_claude_hook_command(
+    hook_obj: &JsonMap<String, JsonValue>,
+    command: &str,
+    command_program: &str,
+    command_args: &[String],
+    hook_subcommand: &str,
+) -> bool {
+    let Ok(argv) = shell_words::split(command) else {
+        return false;
+    };
+    let Some(prefix) = claude_hook_command_prefix(&argv, hook_subcommand) else {
+        return false;
+    };
+    if hook_obj
+        .get(MANAGED_CLAUDE_HOOK_KEY)
+        .and_then(JsonValue::as_bool)
+        == Some(true)
+    {
+        return true;
+    }
+
+    let expected_prefix = std::iter::once(command_program)
+        .chain(command_args.iter().map(String::as_str))
+        .collect::<Vec<_>>();
+    if prefix
+        .iter()
+        .map(String::as_str)
+        .eq(expected_prefix.iter().copied())
+    {
+        return true;
+    }
+    if prefix.len() != expected_prefix.len() {
+        return false;
+    }
+    if prefix
+        .iter()
+        .skip(1)
+        .map(String::as_str)
+        .ne(expected_prefix.iter().skip(1).copied())
+    {
+        return false;
+    }
+    command_identity(prefix[0].as_str()) == "mcp-repl"
+        && command_identity(command_program) == "mcp-repl"
+}
+
+fn claude_hook_command_prefix<'a>(
+    argv: &'a [String],
+    hook_subcommand: &str,
+) -> Option<&'a [String]> {
+    if argv.len() < 3 {
+        return None;
+    }
+    if argv[argv.len() - 2] != "claude-hook" || argv[argv.len() - 1] != hook_subcommand {
+        return None;
+    }
+    Some(&argv[..argv.len() - 2])
+}
+
+fn command_identity(command: &str) -> String {
+    let basename = command.rsplit(['/', '\\']).next().unwrap_or(command);
+    basename
+        .strip_suffix(".exe")
+        .or_else(|| basename.strip_suffix(".EXE"))
+        .unwrap_or(basename)
+        .to_ascii_lowercase()
 }
 
 fn new_hook_entry(matcher: Option<&str>, command: &str) -> JsonValue {
@@ -822,6 +918,7 @@ fn new_hook_command(command: &str) -> JsonValue {
             "command".to_string(),
             JsonValue::String(command.to_string()),
         ),
+        (MANAGED_CLAUDE_HOOK_KEY.to_string(), JsonValue::Bool(true)),
     ]))
 }
 
@@ -1873,6 +1970,60 @@ name="demo"
         assert!(
             commands.contains(&mention_only),
             "expected user-managed command mentioning the hook subcommand to remain"
+        );
+        assert!(
+            commands.contains(&expected_session_start.as_str()),
+            "expected managed Claude hook command to be added"
+        );
+    }
+
+    #[test]
+    fn upsert_claude_settings_hooks_keeps_user_commands_that_end_with_hook_subcommand() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = dir.path().join("settings.json");
+        let suffix_only = "echo claude-hook session-start";
+        let expected_session_start =
+            claude_hook_command("/usr/local/bin/mcp-repl", &[], "session-start");
+
+        fs::write(
+            &settings,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "matcher": "startup",
+                            "hooks": [
+                                {"type": "command", "command": suffix_only}
+                            ]
+                        }
+                    ]
+                }
+            }))
+            .expect("serialize settings"),
+        )
+        .expect("write settings");
+
+        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl", &[])
+            .expect("upsert hooks");
+
+        let text = fs::read_to_string(&settings).expect("read settings");
+        let root: JsonValue = serde_json::from_str(&text).expect("parse json");
+        let startup = root["hooks"]["SessionStart"]
+            .as_array()
+            .expect("session start hooks array")
+            .iter()
+            .find(|entry| entry["matcher"].as_str() == Some("startup"))
+            .expect("startup matcher entry");
+        let commands: Vec<&str> = startup["hooks"]
+            .as_array()
+            .expect("hooks array")
+            .iter()
+            .filter_map(|hook| hook["command"].as_str())
+            .collect();
+
+        assert!(
+            commands.contains(&suffix_only),
+            "expected user-managed suffix command to remain"
         );
         assert!(
             commands.contains(&expected_session_start.as_str()),
