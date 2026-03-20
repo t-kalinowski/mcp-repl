@@ -150,6 +150,9 @@ Optional: enable rich JSONL debug logs for each `mcp-repl` startup:
 When enabled, each startup writes a new `mcp-repl-*.jsonl` file containing startup
 metadata (cwd, argv, Codex session hints) plus tool calls and sandbox state updates.
 
+See [docs/debugging.md](docs/debugging.md) for the full debugging guide, including
+startup logs, sandbox-state tracing, and the external wire-trace proxy.
+
 ### 3) Pick interpreter (optional)
 
 - Default interpreter: R
@@ -225,6 +228,7 @@ Tool behavior and usage guidance:
 - `docs/tool-descriptions/repl_reset_tool.md`
 
 Additional references:
+- Debugging and tracing: `docs/debugging.md`
 - Sandbox behavior and configuration: `docs/sandbox.md`
 - Worker sideband protocol: `docs/worker_sideband_protocol.md`
 
