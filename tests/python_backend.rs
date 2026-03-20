@@ -2,6 +2,7 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::RawContent;
+use std::path::Path;
 use tokio::time::{Duration, Instant, sleep};
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
@@ -51,6 +52,43 @@ async fn start_python_session() -> TestResult<Option<common::McpTestSession>> {
     Ok(Some(session))
 }
 
+async fn start_python_session_with_env(
+    env_vars: Vec<(String, String)>,
+    cleared_env_vars: Vec<String>,
+) -> TestResult<Option<common::McpTestSession>> {
+    if !require_python() {
+        return Ok(None);
+    }
+
+    let mut session = common::spawn_server_with_args_env_cleared_and_pager_page_chars(
+        vec![
+            "--interpreter".to_string(),
+            "python".to_string(),
+            "--sandbox".to_string(),
+            "danger-full-access".to_string(),
+        ],
+        env_vars,
+        cleared_env_vars,
+        300,
+    )
+    .await?;
+    let probe = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let probe_text = result_text(&probe);
+    if probe_text.contains("worker io error: Permission denied")
+        || probe_text.contains("python backend requires a unix-style pty")
+    {
+        eprintln!("python backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(None);
+    }
+
+    Ok(Some(session))
+}
+
+fn claude_state_dir(state_home: &Path) -> std::path::PathBuf {
+    state_home.join("mcp-repl").join("claude-clear")
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn python_smoke() -> TestResult<()> {
     let Some(mut session) = start_python_session().await? else {
@@ -67,6 +105,44 @@ async fn python_smoke() -> TestResult<()> {
     assert!(text.contains("2"), "expected 2, got: {text:?}");
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_non_claude_session_does_not_require_home_or_xdg_state_home() -> TestResult<()> {
+    let Some(session) = start_python_session_with_env(
+        Vec::new(),
+        vec!["HOME".to_string(), "XDG_STATE_HOME".to_string()],
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_non_claude_session_does_not_create_claude_state_dir() -> TestResult<()> {
+    let state_home = tempfile::tempdir()?;
+    let Some(session) = start_python_session_with_env(
+        vec![(
+            "XDG_STATE_HOME".to_string(),
+            state_home.path().to_string_lossy().to_string(),
+        )],
+        Vec::new(),
+    )
+    .await?
+    else {
+        return Ok(());
+    };
+
+    session.cancel().await?;
+    assert!(
+        !claude_state_dir(state_home.path()).exists(),
+        "did not expect Claude state dir for a non-Claude Python session"
+    );
     Ok(())
 }
 

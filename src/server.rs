@@ -9,6 +9,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -24,6 +25,9 @@ use self::timeouts::{
 };
 
 use crate::backend::Backend;
+use crate::claude::{
+    CONTROL_REQUEST_TIMEOUT, ClaudeBindingRefresh, ClaudeClearBinding, ClaudeClientContext,
+};
 use crate::sandbox::{SANDBOX_STATE_CAPABILITY, SANDBOX_STATE_METHOD, SandboxStateUpdate};
 use crate::sandbox_cli::SandboxCliPlan;
 use crate::worker_process::{WorkerError, WorkerManager};
@@ -38,13 +42,35 @@ fn repl_tool_description_for_backend(backend: Backend) -> &'static str {
 
 #[derive(Clone)]
 struct SharedServer {
+    backend: Backend,
+    server_name: String,
     worker: Arc<Mutex<WorkerManager>>,
+    claude_client_context: Option<ClaudeClientContext>,
+    claude_clear_binding: Arc<Mutex<Option<ClaudeClearBinding>>>,
+    claude_prune_started: Arc<AtomicBool>,
 }
 
 impl SharedServer {
-    fn new(backend: Backend, sandbox_plan: SandboxCliPlan) -> Result<Self, WorkerError> {
+    fn new(
+        backend: Backend,
+        server_name: &str,
+        sandbox_plan: SandboxCliPlan,
+    ) -> Result<Self, WorkerError> {
+        let claude_client_context = crate::claude::detect_client_context();
+        let claude_clear_binding = Arc::new(Mutex::new(None));
+        if let Some(context) = claude_client_context.as_ref() {
+            *claude_clear_binding
+                .lock()
+                .expect("claude clear binding mutex poisoned") =
+                ClaudeClearBinding::maybe_register(backend, server_name, context)?;
+        }
         Ok(Self {
+            backend,
+            server_name: server_name.to_string(),
             worker: Arc::new(Mutex::new(WorkerManager::new(backend, sandbox_plan)?)),
+            claude_client_context,
+            claude_clear_binding,
+            claude_prune_started: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -58,12 +84,74 @@ impl SharedServer {
         T: Send + 'static,
     {
         let worker = self.worker.clone();
+        let claude_client_context = self.claude_client_context.clone();
+        let claude_clear_binding = self.claude_clear_binding.clone();
+        let backend = self.backend;
+        let server_name = self.server_name.clone();
         tokio::task::spawn_blocking(move || {
             let mut worker = worker.lock().unwrap();
-            f(&mut worker)
+            let awaiting_initial_sandbox_state_update =
+                worker.awaiting_initial_sandbox_state_update();
+            if let Some(claude_client_context) = claude_client_context.as_ref() {
+                let mut claude_clear_binding = claude_clear_binding
+                    .lock()
+                    .expect("claude clear binding mutex poisoned");
+                let mut clear_stale_binding = false;
+                if let Some(binding) = claude_clear_binding.as_ref() {
+                    clear_stale_binding = matches!(
+                        binding.refresh(claude_client_context)?,
+                        ClaudeBindingRefresh::MissingCurrentSession
+                    );
+                } else {
+                    *claude_clear_binding = ClaudeClearBinding::maybe_register_late(
+                        backend,
+                        &server_name,
+                        claude_client_context,
+                    )?;
+                }
+                if clear_stale_binding {
+                    *claude_clear_binding = None;
+                    if !awaiting_initial_sandbox_state_update {
+                        let _ = worker.restart(CONTROL_REQUEST_TIMEOUT)?;
+                    }
+                }
+                if !awaiting_initial_sandbox_state_update
+                    && let Some(binding) = claude_clear_binding.as_ref()
+                {
+                    binding.sync(&mut worker)?;
+                }
+            }
+            Ok::<T, WorkerError>(f(&mut worker))
         })
         .await
         .map_err(|err| McpError::internal_error(err.to_string(), None))
+        .and_then(|result| result.map_err(|err| McpError::internal_error(err.to_string(), None)))
+    }
+
+    fn on_initialized(&self) {
+        if self.claude_client_context.is_none() {
+            return;
+        }
+        if self.claude_prune_started.swap(true, Ordering::Relaxed) {
+            return;
+        }
+
+        tokio::task::spawn_blocking(|| {
+            crate::event_log::log("claude_state_prune_begin", json!({}));
+            match crate::claude::prune_stale_state() {
+                Ok(()) => crate::event_log::log("claude_state_prune_end", json!({"status": "ok"})),
+                Err(err) => {
+                    eprintln!("claude state prune error: {err}");
+                    crate::event_log::log(
+                        "claude_state_prune_end",
+                        json!({
+                            "status": "error",
+                            "error": err.to_string(),
+                        }),
+                    );
+                }
+            }
+        });
     }
 
     async fn run_write_input(
@@ -300,9 +388,13 @@ macro_rules! define_backend_tool_server {
 
         #[tool_router]
         impl $server_ty {
-            fn new(backend: Backend, sandbox_plan: SandboxCliPlan) -> Result<Self, WorkerError> {
+            fn new(
+                backend: Backend,
+                server_name: &str,
+                sandbox_plan: SandboxCliPlan,
+            ) -> Result<Self, WorkerError> {
                 Ok(Self {
-                    shared: SharedServer::new(backend, sandbox_plan)?,
+                    shared: SharedServer::new(backend, server_name, sandbox_plan)?,
                     tool_router: Self::tool_router(),
                 })
             }
@@ -359,6 +451,13 @@ macro_rules! define_backend_tool_server {
                 _context: rmcp::service::NotificationContext<RoleServer>,
             ) {
                 self.shared.on_custom_notification(notification).await
+            }
+
+            async fn on_initialized(
+                &self,
+                _context: rmcp::service::NotificationContext<RoleServer>,
+            ) {
+                self.shared.on_initialized();
             }
         }
     };
@@ -474,6 +573,7 @@ where
 
 pub async fn run(
     backend: Backend,
+    server_name: &str,
     sandbox_plan: SandboxCliPlan,
 ) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("starting mcp-repl server");
@@ -481,15 +581,16 @@ pub async fn run(
         "server_run_begin",
         json!({
             "backend": format!("{backend:?}"),
+            "server_name": server_name,
         }),
     );
     match backend {
         Backend::R => {
-            let service = RToolServer::new(backend, sandbox_plan)?;
+            let service = RToolServer::new(backend, server_name, sandbox_plan)?;
             run_backend_server(service.clone(), service.shared.worker()).await
         }
         Backend::Python => {
-            let service = PythonToolServer::new(backend, sandbox_plan)?;
+            let service = PythonToolServer::new(backend, server_name, sandbox_plan)?;
             run_backend_server(service.clone(), service.shared.worker()).await
         }
     }

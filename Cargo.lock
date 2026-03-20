@@ -927,6 +927,7 @@ dependencies = [
  "seccompiler",
  "serde",
  "serde_json",
+ "shell-words",
  "sysinfo",
  "tempfile",
  "tokio",

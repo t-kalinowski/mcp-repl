@@ -6,20 +6,41 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::io::ErrorKind;
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+use vt100::Parser;
+
 const SNAPSHOT_NAME: &str = "claude_live_integration";
-const CLAUDE_TIMEOUT: Duration = Duration::from_secs(120);
+const CLAUDE_TIMEOUT: Duration = Duration::from_secs(240);
 const CLAUDE_MODEL: &str = "haiku";
 const CLAUDE_PERMISSION_MODE: &str = "dontAsk";
 const TOOL_INPUT: &str = "cat(\"CLAUDE_MCP_OK\\n\")";
 const FINAL_RESULT: &str = "DONE";
 const CLAUDE_PROMPT: &str = "Use the mcp__r__repl tool exactly once. Send this exact R code: cat(\"CLAUDE_MCP_OK\\n\") Then answer with exactly DONE, with no punctuation or extra text.\n";
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const CLEAR_TEST_SET_MARKER: &str = "3047";
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const CLEAR_TEST_SET_DONE: &str = "CLAUDE_CLEAR_SET_DONE";
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const CLEAR_TEST_CHECK_PRESENT: &str = "9001";
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const CLEAR_TEST_CHECK_MISSING: &str = "9002";
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+const TERMINAL_SETUP_PROMPT: &str = "Use Claude Code's terminal setup?";
 
 #[derive(Debug)]
 struct StagedClaudeEnv {
@@ -28,6 +49,7 @@ struct StagedClaudeEnv {
     home: PathBuf,
     settings_path: PathBuf,
     mcp_config_path: PathBuf,
+    debug_path: PathBuf,
     child_env: Vec<(String, String)>,
 }
 
@@ -85,6 +107,54 @@ fn claude_live_integration() -> TestResult<()> {
         insta::assert_snapshot!(SNAPSHOT_NAME, transcript);
     });
 
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn claude_clear_restarts_repl_session() -> TestResult<()> {
+    if !claude_available() {
+        eprintln!("claude not found on PATH; skipping");
+        return Ok(());
+    }
+
+    let mcp_console = resolve_mcp_console_path()?;
+    let Some(staged) = stage_installed_claude_env(&mcp_console)? else {
+        return Ok(());
+    };
+
+    let mut driver = ClaudePtyDriver::spawn(&staged)?;
+    driver.wait_for_idle(Duration::from_secs(20))?;
+
+    driver.send_line(
+        "Use the mcp__r__repl tool exactly once. Send this exact R code: x <- 1; cat(3000 + 47, \"\\n\") Then answer with exactly CLAUDE_CLEAR_SET_DONE.",
+    )?;
+    driver.wait_for_contains(CLEAR_TEST_SET_MARKER, Duration::from_secs(180))?;
+    driver.wait_for_contains(CLEAR_TEST_SET_DONE, Duration::from_secs(180))?;
+
+    driver.send_line("/clear")?;
+    driver.wait_for_idle(Duration::from_secs(10))?;
+
+    driver.send_line(
+        "Use the mcp__r__repl tool exactly once. Send this exact R code: if (exists(\"x\")) { cat(9000 + 1, \"\\n\") } else { cat(9000 + 2, \"\\n\") } Then answer with exactly CLAUDE_CLEAR_CHECK_DONE.",
+    )?;
+    driver.wait_for_any_contains(
+        &[CLEAR_TEST_CHECK_PRESENT, CLEAR_TEST_CHECK_MISSING],
+        Duration::from_secs(180),
+    )?;
+
+    let screen = normalize_screen(&driver.snapshot_screen());
+    let debug_log = read_debug_log(&staged.debug_path);
+    driver.kill()?;
+
+    assert!(
+        screen.contains(CLEAR_TEST_CHECK_MISSING),
+        "expected /clear to restart the REPL session before the next Claude request\nscreen:\n{screen}\n\ndebug:\n{debug_log}"
+    );
+    assert!(
+        !screen.contains(CLEAR_TEST_CHECK_PRESENT),
+        "expected /clear to remove x from the REPL session before the next Claude request\nscreen:\n{screen}\n\ndebug:\n{debug_log}"
+    );
     Ok(())
 }
 
@@ -264,11 +334,14 @@ fn stage_claude_env(mcp_console: &Path) -> TestResult<Option<StagedClaudeEnv>> {
     let temp_dir = tempfile::tempdir()?;
     let workspace = temp_dir.path().join("workspace");
     let home = temp_dir.path().join("home");
+    let claude_dir = home.join(".claude");
     fs::create_dir_all(&workspace)?;
     fs::create_dir_all(&home)?;
+    fs::create_dir_all(&claude_dir)?;
 
     let settings_path = temp_dir.path().join("settings.json");
     let mcp_config_path = temp_dir.path().join("mcp.json");
+    let debug_path = temp_dir.path().join("debug-live.log");
 
     let mut child_env = Vec::new();
     let mut settings_env = JsonMap::new();
@@ -328,6 +401,13 @@ fn stage_claude_env(mcp_console: &Path) -> TestResult<Option<StagedClaudeEnv>> {
         )])),
     )]));
     fs::write(&mcp_config_path, serde_json::to_string_pretty(&mcp_root)?)?;
+    let claude_version = detect_claude_version().unwrap_or_else(|| "unknown".to_string());
+    seed_claude_root_state(&home.join(".claude.json"), &workspace, &claude_version)?;
+    seed_claude_stats_cache(
+        &claude_dir.join("stats-cache.json"),
+        &workspace,
+        &claude_version,
+    )?;
 
     Ok(Some(StagedClaudeEnv {
         _temp_dir: temp_dir,
@@ -335,8 +415,205 @@ fn stage_claude_env(mcp_console: &Path) -> TestResult<Option<StagedClaudeEnv>> {
         home,
         settings_path,
         mcp_config_path,
+        debug_path,
         child_env,
     }))
+}
+
+fn stage_installed_claude_env(mcp_console: &Path) -> TestResult<Option<StagedClaudeEnv>> {
+    let temp_dir = tempfile::tempdir()?;
+    let workspace = temp_dir.path().join("workspace");
+    let home = temp_dir.path().join("home");
+    let claude_dir = home.join(".claude");
+    fs::create_dir_all(&workspace)?;
+    fs::create_dir_all(&claude_dir)?;
+
+    let settings_path = claude_dir.join("settings.json");
+    let mcp_config_path = home.join(".claude.json");
+    let debug_path = claude_dir.join("debug-integration.log");
+
+    let mut child_env = Vec::new();
+    let mut settings_env = JsonMap::new();
+
+    if let Some(api_key) = nonempty_env("ANTHROPIC_API_KEY") {
+        child_env.push(("ANTHROPIC_API_KEY".to_string(), api_key));
+    } else {
+        let host_settings_env = load_host_claude_settings_env()?;
+        let Some(bedrock_env) = stage_bedrock_env(&home, &host_settings_env)? else {
+            eprintln!("no supported Claude auth staging available; skipping");
+            return Ok(None);
+        };
+        for (key, value) in bedrock_env {
+            child_env.push((key.clone(), value.clone()));
+            settings_env.insert(key, JsonValue::String(value));
+        }
+    }
+
+    let seeded_settings = JsonValue::Object(JsonMap::from_iter([
+        (
+            "enabledPlugins".to_string(),
+            JsonValue::Object(JsonMap::new()),
+        ),
+        ("env".to_string(), JsonValue::Object(settings_env)),
+    ]));
+    fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&seeded_settings)?,
+    )?;
+    let claude_version = detect_claude_version().unwrap_or_else(|| "unknown".to_string());
+    seed_claude_stats_cache(
+        &claude_dir.join("stats-cache.json"),
+        &workspace,
+        &claude_version,
+    )?;
+
+    let status = Command::new(mcp_console)
+        .arg("install")
+        .arg("--client")
+        .arg("claude")
+        .arg("--interpreter")
+        .arg("r")
+        .arg("--command")
+        .arg(mcp_console)
+        .env("HOME", &home)
+        .status()?;
+    if !status.success() {
+        return Err(format!("install --client claude failed with status {status}").into());
+    }
+    let claude_version = detect_claude_version().unwrap_or_else(|| "unknown".to_string());
+    seed_claude_root_state(&mcp_config_path, &workspace, &claude_version)?;
+    seed_claude_stats_cache(
+        &claude_dir.join("stats-cache.json"),
+        &workspace,
+        &claude_version,
+    )?;
+
+    Ok(Some(StagedClaudeEnv {
+        _temp_dir: temp_dir,
+        workspace,
+        home,
+        settings_path,
+        mcp_config_path,
+        debug_path,
+        child_env,
+    }))
+}
+
+fn seed_claude_stats_cache(path: &Path, workspace: &Path, version: &str) -> TestResult<()> {
+    let project_state = claude_project_state();
+    let workspace_display = workspace.display().to_string();
+    let workspace_private = format!("/private{workspace_display}");
+    let stats = JsonValue::Object(JsonMap::from_iter([
+        ("hasCompletedOnboarding".to_string(), JsonValue::Bool(true)),
+        (
+            "lastOnboardingVersion".to_string(),
+            JsonValue::String(version.to_string()),
+        ),
+        (
+            "projects".to_string(),
+            JsonValue::Object(JsonMap::from_iter([
+                (workspace_display, project_state.clone()),
+                (workspace_private, project_state),
+            ])),
+        ),
+    ]));
+    fs::write(path, serde_json::to_string_pretty(&stats)?)?;
+    Ok(())
+}
+
+fn seed_claude_root_state(path: &Path, workspace: &Path, version: &str) -> TestResult<()> {
+    let mut root = match fs::read_to_string(path) {
+        Ok(raw) => {
+            serde_json::from_str::<JsonValue>(&raw).unwrap_or(JsonValue::Object(JsonMap::new()))
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => JsonValue::Object(JsonMap::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let Some(root_object) = root.as_object_mut() else {
+        return Err(format!("expected {} to contain a JSON object", path.display()).into());
+    };
+    root_object
+        .entry("numStartups".to_string())
+        .or_insert(JsonValue::Number(1.into()));
+    let tips_history = root_object
+        .entry("tipsHistory".to_string())
+        .or_insert_with(|| JsonValue::Object(JsonMap::new()));
+    let Some(tips_history) = tips_history.as_object_mut() else {
+        return Err(format!(
+            "expected {} tipsHistory to contain a JSON object",
+            path.display()
+        )
+        .into());
+    };
+    tips_history.insert("shift-enter".to_string(), JsonValue::Number(1.into()));
+    root_object.insert(
+        "shiftEnterKeyBindingInstalled".to_string(),
+        JsonValue::Bool(true),
+    );
+    root_object.insert("hasCompletedOnboarding".to_string(), JsonValue::Bool(true));
+    root_object.insert(
+        "lastOnboardingVersion".to_string(),
+        JsonValue::String(version.to_string()),
+    );
+    root_object.insert(
+        "lastReleaseNotesSeen".to_string(),
+        JsonValue::String(version.to_string()),
+    );
+    let projects = root_object
+        .entry("projects".to_string())
+        .or_insert_with(|| JsonValue::Object(JsonMap::new()));
+    let Some(projects) = projects.as_object_mut() else {
+        return Err(format!(
+            "expected {} projects to contain a JSON object",
+            path.display()
+        )
+        .into());
+    };
+    let project_state = claude_project_state();
+    let workspace_display = workspace.display().to_string();
+    let workspace_private = format!("/private{workspace_display}");
+    projects.insert(workspace_display, project_state.clone());
+    projects.insert(workspace_private, project_state);
+    fs::write(path, serde_json::to_string_pretty(&root)?)?;
+    Ok(())
+}
+
+fn claude_project_state() -> JsonValue {
+    JsonValue::Object(JsonMap::from_iter([
+        ("allowedTools".to_string(), JsonValue::Array(Vec::new())),
+        ("mcpContextUris".to_string(), JsonValue::Array(Vec::new())),
+        ("mcpServers".to_string(), JsonValue::Object(JsonMap::new())),
+        (
+            "enabledMcpjsonServers".to_string(),
+            JsonValue::Array(Vec::new()),
+        ),
+        (
+            "disabledMcpjsonServers".to_string(),
+            JsonValue::Array(Vec::new()),
+        ),
+        ("hasTrustDialogAccepted".to_string(), JsonValue::Bool(true)),
+        (
+            "projectOnboardingSeenCount".to_string(),
+            JsonValue::Number(1.into()),
+        ),
+        (
+            "hasCompletedProjectOnboarding".to_string(),
+            JsonValue::Bool(true),
+        ),
+    ]))
+}
+
+fn detect_claude_version() -> Option<String> {
+    let output = Command::new("claude")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    stdout.split_whitespace().next().map(ToOwned::to_owned)
 }
 
 fn stage_bedrock_env(
@@ -362,8 +639,52 @@ fn stage_bedrock_env(
             env_vars.insert(key.to_string(), value);
         }
     }
+    if !bedrock_session_is_valid(temp_home, &env_vars) {
+        eprintln!("Bedrock auth is unavailable or expired; skipping");
+        return Ok(None);
+    }
 
     Ok(Some(env_vars))
+}
+
+fn bedrock_session_is_valid(
+    temp_home: &Path,
+    env_vars: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    let mut cmd = Command::new("aws");
+    cmd.env_clear();
+    if let Some(path) = env::var_os("PATH") {
+        cmd.env("PATH", path);
+    }
+    if let Some(tmpdir) = env::var_os("TMPDIR") {
+        cmd.env("TMPDIR", tmpdir);
+    }
+    cmd.env("HOME", temp_home);
+    cmd.env("AWS_EC2_METADATA_DISABLED", "true");
+    for (key, value) in env_vars {
+        cmd.env(key, value);
+    }
+    cmd.arg("sts");
+    cmd.arg("get-caller-identity");
+
+    let output = match run_command_with_timeout(cmd, "", Duration::from_secs(15)) {
+        Ok(output) => output,
+        Err(err) => {
+            eprintln!("Bedrock auth check failed: {err}");
+            return false;
+        }
+    };
+    if output.status.success() {
+        return true;
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!(
+        "Bedrock auth check failed with status {status}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+        status = output.status
+    );
+    false
 }
 
 fn load_host_claude_settings_env() -> TestResult<std::collections::BTreeMap<String, String>> {
@@ -495,6 +816,288 @@ fn parse_snapshot(stdout: &str, workspace: &Path) -> TestResult<Option<ClaudeSna
         final_text,
         result,
     }))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+struct ClaudePtyDriver {
+    child: Box<dyn portable_pty::Child + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
+    rx: Receiver<Vec<u8>>,
+    parser: Parser,
+    accepted_theme: bool,
+    accepted_enter_continue: bool,
+    accepted_trust_prompt: bool,
+    skipped_terminal_setup: bool,
+    _master: Box<dyn portable_pty::MasterPty + Send>,
+    _slave: Box<dyn portable_pty::SlavePty + Send>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl ClaudePtyDriver {
+    fn spawn(staged: &StagedClaudeEnv) -> TestResult<Self> {
+        let pty_system = native_pty_system();
+        let pair = pty_system
+            .openpty(PtySize {
+                rows: 40,
+                cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|err| format!("openpty failed: {err}"))?;
+
+        let mut cmd = CommandBuilder::new("sh");
+        let mut env_prefix = String::new();
+        for (key, value) in &staged.child_env {
+            if !env_prefix.is_empty() {
+                env_prefix.push(' ');
+            }
+            env_prefix.push_str(key);
+            env_prefix.push('=');
+            env_prefix.push_str(&sh_single_quote(value));
+        }
+        let shell_script = if env_prefix.is_empty() {
+            format!(
+                "HOME={} TERM=xterm-256color LANG=C claude --setting-sources local --settings {} --mcp-config {} --strict-mcp-config --debug-file {} --model {} --permission-mode {} --tools \"\"",
+                sh_single_quote(&staged.home.display().to_string()),
+                sh_single_quote(&staged.settings_path.display().to_string()),
+                sh_single_quote(&staged.mcp_config_path.display().to_string()),
+                sh_single_quote(&staged.debug_path.display().to_string()),
+                sh_single_quote(CLAUDE_MODEL),
+                sh_single_quote(CLAUDE_PERMISSION_MODE),
+            )
+        } else {
+            format!(
+                "HOME={} TERM=xterm-256color LANG=C {} claude --setting-sources local --settings {} --mcp-config {} --strict-mcp-config --debug-file {} --model {} --permission-mode {} --tools \"\"",
+                sh_single_quote(&staged.home.display().to_string()),
+                env_prefix,
+                sh_single_quote(&staged.settings_path.display().to_string()),
+                sh_single_quote(&staged.mcp_config_path.display().to_string()),
+                sh_single_quote(&staged.debug_path.display().to_string()),
+                sh_single_quote(CLAUDE_MODEL),
+                sh_single_quote(CLAUDE_PERMISSION_MODE),
+            )
+        };
+        cmd.arg("-c");
+        cmd.arg(shell_script);
+        cmd.cwd(staged.workspace.clone());
+
+        let child = pair
+            .slave
+            .spawn_command(cmd)
+            .map_err(|err| format!("spawn claude failed: {err}"))?;
+        let reader = pair
+            .master
+            .try_clone_reader()
+            .map_err(|err| format!("clone reader failed: {err}"))?;
+        let writer = pair
+            .master
+            .take_writer()
+            .map_err(|err| format!("take writer failed: {err}"))?;
+        let writer = Arc::new(Mutex::new(writer));
+        let (tx, rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let mut reader = reader;
+            let mut buf = [0u8; 8192];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if tx.send(buf[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                    Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        Ok(Self {
+            child,
+            writer,
+            rx,
+            parser: Parser::new(40, 120, 0),
+            accepted_theme: false,
+            accepted_enter_continue: false,
+            accepted_trust_prompt: false,
+            skipped_terminal_setup: false,
+            _master: pair.master,
+            _slave: pair.slave,
+        })
+    }
+
+    fn send(&mut self, text: &str) -> TestResult<()> {
+        let mut writer = self.writer.lock().map_err(|_| "pty lock failed")?;
+        writer
+            .write_all(text.as_bytes())
+            .map_err(|err| format!("pty write failed: {err}"))?;
+        writer
+            .flush()
+            .map_err(|err| format!("pty flush failed: {err}"))?;
+        Ok(())
+    }
+
+    fn send_line(&mut self, text: &str) -> TestResult<()> {
+        self.send(text)?;
+        self.send("\r")?;
+        Ok(())
+    }
+
+    fn drain(&mut self, duration: Duration) {
+        let deadline = Instant::now() + duration;
+        while Instant::now() < deadline {
+            match self.rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(chunk) => {
+                    self.parser.process(&chunk);
+                    let _ = self.handle_startup_prompts();
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    }
+
+    fn wait_for_contains(&mut self, needle: &str, timeout: Duration) -> TestResult<()> {
+        let ok = self.wait_for_screen(timeout, |screen| screen.contains(needle));
+        if ok {
+            return Ok(());
+        }
+        Err(format!(
+            "timeout waiting for screen to contain {needle}\n{}",
+            normalize_screen(&self.snapshot_screen())
+        )
+        .into())
+    }
+
+    fn wait_for_any_contains(&mut self, needles: &[&str], timeout: Duration) -> TestResult<()> {
+        let ok = self.wait_for_screen(timeout, |screen| {
+            needles.iter().any(|needle| screen.contains(needle))
+        });
+        if ok {
+            return Ok(());
+        }
+        Err(format!(
+            "timeout waiting for screen to contain one of {:?}\n{}",
+            needles,
+            normalize_screen(&self.snapshot_screen())
+        )
+        .into())
+    }
+
+    fn wait_for_idle(&mut self, timeout: Duration) -> TestResult<()> {
+        let deadline = Instant::now() + timeout;
+        let mut stable_iterations = 0;
+        let mut last = String::new();
+        loop {
+            self.ensure_running("while waiting for idle")?;
+            self.drain(Duration::from_millis(200));
+            self.handle_startup_prompts()?;
+            let current = normalize_screen(&self.snapshot_screen());
+            if current == last && !current.trim().is_empty() {
+                stable_iterations += 1;
+                if stable_iterations >= 3 {
+                    return Ok(());
+                }
+            } else {
+                stable_iterations = 0;
+                last = current;
+            }
+            if Instant::now() >= deadline {
+                return Err(format!(
+                    "timeout waiting for Claude to become idle\n{}",
+                    normalize_screen(&self.snapshot_screen())
+                )
+                .into());
+            }
+        }
+    }
+
+    fn wait_for_screen(
+        &mut self,
+        timeout: Duration,
+        mut predicate: impl FnMut(&str) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.drain(Duration::from_millis(100));
+            let snapshot = self.snapshot_screen();
+            if predicate(&snapshot) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+        }
+    }
+
+    fn snapshot_screen(&self) -> String {
+        self.parser.screen().contents()
+    }
+
+    fn handle_startup_prompts(&mut self) -> TestResult<()> {
+        let screen = self.snapshot_screen();
+        if !self.accepted_theme
+            && screen.contains("Choose the text style that looks best with your terminal")
+        {
+            self.send("\r")?;
+            self.accepted_theme = true;
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        if !self.accepted_enter_continue
+            && (screen.contains("Press Enter to continue")
+                || screen.contains("Press Enter to continue…"))
+        {
+            self.send("\r")?;
+            self.accepted_enter_continue = true;
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        if !self.accepted_trust_prompt
+            && (screen.contains("Do you trust this folder")
+                || screen.contains("Do you trust this workspace")
+                || screen.contains("Trust this folder")
+                || screen.contains("Trust this workspace")
+                || screen.contains("Yes, I trust this folder")
+                || screen.contains("Yes, I trust this workspace")
+                || screen.contains("Quick safety check"))
+        {
+            self.send("\r")?;
+            self.accepted_trust_prompt = true;
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        if !self.skipped_terminal_setup && screen.contains(TERMINAL_SETUP_PROMPT) {
+            self.send("\u{1b}[B")?;
+            std::thread::sleep(Duration::from_millis(100));
+            self.send("\r")?;
+            self.skipped_terminal_setup = true;
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        Ok(())
+    }
+
+    fn ensure_running(&mut self, context: &str) -> TestResult<()> {
+        if let Some(status) = self
+            .child
+            .try_wait()
+            .map_err(|err| format!("claude wait failed: {err}"))?
+        {
+            return Err(format!(
+                "claude exited {context}: {status:?}\n{}",
+                normalize_screen(&self.snapshot_screen())
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn kill(mut self) -> TestResult<()> {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        Ok(())
+    }
 }
 
 fn extract_tool_call(events: &[JsonValue]) -> TestResult<ClaudeToolCallSnapshot> {
@@ -715,6 +1318,27 @@ fn normalize_done_text(text: &str) -> String {
     }
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn normalize_screen(screen: &str) -> String {
+    screen
+        .lines()
+        .map(str::trim_end)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn sh_single_quote(raw: &str) -> String {
+    if raw.is_empty() {
+        return "''".to_string();
+    }
+    format!("'{}'", raw.replace('\'', "'\"'\"'"))
+}
+
+fn read_debug_log(path: &Path) -> String {
+    fs::read_to_string(path).unwrap_or_else(|_| "<missing debug log>".to_string())
+}
+
 fn host_home_dir() -> TestResult<PathBuf> {
     resolve_home_dir_from_env(
         env::var_os("HOME"),
@@ -757,6 +1381,72 @@ fn resolve_home_dir_from_env(
     }
     combined.push(homepath);
     Some(PathBuf::from(combined))
+}
+
+#[test]
+fn seed_claude_root_state_preserves_existing_mcp_config() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let config_path = temp.path().join(".claude.json");
+    fs::write(
+        &config_path,
+        r#"{
+  "mcpServers": {
+    "r": {
+      "command": "mcp-repl"
+    }
+  }
+}"#,
+    )?;
+
+    seed_claude_root_state(&config_path, &workspace, "2.1.79")?;
+
+    let root: JsonValue = serde_json::from_str(&fs::read_to_string(&config_path)?)?;
+    assert_eq!(
+        root.get("shiftEnterKeyBindingInstalled")
+            .and_then(JsonValue::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        root.get("mcpServers")
+            .and_then(JsonValue::as_object)
+            .and_then(|servers| servers.get("r"))
+            .and_then(JsonValue::as_object)
+            .and_then(|server| server.get("command"))
+            .and_then(JsonValue::as_str),
+        Some("mcp-repl")
+    );
+
+    Ok(())
+}
+
+#[test]
+fn seed_claude_stats_cache_marks_project_onboarding_complete() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    fs::create_dir_all(&workspace)?;
+    let cache_path = temp.path().join("stats-cache.json");
+
+    seed_claude_stats_cache(&cache_path, &workspace, "2.1.79")?;
+
+    let root: JsonValue = serde_json::from_str(&fs::read_to_string(&cache_path)?)?;
+    let projects = root
+        .get("projects")
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| "projects missing from stats cache".to_string())?;
+    let project = projects
+        .get(&workspace.display().to_string())
+        .and_then(JsonValue::as_object)
+        .ok_or_else(|| "workspace missing from stats cache".to_string())?;
+    assert_eq!(
+        project
+            .get("hasCompletedProjectOnboarding")
+            .and_then(JsonValue::as_bool),
+        Some(true)
+    );
+
+    Ok(())
 }
 
 fn copy_dir_all(source: &Path, dest: &Path) -> TestResult<()> {

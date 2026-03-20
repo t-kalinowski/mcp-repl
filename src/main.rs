@@ -1,4 +1,5 @@
 mod backend;
+mod claude;
 mod debug_repl;
 mod diagnostics;
 mod event_log;
@@ -16,6 +17,7 @@ mod r_session;
 mod sandbox;
 mod sandbox_cli;
 mod server;
+mod shell_escape;
 #[cfg(target_os = "windows")]
 mod windows_sandbox;
 mod worker;
@@ -32,6 +34,7 @@ use crate::sandbox_cli::{
 enum CliCommand {
     RunServer(CliOptions),
     Install(install::InstallOptions),
+    ClaudeHook(claude::HookCommand),
 }
 
 #[derive(Debug, Clone)]
@@ -39,6 +42,7 @@ struct CliOptions {
     sandbox_plan: SandboxCliPlan,
     debug_repl: bool,
     backend: Backend,
+    server_name: String,
     debug_events_dir: Option<PathBuf>,
 }
 
@@ -84,6 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         Backend::R => "r".to_string(),
                         Backend::Python => "python".to_string(),
                     },
+                    server_name: options.server_name.clone(),
                     debug_repl: options.debug_repl,
                     sandbox_state: None,
                 },
@@ -93,9 +98,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return debug_repl::run(options.backend, options.sandbox_plan);
             }
             crate::diagnostics::startup_log("main: server mode");
-            server::run(options.backend, options.sandbox_plan).await
+            server::run(options.backend, &options.server_name, options.sandbox_plan).await
         }
         CliCommand::Install(options) => install::run(options),
+        CliCommand::ClaudeHook(command) => claude::run_hook(command),
     }
 }
 
@@ -107,7 +113,12 @@ fn ignore_sigpipe() {
 }
 
 fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
-    let mut parser = ArgParser::new();
+    parse_cli_args_with_parser(ArgParser::new())
+}
+
+fn parse_cli_args_with_parser(
+    mut parser: ArgParser,
+) -> Result<CliCommand, Box<dyn std::error::Error>> {
     if parser.peek() == Some("install") {
         parser.next();
         return Ok(CliCommand::Install(parse_install_args(
@@ -115,11 +126,16 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
             Vec::new(),
         )?));
     }
+    if parser.args.len() >= 2 && parser.args[parser.args.len() - 2] == "claude-hook" {
+        parser.index = parser.args.len() - 1;
+        return Ok(CliCommand::ClaudeHook(parse_claude_hook_args(&mut parser)?));
+    }
 
     let mut sandbox_args = SandboxCliArgs::default();
     let mut debug_repl = false;
     let mut debug_events_dir = None;
     let mut backend = backend_from_env()?;
+    let mut server_name = None;
     while let Some(arg) = parser.next() {
         match arg.as_str() {
             "-h" | "--help" => {
@@ -228,19 +244,60 @@ fn parse_cli_args() -> Result<CliCommand, Box<dyn std::error::Error>> {
                 }
                 debug_events_dir = Some(PathBuf::from(value));
             }
+            "--server-name" => {
+                let value = parser.next_value("--server-name")?;
+                if value.trim().is_empty() {
+                    return Err("missing value for --server-name".into());
+                }
+                server_name = Some(value);
+            }
+            _ if arg.starts_with("--server-name=") => {
+                let value = arg.split_once('=').map(|(_, value)| value).unwrap_or("");
+                if value.trim().is_empty() {
+                    return Err("missing value for --server-name".into());
+                }
+                server_name = Some(value.to_string());
+            }
             _ => match parse_backend_arg(&arg, &mut parser)? {
                 Some(parsed_backend) => backend = Some(parsed_backend),
                 None => return Err(format!("unknown argument: {arg}").into()),
             },
         }
     }
+    let backend = backend.unwrap_or(Backend::R);
 
     Ok(CliCommand::RunServer(CliOptions {
         sandbox_plan: sandbox_args.plan,
         debug_repl,
-        backend: backend.unwrap_or(Backend::R),
+        backend,
+        server_name: server_name.unwrap_or_else(|| default_server_name(backend).to_string()),
         debug_events_dir,
     }))
+}
+
+fn default_server_name(backend: Backend) -> &'static str {
+    match backend {
+        Backend::R => "r",
+        Backend::Python => "python",
+    }
+}
+
+fn parse_claude_hook_args(
+    parser: &mut ArgParser,
+) -> Result<claude::HookCommand, Box<dyn std::error::Error>> {
+    let Some(subcommand) = parser.next() else {
+        return Err("missing claude-hook subcommand (expected session-start|session-end)".into());
+    };
+    if matches!(subcommand.as_str(), "-h" | "--help") {
+        print_usage();
+        std::process::exit(0);
+    }
+    let command = claude::HookCommand::parse(&subcommand)
+        .map_err(|err| -> Box<dyn std::error::Error> { err.into() })?;
+    if let Some(extra) = parser.next() {
+        return Err(format!("unexpected claude-hook argument: {extra}").into());
+    }
+    Ok(command)
 }
 
 fn parse_backend_arg(
@@ -457,6 +514,7 @@ fn print_usage() {
         "Usage:\n\
 mcp-repl [--debug-repl] [--interpreter <r|python>] [--sandbox <inherit|read-only|workspace-write|danger-full-access>] [--add-writable-root <abs-path>] [--add-allowed-domain <domain>] [--config <key=value>]...\n\
 mcp-repl install [codex] [claude] [--client <codex|claude>]... [--interpreter <r|python>[,r|python]...]... [--server-name <name>] [--command <path>] [--arg <value>]...\n\n\
+mcp-repl claude-hook <session-start|session-end>\n\n\
 --debug-repl: run an interactive debug REPL over stdio\n\
 --debug-events-dir: optional directory for per-startup JSONL debug event logs (env: MCP_REPL_DEBUG_EVENTS_DIR)\n\
 --interpreter: choose REPL interpreter (default: r; env MCP_REPL_INTERPRETER, compatibility env MCP_REPL_BACKEND)\n\
@@ -487,6 +545,49 @@ mod tests {
     use super::*;
     use crate::sandbox::{SandboxPolicy, SandboxState};
     use crate::sandbox_cli::{SandboxConfigOperation, resolve_effective_sandbox_state};
+
+    #[test]
+    fn parse_claude_hook_args_accepts_session_start() {
+        let mut parser = ArgParser {
+            args: vec!["session-start".to_string()],
+            index: 0,
+        };
+        let parsed = parse_claude_hook_args(&mut parser).expect("parse claude hook args");
+        assert_eq!(parsed, crate::claude::HookCommand::SessionStart);
+    }
+
+    #[test]
+    fn parse_cli_args_accepts_claude_hook_after_passthrough_args() {
+        let parsed = parse_cli_args_with_parser(ArgParser {
+            args: vec![
+                "--sandbox".to_string(),
+                "workspace-write".to_string(),
+                "claude-hook".to_string(),
+                "session-end".to_string(),
+            ],
+            index: 0,
+        })
+        .expect("parse cli args");
+        assert!(matches!(
+            parsed,
+            CliCommand::ClaudeHook(crate::claude::HookCommand::SessionEnd)
+        ));
+    }
+
+    #[test]
+    fn parse_cli_args_does_not_treat_non_trailing_claude_hook_token_as_hook_mode() {
+        let parsed = parse_cli_args_with_parser(ArgParser {
+            args: vec!["--debug-events-dir".to_string(), "claude-hook".to_string()],
+            index: 0,
+        })
+        .expect("parse cli args");
+        match parsed {
+            CliCommand::RunServer(options) => {
+                assert_eq!(options.debug_events_dir, Some(PathBuf::from("claude-hook")));
+            }
+            _ => panic!("expected RunServer"),
+        }
+    }
 
     #[test]
     fn parse_backend_arg_accepts_interpreter_flag_forms() {
@@ -664,8 +765,10 @@ mod tests {
     #[test]
     fn empty_plan_uses_inherited_state_when_available() {
         let plan = SandboxCliPlan::default();
-        let mut inherited = SandboxState::default();
-        inherited.sandbox_policy = SandboxPolicy::DangerFullAccess;
+        let inherited = SandboxState {
+            sandbox_policy: SandboxPolicy::DangerFullAccess,
+            ..SandboxState::default()
+        };
         let resolved = resolve_effective_sandbox_state(&plan, Some(&inherited))
             .expect("effective sandbox state");
         assert_eq!(resolved.sandbox_policy, SandboxPolicy::DangerFullAccess);
