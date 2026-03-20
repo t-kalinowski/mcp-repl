@@ -499,6 +499,71 @@ fn install_claude_ignores_duplicate_hook_matchers() -> TestResult<()> {
 }
 
 #[test]
+fn install_claude_ignores_malformed_matched_hook_entries() -> TestResult<()> {
+    let temp = tempfile::tempdir()?;
+    let claude_dir = temp.path().join(".claude");
+    std::fs::create_dir_all(&claude_dir)?;
+    let settings_path = claude_dir.join("settings.json");
+    std::fs::write(
+        &settings_path,
+        serde_json::to_string_pretty(&serde_json::json!({
+            "hooks": {
+                "SessionStart": [
+                    {"matcher": "startup", "hooks": {"type": "command"}},
+                    {"matcher": "resume", "hooks": []}
+                ]
+            }
+        }))?,
+    )?;
+    let exe = common::resolve_test_binary()?;
+
+    let status = Command::new(exe)
+        .arg("install")
+        .arg("--client")
+        .arg("claude")
+        .arg("--command")
+        .arg("/usr/local/bin/mcp-repl")
+        .env("HOME", temp.path())
+        .status()?;
+    assert!(
+        status.success(),
+        "install should ignore malformed matcher entries instead of failing"
+    );
+
+    let settings_text = std::fs::read_to_string(settings_path)?;
+    let settings_root: JsonValue = serde_json::from_str(&settings_text)?;
+    let startup_entries: Vec<&JsonValue> = claude_hook_entries(&settings_root, "SessionStart")
+        .iter()
+        .filter(|entry| entry["matcher"].as_str() == Some("startup"))
+        .collect();
+    assert_eq!(
+        startup_entries.len(),
+        2,
+        "expected malformed startup entry to remain while canonical managed hooks are added"
+    );
+    assert!(
+        startup_entries
+            .iter()
+            .any(|entry| entry["hooks"].as_object().is_some()),
+        "expected malformed startup entry to remain untouched"
+    );
+    let expected =
+        installed_claude_hook_command(temp.path(), "/usr/local/bin/mcp-repl", &[], "session-start");
+    assert!(
+        startup_entries.iter().any(|entry| {
+            entry["hooks"].as_array().is_some_and(|hooks| {
+                hooks
+                    .iter()
+                    .any(|hook| hook["command"].as_str() == Some(expected.as_str()))
+            })
+        }),
+        "expected one startup entry to contain the managed command"
+    );
+
+    Ok(())
+}
+
+#[test]
 fn install_codex_and_install_claude_commands_are_rejected() -> TestResult<()> {
     let temp = tempfile::tempdir()?;
     let codex_home = temp.path().join("codex-home");

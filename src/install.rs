@@ -704,19 +704,21 @@ fn upsert_claude_hook_command(
         .filter_map(|(idx, entry)| hook_entry_matches(entry, matcher).then_some(idx))
         .collect::<Vec<_>>();
 
-    let primary_idx = match matching_indexes.as_slice() {
-        [first, rest @ ..] => {
-            for idx in rest {
-                remove_managed_claude_hook_commands(
-                    &mut entries_arr[*idx],
-                    command_program,
-                    command_args,
-                    hook_subcommand,
-                )?;
-            }
-            *first
+    let mut primary_idx = None;
+    for idx in matching_indexes {
+        if remove_managed_claude_hook_commands(
+            &mut entries_arr[idx],
+            command_program,
+            command_args,
+            hook_subcommand,
+        )? {
+            primary_idx.get_or_insert(idx);
         }
-        [] => {
+    }
+
+    let primary_idx = match primary_idx {
+        Some(idx) => idx,
+        None => {
             entries_arr.push(new_hook_entry(matcher, command));
             entries_arr.len() - 1
         }
@@ -741,6 +743,21 @@ fn hook_entry_matches(entry: &JsonValue, matcher: Option<&str>) -> bool {
     }
 }
 
+fn entry_hook_array_mut(
+    entry: &mut JsonValue,
+) -> Result<Option<&mut Vec<JsonValue>>, Box<dyn std::error::Error>> {
+    let Some(obj) = entry.as_object_mut() else {
+        return Err("claude hook entry must be an object".into());
+    };
+    if !obj.contains_key("hooks") {
+        obj.insert("hooks".to_string(), JsonValue::Array(Vec::new()));
+    }
+    Ok(obj
+        .get_mut("hooks")
+        .expect("hooks entry should exist")
+        .as_array_mut())
+}
+
 fn replace_claude_hook_command(
     entry: &mut JsonValue,
     command: &str,
@@ -748,13 +765,7 @@ fn replace_claude_hook_command(
     command_args: &[String],
     hook_subcommand: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(obj) = entry.as_object_mut() else {
-        return Err("claude hook entry must be an object".into());
-    };
-    let hooks = obj
-        .entry("hooks".to_string())
-        .or_insert_with(|| JsonValue::Array(Vec::new()));
-    let Some(hooks_arr) = hooks.as_array_mut() else {
+    let Some(hooks_arr) = entry_hook_array_mut(entry)? else {
         return Err("claude hook entry `hooks` must be an array".into());
     };
 
@@ -796,15 +807,9 @@ fn remove_managed_claude_hook_commands(
     command_program: &str,
     command_args: &[String],
     hook_subcommand: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let Some(obj) = entry.as_object_mut() else {
-        return Err("claude hook entry must be an object".into());
-    };
-    let hooks = obj
-        .entry("hooks".to_string())
-        .or_insert_with(|| JsonValue::Array(Vec::new()));
-    let Some(hooks_arr) = hooks.as_array_mut() else {
-        return Err("claude hook entry `hooks` must be an array".into());
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let Some(hooks_arr) = entry_hook_array_mut(entry)? else {
+        return Ok(false);
     };
 
     hooks_arr.retain(|hook| {
@@ -825,7 +830,7 @@ fn remove_managed_claude_hook_commands(
             hook_subcommand,
         )
     });
-    Ok(())
+    Ok(true)
 }
 
 fn is_managed_claude_hook_command(

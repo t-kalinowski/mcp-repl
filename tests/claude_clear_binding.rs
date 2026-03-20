@@ -38,6 +38,17 @@ fn claude_scope_env_vars(state_home: &Path, scope_key: &str) -> Vec<(String, Str
     ]
 }
 
+fn overwrite_session_id_env_file(env_file: &Path, session_id: &str) -> TestResult<()> {
+    let encoded = URL_SAFE_NO_PAD.encode(session_id);
+    let line = if cfg!(windows) {
+        format!("set MCP_REPL_CLAUDE_SESSION_ID={SESSION_ID_TOKEN_PREFIX}{encoded}\n")
+    } else {
+        format!("export MCP_REPL_CLAUDE_SESSION_ID={SESSION_ID_TOKEN_PREFIX}{encoded}\n")
+    };
+    std::fs::write(env_file, line)?;
+    Ok(())
+}
+
 #[cfg(not(windows))]
 fn source_session_id_from_env_file(env_file: &Path) -> TestResult<String> {
     let output = Command::new("sh")
@@ -959,6 +970,76 @@ async fn claude_clear_scope_binding_prefers_current_session_before_first_worker_
     assert!(
         after_clear.contains("FALSE"),
         "expected current scope session clear to reset the lazily bound worker, got: {after_clear:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn claude_clear_scope_binding_ignores_stale_env_file_session_for_same_scope() -> TestResult<()>
+{
+    let _guard = common::lock_test_mutex()?;
+    let temp = tempfile::tempdir()?;
+    let exe = common::resolve_test_binary()?;
+    let env_file = temp.path().join("claude.env");
+    let env_vars = vec![
+        (
+            "XDG_STATE_HOME".to_string(),
+            temp.path().to_string_lossy().to_string(),
+        ),
+        (
+            "MCP_REPL_CLAUDE_TEST_SCOPE_KEY".to_string(),
+            "scope-stale-env".to_string(),
+        ),
+        (
+            "CLAUDE_ENV_FILE".to_string(),
+            env_file.to_string_lossy().to_string(),
+        ),
+    ];
+
+    run_session_start_with_env(&exe, &env_vars, "sess-a")?;
+    run_session_start_with_env(&exe, &env_vars, "sess-b")?;
+    overwrite_session_id_env_file(&env_file, "sess-a")?;
+
+    let mut session = common::spawn_server_with_env_vars(env_vars.clone()).await?;
+
+    let before_clear = match repl_text(
+        &mut session,
+        "scope_stale_env_bound <- 1; print(exists(\"scope_stale_env_bound\"))",
+        "before stale env-file scope clear on current session",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session.cancel().await?;
+            return Ok(());
+        }
+    };
+    assert!(
+        before_clear.contains("TRUE"),
+        "expected current scope session state before clear, got: {before_clear:?}"
+    );
+
+    run_session_end_clear_with_env(&exe, &env_vars, "sess-b")?;
+
+    let after_clear = match repl_text(
+        &mut session,
+        "print(exists(\"scope_stale_env_bound\"))",
+        "after stale env-file scope clear on current session",
+    )
+    .await?
+    {
+        Some(text) => text,
+        None => {
+            session.cancel().await?;
+            return Ok(());
+        }
+    };
+
+    session.cancel().await?;
+    assert!(
+        after_clear.contains("FALSE"),
+        "expected current scope session to beat stale env-file state, got: {after_clear:?}"
     );
     Ok(())
 }

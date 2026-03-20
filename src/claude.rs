@@ -487,6 +487,17 @@ fn current_claude_session_binding(
     record_template: &InstanceRecordTemplate,
     current_binding: Option<(&Path, &ClaudeSessionBinding)>,
 ) -> Result<Option<ClaudeSessionBinding>, WorkerError> {
+    if let Some(state_root) = runtime.state_root()
+        && let Some(scope_key) = runtime.scope_key()
+        && let Some(session_id) =
+            resolve_scope_session_id_in(state_root, scope_key, record_template, current_binding)?
+    {
+        return Ok(Some(ClaudeSessionBinding {
+            identity: ClaudeSessionIdentity::ScopeKey(scope_key.to_string()),
+            session_id,
+        }));
+    }
+
     if let Some(env_file_path) = runtime.env_file_path()
         && let Some(session_id) = read_session_id_from_env_file(Some(env_file_path))
     {
@@ -497,17 +508,6 @@ fn current_claude_session_binding(
                 session_id,
             }));
         }
-    }
-
-    if let Some(state_root) = runtime.state_root()
-        && let Some(scope_key) = runtime.scope_key()
-        && let Some(session_id) =
-            resolve_scope_session_id_in(state_root, scope_key, record_template, current_binding)?
-    {
-        return Ok(Some(ClaudeSessionBinding {
-            identity: ClaudeSessionIdentity::ScopeKey(scope_key.to_string()),
-            session_id,
-        }));
     }
 
     Ok(None)
@@ -1304,6 +1304,7 @@ fn canonicalize_or_identity(path: PathBuf) -> PathBuf {
 mod tests {
     use super::*;
     use crate::sandbox_cli::{SandboxCliOperation, SandboxCliPlan, SandboxModeArg};
+    use std::ffi::OsString;
     use std::sync::Mutex;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -1324,6 +1325,56 @@ mod tests {
 
     fn live_test_process_identity() -> ProcessIdentity {
         current_process_identity().expect("current process identity")
+    }
+
+    struct SavedStateHomeEnv {
+        home: Option<OsString>,
+        xdg_state_home: Option<OsString>,
+        local_app_data: Option<OsString>,
+        app_data: Option<OsString>,
+    }
+
+    fn capture_state_home_env() -> SavedStateHomeEnv {
+        SavedStateHomeEnv {
+            home: env::var_os("HOME"),
+            xdg_state_home: env::var_os("XDG_STATE_HOME"),
+            local_app_data: env::var_os("LOCALAPPDATA"),
+            app_data: env::var_os("APPDATA"),
+        }
+    }
+
+    fn clear_state_home_env() {
+        unsafe {
+            env::remove_var("HOME");
+            env::remove_var("XDG_STATE_HOME");
+            env::remove_var("LOCALAPPDATA");
+            env::remove_var("APPDATA");
+        }
+    }
+
+    fn restore_state_home_env(saved: SavedStateHomeEnv) {
+        unsafe {
+            if let Some(home) = saved.home {
+                env::set_var("HOME", home);
+            } else {
+                env::remove_var("HOME");
+            }
+            if let Some(xdg_state_home) = saved.xdg_state_home {
+                env::set_var("XDG_STATE_HOME", xdg_state_home);
+            } else {
+                env::remove_var("XDG_STATE_HOME");
+            }
+            if let Some(local_app_data) = saved.local_app_data {
+                env::set_var("LOCALAPPDATA", local_app_data);
+            } else {
+                env::remove_var("LOCALAPPDATA");
+            }
+            if let Some(app_data) = saved.app_data {
+                env::set_var("APPDATA", app_data);
+            } else {
+                env::remove_var("APPDATA");
+            }
+        }
     }
 
     #[test]
@@ -1611,11 +1662,9 @@ mod tests {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let temp = test_tempdir("claude-session-start-no-state-home-");
         let env_file = temp.path().join("claude.env");
-        let home = env::var_os("HOME");
-        let xdg_state_home = env::var_os("XDG_STATE_HOME");
+        let saved_state_home = capture_state_home_env();
         unsafe {
-            env::remove_var("XDG_STATE_HOME");
-            env::remove_var("HOME");
+            clear_state_home_env();
             env::set_var(CLAUDE_ENV_FILE_ENV, &env_file);
             env::remove_var(CLAUDE_TEST_SCOPE_KEY_ENV);
             env::remove_var(CLAUDE_PROJECT_DIR_ENV);
@@ -1639,17 +1688,12 @@ mod tests {
 
         unsafe {
             env::remove_var(CLAUDE_ENV_FILE_ENV);
-            if let Some(home) = home {
-                env::set_var("HOME", home);
-            }
-            if let Some(xdg_state_home) = xdg_state_home {
-                env::set_var("XDG_STATE_HOME", xdg_state_home);
-            }
+            restore_state_home_env(saved_state_home);
         }
     }
 
     #[test]
-    fn current_claude_session_binding_prefers_env_file_over_scope_state() {
+    fn current_claude_session_binding_prefers_scope_state_over_stale_env_file() {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let temp = test_tempdir("claude-env-file-over-scope-");
         let env_file = temp.path().join("claude.env");
@@ -1658,7 +1702,7 @@ mod tests {
             env::set_var(CLAUDE_ENV_FILE_ENV, &env_file);
             env::set_var(CLAUDE_TEST_SCOPE_KEY_ENV, "scope-env-file");
         }
-        fs::write(&env_file, session_export_line("sess-new")).expect("write env file");
+        fs::write(&env_file, session_export_line("sess-old")).expect("write env file");
         let scope_key = current_claude_scope_key(None).expect("scope key");
         write_json_atomic(
             &claude_session_state_path(&scope_key).expect("scope state path"),
@@ -1700,10 +1744,10 @@ mod tests {
         assert_eq!(
             binding,
             ClaudeSessionBinding {
-                identity: ClaudeSessionIdentity::EnvFile(env_file.clone()),
+                identity: ClaudeSessionIdentity::ScopeKey(scope_key),
                 session_id: "sess-new".to_string(),
             },
-            "expected exact env-file session binding to override stale scope state"
+            "expected current scope session binding to override stale env-file state"
         );
 
         unsafe {
@@ -1719,11 +1763,9 @@ mod tests {
         let temp = test_tempdir("claude-register-no-state-home-");
         let env_file = temp.path().join("claude.env");
         fs::write(&env_file, session_export_line("sess-env-only")).expect("write env file");
-        let home = env::var_os("HOME");
-        let xdg_state_home = env::var_os("XDG_STATE_HOME");
+        let saved_state_home = capture_state_home_env();
         unsafe {
-            env::remove_var("HOME");
-            env::remove_var("XDG_STATE_HOME");
+            clear_state_home_env();
             env::set_var(CLAUDE_ENV_FILE_ENV, &env_file);
             env::remove_var(CLAUDE_TEST_SCOPE_KEY_ENV);
             env::remove_var(CLAUDE_PROJECT_DIR_ENV);
@@ -1739,12 +1781,7 @@ mod tests {
 
         unsafe {
             env::remove_var(CLAUDE_ENV_FILE_ENV);
-            if let Some(home) = home {
-                env::set_var("HOME", home);
-            }
-            if let Some(xdg_state_home) = xdg_state_home {
-                env::set_var("XDG_STATE_HOME", xdg_state_home);
-            }
+            restore_state_home_env(saved_state_home);
         }
     }
 
@@ -1754,8 +1791,7 @@ mod tests {
         let temp = test_tempdir("claude-runtime-mode-matrix-");
         let state_home = temp.path().join("state-home");
         let env_file = temp.path().join("claude.env");
-        let home = env::var_os("HOME");
-        let xdg_state_home = env::var_os("XDG_STATE_HOME");
+        let saved_state_home = capture_state_home_env();
 
         struct Case<'a> {
             name: &'a str,
@@ -1791,8 +1827,7 @@ mod tests {
 
         for case in cases {
             unsafe {
-                env::remove_var("HOME");
-                env::remove_var("XDG_STATE_HOME");
+                clear_state_home_env();
                 env::remove_var(CLAUDE_ENV_FILE_ENV);
                 env::remove_var(CLAUDE_TEST_SCOPE_KEY_ENV);
                 if case.home {
@@ -1845,16 +1880,7 @@ mod tests {
         unsafe {
             env::remove_var(CLAUDE_ENV_FILE_ENV);
             env::remove_var(CLAUDE_TEST_SCOPE_KEY_ENV);
-            if let Some(home) = home {
-                env::set_var("HOME", home);
-            } else {
-                env::remove_var("HOME");
-            }
-            if let Some(xdg_state_home) = xdg_state_home {
-                env::set_var("XDG_STATE_HOME", xdg_state_home);
-            } else {
-                env::remove_var("XDG_STATE_HOME");
-            }
+            restore_state_home_env(saved_state_home);
         }
     }
 
@@ -2231,11 +2257,9 @@ mod tests {
         let _guard = ENV_LOCK.lock().expect("env lock");
         let temp = test_tempdir("claude-session-end-no-state-home-");
         let env_file = temp.path().join("claude.env");
-        let home = env::var_os("HOME");
-        let xdg_state_home = env::var_os("XDG_STATE_HOME");
+        let saved_state_home = capture_state_home_env();
         unsafe {
-            env::remove_var("HOME");
-            env::remove_var("XDG_STATE_HOME");
+            clear_state_home_env();
             env::set_var(CLAUDE_ENV_FILE_ENV, &env_file);
             env::remove_var(CLAUDE_TEST_SCOPE_KEY_ENV);
             env::remove_var(CLAUDE_PROJECT_DIR_ENV);
@@ -2250,12 +2274,7 @@ mod tests {
 
         unsafe {
             env::remove_var(CLAUDE_ENV_FILE_ENV);
-            if let Some(home) = home {
-                env::set_var("HOME", home);
-            }
-            if let Some(xdg_state_home) = xdg_state_home {
-                env::set_var("XDG_STATE_HOME", xdg_state_home);
-            }
+            restore_state_home_env(saved_state_home);
         }
     }
 
