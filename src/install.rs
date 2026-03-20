@@ -767,7 +767,9 @@ fn remove_managed_claude_hook_commands(
 }
 
 fn is_managed_claude_hook_command(command: &str, hook_subcommand: &str) -> bool {
-    command.contains(&format!("claude-hook {hook_subcommand}"))
+    command
+        .trim_end()
+        .ends_with(&format!(" claude-hook {hook_subcommand}"))
 }
 
 fn new_hook_entry(matcher: Option<&str>, command: &str) -> JsonValue {
@@ -1747,6 +1749,60 @@ name="demo"
         assert!(
             !commands.contains(&"/opt/old/mcp-repl claude-hook session-start"),
             "expected stale managed command to be removed even when duplicate entries remain"
+        );
+    }
+
+    #[test]
+    fn upsert_claude_settings_hooks_keeps_user_commands_that_only_mention_hook_subcommand() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = dir.path().join("settings.json");
+        let mention_only = "logger --message 'claude-hook session-start'";
+        let expected_session_start =
+            claude_hook_command("/usr/local/bin/mcp-repl", &[], "session-start");
+
+        fs::write(
+            &settings,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "hooks": {
+                    "SessionStart": [
+                        {
+                            "matcher": "startup",
+                            "hooks": [
+                                {"type": "command", "command": mention_only}
+                            ]
+                        }
+                    ]
+                }
+            }))
+            .expect("serialize settings"),
+        )
+        .expect("write settings");
+
+        upsert_claude_settings_hooks(&settings, "/usr/local/bin/mcp-repl", &[])
+            .expect("upsert hooks");
+
+        let text = fs::read_to_string(&settings).expect("read settings");
+        let root: JsonValue = serde_json::from_str(&text).expect("parse json");
+        let startup = root["hooks"]["SessionStart"]
+            .as_array()
+            .expect("session start hooks array")
+            .iter()
+            .find(|entry| entry["matcher"].as_str() == Some("startup"))
+            .expect("startup matcher entry");
+        let commands: Vec<&str> = startup["hooks"]
+            .as_array()
+            .expect("hooks array")
+            .iter()
+            .filter_map(|hook| hook["command"].as_str())
+            .collect();
+
+        assert!(
+            commands.contains(&mention_only),
+            "expected user-managed command mentioning the hook subcommand to remain"
+        );
+        assert!(
+            commands.contains(&expected_session_start.as_str()),
+            "expected managed Claude hook command to be added"
         );
     }
 
