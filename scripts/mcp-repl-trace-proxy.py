@@ -13,16 +13,16 @@ CHUNK_SIZE = 65536
 LOG_DIR_NAME = ".mcp-repl-trace"
 FORWARD_STDERR_ENV = "MCP_REPL_TRACE_FORWARD_STDERR"
 STREAM_META = {
-    "stdin": {"route": "claude_client -> mcp_repl_server"},
-    "stdout": {"route": "mcp_repl_server -> claude_client"},
-    "stderr": {"route": "mcp_repl_server_stderr -> trace_log"},
+    "stdin": {"route": "mcp_client -> mcp_server"},
+    "stdout": {"route": "mcp_server -> mcp_client"},
+    "stderr": {"route": "mcp_server_stderr -> trace_log"},
 }
 
 
-def filtered_prefixed_env(prefix: str):
+def filtered_prefixed_env(prefixes: tuple[str, ...]):
     out = {}
     for k, v in os.environ.items():
-        if not k.startswith(prefix):
+        if not any(k.startswith(prefix) for prefix in prefixes):
             continue
         upper = k.upper()
         if any(token in upper for token in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
@@ -125,7 +125,7 @@ def main():
     global child
 
     if len(sys.argv) < 2:
-        print("usage: mcp-repl-trace-proxy REAL_MCP_REPL [ARGS...]", file=sys.stderr)
+        print("usage: mcp-repl-trace-proxy REAL_MCP_SERVER [ARGS...]", file=sys.stderr)
         return 2
 
     real_cmd = sys.argv[1:]
@@ -140,7 +140,7 @@ def main():
         pretty_log_path=str(pretty_path),
         forward_stderr=bool(os.environ.get(FORWARD_STDERR_ENV)),
         ppid=os.getppid(),
-        claude_env=filtered_prefixed_env("CLAUDE_"),
+        visible_env=filtered_prefixed_env(("MCP_", "CODEX_", "CLAUDE_")),
     )
 
     child = subprocess.Popen(
