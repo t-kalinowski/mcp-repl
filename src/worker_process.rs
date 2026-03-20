@@ -901,6 +901,7 @@ impl WorkerManager {
         worker_timeout: Duration,
         server_timeout: Duration,
     ) -> Result<RequestState, WorkerError> {
+        let text = normalize_input_newlines(&text);
         let started_at = std::time::Instant::now();
         let ipc = self
             .process
@@ -2533,6 +2534,10 @@ fn normalize_prompt(prompt: Option<String>) -> Option<String> {
     prompt.filter(|value| !value.is_empty())
 }
 
+fn normalize_input_newlines(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
 fn timeout_status_content(timeout: Duration) -> WorkerContent {
     let elapsed_ms = duration_to_millis(timeout);
     let elapsed_ms = (elapsed_ms / TIMEOUT_STATUS_GRANULARITY_MS) * TIMEOUT_STATUS_GRANULARITY_MS;
@@ -3944,6 +3949,11 @@ mod tests {
             Some(&Some("/tmp/mcp-repl-debug-session".to_string()))
         );
         assert_eq!(envs.get(crate::diagnostics::STARTUP_LOG_PATH_ENV), None);
+    }
+
+    #[test]
+    fn normalize_input_newlines_canonicalizes_crlf_and_cr() {
+        assert_eq!(normalize_input_newlines("a\r\nb\rc\n"), "a\nb\nc\n");
     }
 
     #[test]
