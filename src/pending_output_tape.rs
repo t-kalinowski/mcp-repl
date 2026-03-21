@@ -12,6 +12,7 @@ pub(crate) struct PendingOutputTape {
 #[derive(Default)]
 struct PendingOutputTapeInner {
     next_seq: u64,
+    progress_seq: u64,
     events: VecDeque<PendingOutputEvent>,
     stdout_tail: Vec<u8>,
     stderr_tail: Vec<u8>,
@@ -75,6 +76,7 @@ impl PendingOutputTape {
             .inner
             .lock()
             .expect("pending output tape mutex poisoned");
+        note_progress(&mut guard);
         flush_tail(&mut guard, TextStream::Stdout);
         flush_tail(&mut guard, TextStream::Stderr);
         let seq = next_seq(&mut guard);
@@ -92,6 +94,7 @@ impl PendingOutputTape {
             .inner
             .lock()
             .expect("pending output tape mutex poisoned");
+        note_progress(&mut guard);
         flush_tail(&mut guard, TextStream::Stdout);
         flush_tail(&mut guard, TextStream::Stderr);
         let seq = next_seq(&mut guard);
@@ -121,7 +124,7 @@ impl PendingOutputTape {
             .inner
             .lock()
             .expect("pending output tape mutex poisoned");
-        guard.next_seq
+        guard.progress_seq
     }
 
     pub(crate) fn drain_snapshot(&self) -> PendingOutputSnapshot {
@@ -144,6 +147,7 @@ impl PendingOutputTape {
             .inner
             .lock()
             .expect("pending output tape mutex poisoned");
+        note_progress(&mut guard);
         flush_tail(&mut guard, other_stream(stream));
         tail_mut(&mut guard, stream).extend_from_slice(bytes);
         loop {
@@ -182,7 +186,7 @@ impl PendingOutputSnapshot {
                         continue;
                     }
                     let text = if matches!(stream, TextStream::Stderr) {
-                        format!("stderr: {rendered}")
+                        render_stderr_text(&formatted.contents, rendered)
                     } else {
                         rendered
                     };
@@ -258,6 +262,30 @@ fn next_seq(inner: &mut PendingOutputTapeInner) -> u64 {
     let seq = inner.next_seq;
     inner.next_seq = inner.next_seq.saturating_add(1);
     seq
+}
+
+fn note_progress(inner: &mut PendingOutputTapeInner) {
+    inner.progress_seq = inner.progress_seq.saturating_add(1);
+}
+
+fn render_stderr_text(existing_contents: &[WorkerContent], rendered: String) -> String {
+    let needs_separator = existing_contents
+        .last()
+        .and_then(last_text_content)
+        .is_some_and(|text| !text.ends_with('\n'))
+        && !rendered.starts_with('\n');
+    if needs_separator {
+        format!("\nstderr: {rendered}")
+    } else {
+        format!("stderr: {rendered}")
+    }
+}
+
+fn last_text_content(content: &WorkerContent) -> Option<&str> {
+    match content {
+        WorkerContent::ContentText { text, .. } => Some(text.as_str()),
+        WorkerContent::ContentImage { .. } => None,
+    }
 }
 
 fn other_stream(stream: TextStream) -> TextStream {
@@ -351,6 +379,37 @@ mod tests {
         assert_eq!(
             formatted.contents,
             vec![WorkerContent::stdout("ok \\xFF\\xFE done\n")]
+        );
+    }
+
+    #[test]
+    fn progress_seq_tracks_partial_line_appends() {
+        let tape = PendingOutputTape::new();
+        tape.append_stdout_bytes(b"abc");
+        let first = tape.current_seq();
+        tape.append_stdout_bytes(b"def");
+        let second = tape.current_seq();
+
+        assert!(
+            second > first,
+            "progress counter should advance on tail-only appends"
+        );
+    }
+
+    #[test]
+    fn stderr_after_partial_stdout_starts_on_new_line() {
+        let tape = PendingOutputTape::new();
+        tape.append_stdout_bytes(b"x");
+        tape.append_stderr_bytes(b"boom\n");
+
+        let snapshot = tape.drain_snapshot();
+        let formatted = snapshot.format_contents();
+        assert_eq!(
+            formatted.contents,
+            vec![
+                WorkerContent::stdout("x"),
+                WorkerContent::stderr("\nstderr: boom\n")
+            ]
         );
     }
 }
