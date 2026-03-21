@@ -20,14 +20,14 @@ libc = "0.2"
 libr = { git = "https://github.com/t-kalinowski/ark" }
 memchr = "2.8.0"
 regex-lite = "0.1"
-rmcp = { version = "0.15.0", features = ["client", "transport-child-process", "transport-io"] }
+rmcp = { version = "1.2.0", features = ["client", "transport-child-process", "transport-io"] }
 schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sysinfo = "0.38.1"
-tempfile = "3.25.0"
+sysinfo = "0.38.4"
+tempfile = "3.27.0"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-toml_edit = "0.25.0"
+toml_edit = "0.25.5"
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4.4"
 seccompiler = "0.5.0"

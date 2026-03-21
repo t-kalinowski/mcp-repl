@@ -217,14 +217,13 @@ impl SharedServer {
 }
 
 fn server_info() -> ServerInfo {
-    ServerInfo {
-        protocol_version: ProtocolVersion::V_2025_06_18,
-        capabilities: ServerCapabilities::builder()
+    ServerInfo::new(
+        ServerCapabilities::builder()
             .enable_tools()
             .enable_experimental_with(sandbox_capabilities())
             .build(),
-        ..ServerInfo::default()
-    }
+    )
+    .with_protocol_version(ProtocolVersion::V_2025_06_18)
 }
 
 #[derive(Clone, Copy)]

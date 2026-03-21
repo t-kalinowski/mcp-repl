@@ -364,15 +364,12 @@ impl McpTestSession {
             }
         };
 
-        let result = self
-            .service
-            .call_tool(CallToolRequestParams {
-                meta: None,
-                name: request_tool.into(),
-                arguments: arguments_for_mcp,
-                task: None,
-            })
-            .await;
+        let request = match arguments_for_mcp {
+            Some(arguments) => CallToolRequestParams::new(request_tool).with_arguments(arguments),
+            None => CallToolRequestParams::new(request_tool),
+        };
+
+        let result = self.service.call_tool(request).await;
 
         let response = match result {
             Ok(result) => SnapshotResponse::ToolResult(tool_result_snapshot(&result)),
@@ -405,14 +402,12 @@ impl McpTestSession {
                 )));
             }
         };
-        self.service
-            .call_tool(CallToolRequestParams {
-                meta: None,
-                name: request_tool.into(),
-                arguments,
-                task: None,
-            })
-            .await
+        let request = match arguments {
+            Some(arguments) => CallToolRequestParams::new(request_tool).with_arguments(arguments),
+            None => CallToolRequestParams::new(request_tool),
+        };
+
+        self.service.call_tool(request).await
     }
 
     pub async fn write_stdin_raw_with(
