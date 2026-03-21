@@ -27,8 +27,6 @@ use crate::ipc::{
 use crate::ipc::{IpcHandlers, IpcPlotImage};
 #[cfg(feature = "pager")]
 use crate::output_capture::{OutputBuffer, OutputEventKind, OutputRange, OutputTextSpan};
-#[cfg(feature = "pager")]
-use crate::pager;
 use crate::pending_output_tape::{FormattedPendingOutput, PendingOutputTape, PendingSidebandKind};
 use crate::sandbox::{
     R_SESSION_TMPDIR_ENV, SandboxState, SandboxStateUpdate, prepare_worker_command,
@@ -991,7 +989,7 @@ impl WorkerManager {
                 } else {
                     let message = "[repl] session ended\n".to_string();
                     self.pending_output_tape
-                        .append_stdout_bytes(message.as_bytes());
+                        .append_stdout_status_line(message.as_bytes());
                 }
             }
         }
@@ -1410,137 +1408,6 @@ impl WorkerManager {
                 prompt_variants: None,
             },
         }
-    }
-}
-
-#[cfg(feature = "pager")]
-fn snapshot_page_with_images(
-    output: &OutputBuffer,
-    end_offset: u64,
-    target_bytes: u64,
-) -> SnapshotWithImages {
-    let start_offset = output.current_offset().unwrap_or(end_offset);
-    let image_groups = collect_image_groups(output, start_offset, end_offset);
-    let pager::SnapshotPage {
-        mut contents,
-        pages_left,
-        buffer,
-        last_range,
-        last_range_end_byte,
-    } = pager::take_snapshot_page_from_ring(output, end_offset, target_bytes);
-    if pages_left == 0
-        && pager::MAX_IMAGES_PER_PAGE > 0
-        && contents
-            .iter()
-            .all(|content| !matches!(content, WorkerContent::ContentImage { .. }))
-        && !image_groups.is_empty()
-    {
-        // The pager snapshot may exclude image events when the text page is tiny (e.g. just a
-        // prompt). Ensure we still surface the final images for this capture range.
-        let max = pager::MAX_IMAGES_PER_PAGE.min(image_groups.len());
-        for (_, image) in image_groups.into_iter().take(max) {
-            contents.push(image);
-        }
-        return SnapshotWithImages {
-            contents,
-            pages_left,
-            buffer,
-            last_range,
-        };
-    }
-    let page_end = page_end_offset(start_offset, end_offset, pages_left, last_range_end_byte);
-    let mut remaining_images = pager::MAX_IMAGES_PER_PAGE;
-    if remaining_images > 0 {
-        let already = contents
-            .iter()
-            .filter(|content| matches!(content, WorkerContent::ContentImage { .. }))
-            .count();
-        remaining_images = remaining_images.saturating_sub(already);
-    }
-    if remaining_images > 0 && page_end < end_offset {
-        append_image_groups_after_page(&mut contents, page_end, image_groups, remaining_images);
-    }
-    SnapshotWithImages {
-        contents,
-        pages_left,
-        buffer,
-        last_range,
-    }
-}
-
-#[cfg(feature = "pager")]
-fn snapshot_page_with_images_from_collapsed(
-    bytes: Vec<u8>,
-    events: Vec<(u64, OutputEventKind)>,
-    text_spans: Vec<OutputTextSpan>,
-    source_end: u64,
-    target_bytes: u64,
-) -> SnapshotWithImages {
-    let buffer = pager::PagerBuffer::from_bytes_and_events(bytes, events, text_spans, source_end);
-    let pager::SnapshotPage {
-        contents,
-        pages_left,
-        buffer,
-        last_range,
-        last_range_end_byte: _,
-    } = pager::take_snapshot_page_from_buffer(buffer, target_bytes);
-    SnapshotWithImages {
-        contents,
-        pages_left,
-        buffer,
-        last_range,
-    }
-}
-
-#[cfg(feature = "pager")]
-fn snapshot_after_completion(
-    output: &OutputBuffer,
-    start_offset: u64,
-    end_offset: u64,
-    target_bytes: u64,
-    completion: &CompletionInfo,
-) -> CompletionSnapshot {
-    let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
-    if !trim_enabled {
-        // Multi-expression inputs can produce huge echoed transcripts even when most lines are
-        // silent. Collapse echoed input aggressively (while preserving attribution to the
-        // relevant expression) so we don't page/hang on pure echo.
-        let saw_stderr = output.saw_stderr_in_range(start_offset.min(end_offset), end_offset);
-        let range = output.read_range(start_offset, end_offset);
-        output.advance_offset_to(end_offset);
-        let prompt_variants = completion.prompt_variants.clone().unwrap_or_default();
-        let (bytes, events, text_spans) =
-            collapse_echo_with_attribution(range, &completion.echo_events, &prompt_variants);
-        let snapshot = snapshot_page_with_images_from_collapsed(
-            bytes,
-            events,
-            text_spans,
-            end_offset,
-            target_bytes,
-        );
-        return CompletionSnapshot {
-            snapshot,
-            saw_stderr,
-        };
-    }
-
-    let echo_transcript = echo_transcript_from_events(&completion.echo_events);
-    if let Some(echo) = echo_transcript.as_deref() {
-        // Large multi-line inputs can be echoed back line-by-line by the backend, which can trip
-        // the pager and waste tokens even when the input is silent. If the turn's captured output
-        // is exactly the echoed bytes, drop it entirely.
-        let _ = drop_echo_only_output(output, start_offset, end_offset, echo);
-    }
-
-    let _ = trim_echo_prefix_in_output(output, echo_transcript.as_deref(), trim_enabled);
-    let effective_start = output.current_offset().unwrap_or(start_offset);
-    let saw_stderr = output.saw_stderr_in_range(effective_start.min(end_offset), end_offset);
-
-    let mut snapshot = snapshot_page_with_images(output, end_offset, target_bytes);
-    maybe_trim_echo_prefix(&mut snapshot.contents, echo_transcript.as_deref(), true);
-    CompletionSnapshot {
-        snapshot,
-        saw_stderr,
     }
 }
 
