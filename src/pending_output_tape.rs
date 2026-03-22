@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fmt::Write as _;
 use std::sync::{Arc, Mutex};
 
-use crate::worker_protocol::{TextStream, WorkerContent};
+use crate::worker_protocol::{ContentOrigin, TextStream, WorkerContent};
 
 #[derive(Clone, Default)]
 pub(crate) struct PendingOutputTape {
@@ -224,13 +224,18 @@ fn push_text(contents: &mut Vec<WorkerContent>, stream: TextStream, text: String
     if let Some(WorkerContent::ContentText {
         text: existing,
         stream: existing_stream,
+        ..
     }) = contents.last_mut()
         && *existing_stream == stream
     {
         existing.push_str(&text);
         return;
     }
-    contents.push(WorkerContent::ContentText { text, stream });
+    contents.push(WorkerContent::ContentText {
+        text,
+        stream,
+        origin: ContentOrigin::Worker,
+    });
 }
 
 fn render_bytes(bytes: &[u8]) -> String {

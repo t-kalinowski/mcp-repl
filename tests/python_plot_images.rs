@@ -563,6 +563,11 @@ async fn python_plots_emit_images_when_paged_output() -> TestResult<()> {
         !result_text(&result).contains("--More--"),
         "did not expect pager footer in response"
     );
+    assert!(
+        !result_text(&result).contains("full output:"),
+        "did not expect spill path marker in mixed text+image reply: {}",
+        result_text(&result)
+    );
 
     Ok(())
 }

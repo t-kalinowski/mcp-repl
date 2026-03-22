@@ -1,7 +1,7 @@
 use rmcp::handler::server::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Content, CustomNotification, CustomRequest, CustomResult, ErrorCode,
+    CallToolResult, CustomNotification, CustomRequest, CustomResult, ErrorCode,
     ErrorData as McpError, JsonObject, ProtocolVersion, ServerCapabilities, ServerInfo,
 };
 use rmcp::{RoleServer, ServerHandler, tool, tool_handler, tool_router};
@@ -18,7 +18,7 @@ mod response;
 mod tests;
 mod timeouts;
 
-use self::response::{finalize_batch, worker_reply_to_contents};
+use self::response::ResponseState;
 use self::timeouts::{
     SANDBOX_UPDATE_TIMEOUT, apply_safety_margin, apply_tool_call_margin, parse_timeout,
 };
@@ -38,34 +38,46 @@ fn repl_tool_description_for_backend(backend: Backend) -> &'static str {
 
 #[derive(Clone)]
 struct SharedServer {
-    worker: Arc<Mutex<WorkerManager>>,
+    state: Arc<Mutex<ServerState>>,
+}
+
+struct ServerState {
+    worker: WorkerManager,
+    response: ResponseState,
 }
 
 impl SharedServer {
     fn new(backend: Backend, sandbox_plan: SandboxCliPlan) -> Result<Self, WorkerError> {
         Ok(Self {
-            worker: Arc::new(Mutex::new(WorkerManager::new(backend, sandbox_plan)?)),
+            state: Arc::new(Mutex::new(ServerState {
+                worker: WorkerManager::new(backend, sandbox_plan)?,
+                response: ResponseState::new()?,
+            })),
         })
     }
 
-    fn worker(&self) -> Arc<Mutex<WorkerManager>> {
-        Arc::clone(&self.worker)
+    fn state(&self) -> Arc<Mutex<ServerState>> {
+        Arc::clone(&self.state)
     }
 
-    async fn run_worker<T, F>(&self, f: F) -> Result<T, McpError>
+    /// Runs a closure with exclusive access to the combined worker/response state.
+    /// This keeps reply finalization in the same critical section as the worker call it seals.
+    async fn run_state<T, F>(&self, f: F) -> Result<T, McpError>
     where
-        F: FnOnce(&mut WorkerManager) -> T + Send + 'static,
+        F: FnOnce(&mut ServerState) -> T + Send + 'static,
         T: Send + 'static,
     {
-        let worker = self.worker.clone();
+        let state = self.state.clone();
         tokio::task::spawn_blocking(move || {
-            let mut worker = worker.lock().unwrap();
-            f(&mut worker)
+            let mut state = state.lock().unwrap();
+            f(&mut state)
         })
         .await
         .map_err(|err| McpError::internal_error(err.to_string(), None))
     }
 
+    /// Executes one `repl` call and immediately finalizes the visible reply on the server side.
+    /// The response layer needs `pending_request` after the worker call to decide transcript reuse.
     async fn run_write_input(
         &self,
         input: String,
@@ -73,12 +85,16 @@ impl SharedServer {
     ) -> Result<CallToolResult, McpError> {
         let worker_timeout = apply_tool_call_margin(timeout);
         let server_timeout = apply_safety_margin(timeout);
-        let result = self
-            .run_worker(move |worker| {
-                worker.write_stdin(input, worker_timeout, server_timeout, None, false)
-            })
-            .await?;
-        worker_result_to_call_tool_result(result)
+        self.run_state(move |state| {
+            let result =
+                state
+                    .worker
+                    .write_stdin(input, worker_timeout, server_timeout, None, false);
+            state
+                .response
+                .finalize_worker_result(result, state.worker.pending_request())
+        })
+        .await
     }
 
     async fn on_custom_request(&self, request: CustomRequest) -> Result<CustomResult, McpError> {
@@ -113,7 +129,11 @@ impl SharedServer {
             .unwrap_or_else(|err| json!({"serialize_error": err.to_string()}));
 
         let outcome = self
-            .run_worker(move |worker| worker.update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT))
+            .run_state(move |state| {
+                state
+                    .worker
+                    .update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT)
+            })
             .await?;
         match outcome {
             Ok(changed) => {
@@ -180,7 +200,11 @@ impl SharedServer {
             .unwrap_or_else(|err| json!({"serialize_error": err.to_string()}));
 
         match self
-            .run_worker(move |worker| worker.update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT))
+            .run_state(move |state| {
+                state
+                    .worker
+                    .update_sandbox_state(update, SANDBOX_UPDATE_TIMEOUT)
+            })
             .await
         {
             Ok(Ok(changed)) => {
@@ -329,9 +353,14 @@ macro_rules! define_backend_tool_server {
                 let worker_timeout = apply_tool_call_margin(timeout);
                 let result = self
                     .shared
-                    .run_worker(move |worker| worker.restart(worker_timeout))
+                    .run_state(move |state| {
+                        let result = state.worker.restart(worker_timeout);
+                        state
+                            .response
+                            .finalize_worker_result(result, state.worker.pending_request())
+                    })
                     .await?;
-                worker_result_to_call_tool_result(result)
+                Ok(result)
             }
         }
 
@@ -387,27 +416,6 @@ fn resolve_timeout_ms(
     parse_timeout(timeout_secs, tool_name, allow_zero)
 }
 
-fn worker_result_to_call_tool_result(
-    result: Result<crate::worker_protocol::WorkerReply, WorkerError>,
-) -> Result<CallToolResult, McpError> {
-    let mut contents = Vec::new();
-    let mut is_error = false;
-    match result {
-        Ok(reply) => {
-            let (mut reply_contents, reply_error) = worker_reply_to_contents(reply);
-            is_error |= reply_error;
-            contents.append(&mut reply_contents);
-            Ok(finalize_batch(contents, is_error))
-        }
-        Err(err) => {
-            eprintln!("worker write stdin error: {err}");
-            contents.push(Content::text(format!("worker error: {err}")));
-            is_error = true;
-            Ok(finalize_batch(contents, is_error))
-        }
-    }
-}
-
 fn sandbox_capabilities() -> BTreeMap<String, JsonObject> {
     let mut capability = JsonObject::new();
     capability.insert("version".to_string(), json!("1.0.0"));
@@ -418,16 +426,16 @@ fn sandbox_capabilities() -> BTreeMap<String, JsonObject> {
 
 async fn run_backend_server<S>(
     service: S,
-    shutdown_worker: Arc<Mutex<WorkerManager>>,
+    shutdown_state: Arc<Mutex<ServerState>>,
 ) -> Result<(), Box<dyn std::error::Error>>
 where
     S: ServerHandler + Send + Sync + Clone + 'static,
 {
-    let warm_worker = shutdown_worker.clone();
+    let warm_state = shutdown_state.clone();
     thread::spawn(move || {
         crate::event_log::log("worker_warm_start_begin", json!({}));
-        let mut worker = warm_worker.lock().unwrap();
-        if let Err(err) = worker.warm_start() {
+        let mut state = warm_state.lock().unwrap();
+        if let Err(err) = state.worker.warm_start() {
             eprintln!("worker warm start error: {err}");
             crate::event_log::log(
                 "worker_warm_start_error",
@@ -452,8 +460,8 @@ where
     .await;
 
     {
-        let mut worker = shutdown_worker.lock().unwrap();
-        worker.shutdown();
+        let mut state = shutdown_state.lock().unwrap();
+        state.worker.shutdown();
     }
     match &result {
         Ok(()) => crate::event_log::log("server_listen_end", json!({"status": "ok"})),
@@ -482,11 +490,11 @@ pub async fn run(
     match backend {
         Backend::R => {
             let service = RToolServer::new(backend, sandbox_plan)?;
-            run_backend_server(service.clone(), service.shared.worker()).await
+            run_backend_server(service.clone(), service.shared.state()).await
         }
         Backend::Python => {
             let service = PythonToolServer::new(backend, sandbox_plan)?;
-            run_backend_server(service.clone(), service.shared.worker()).await
+            run_backend_server(service.clone(), service.shared.state()).await
         }
     }
 }

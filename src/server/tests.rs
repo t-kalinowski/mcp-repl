@@ -28,7 +28,7 @@ fn cleanup_echo_only_sequences(
 
     for (idx, content) in contents.iter().enumerate() {
         match content {
-            WorkerContent::ContentText { text, stream } => {
+            WorkerContent::ContentText { text, stream, .. } => {
                 let lines = split_lines(text);
                 let mut keep = vec![true; lines.len()];
                 for (line_idx, line) in lines.iter().enumerate() {
@@ -86,7 +86,11 @@ fn cleanup_echo_only_sequences(
     let mut cleaned = Vec::with_capacity(contents.len());
     for (idx, content) in contents.into_iter().enumerate() {
         match content {
-            WorkerContent::ContentText { text: _, stream } => {
+            WorkerContent::ContentText {
+                text: _,
+                stream,
+                origin,
+            } => {
                 let Some(lines) = lines_per_content[idx].take() else {
                     continue;
                 };
@@ -101,6 +105,7 @@ fn cleanup_echo_only_sequences(
                     cleaned.push(WorkerContent::ContentText {
                         text: new_text,
                         stream,
+                        origin,
                     });
                 }
             }

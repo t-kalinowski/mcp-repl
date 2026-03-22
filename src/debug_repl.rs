@@ -185,7 +185,7 @@ fn render_reply(
             }
             for content in contents {
                 match content {
-                    WorkerContent::ContentText { text, stream } => match stream {
+                    WorkerContent::ContentText { text, stream, .. } => match stream {
                         TextStream::Stdout => stdout.write_all(text.as_bytes())?,
                         TextStream::Stderr => stderr.write_all(text.as_bytes())?,
                     },

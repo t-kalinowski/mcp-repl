@@ -14,12 +14,24 @@ pub enum WorkerErrorCode {
     Interrupted,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentOrigin {
+    /// Text that came from the worker REPL and is eligible for transcript spill files.
+    #[default]
+    Worker,
+    /// Text synthesized by the server, such as timeout or busy-status notices.
+    Server,
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum WorkerContent {
     ContentText {
         text: String,
         stream: TextStream,
+        #[serde(default)]
+        origin: ContentOrigin,
     },
     ContentImage {
         data: String,
@@ -57,17 +69,46 @@ pub enum WorkerReply {
 }
 
 impl WorkerContent {
+    #[allow(dead_code)]
     pub fn stdout(text: impl Into<String>) -> Self {
+        Self::worker_stdout(text)
+    }
+
+    #[allow(dead_code)]
+    pub fn stderr(text: impl Into<String>) -> Self {
+        Self::worker_stderr(text)
+    }
+
+    pub fn worker_stdout(text: impl Into<String>) -> Self {
         WorkerContent::ContentText {
             text: text.into(),
             stream: TextStream::Stdout,
+            origin: ContentOrigin::Worker,
         }
     }
 
-    pub fn stderr(text: impl Into<String>) -> Self {
+    #[allow(dead_code)]
+    pub fn worker_stderr(text: impl Into<String>) -> Self {
         WorkerContent::ContentText {
             text: text.into(),
             stream: TextStream::Stderr,
+            origin: ContentOrigin::Worker,
+        }
+    }
+
+    pub fn server_stdout(text: impl Into<String>) -> Self {
+        WorkerContent::ContentText {
+            text: text.into(),
+            stream: TextStream::Stdout,
+            origin: ContentOrigin::Server,
+        }
+    }
+
+    pub fn server_stderr(text: impl Into<String>) -> Self {
+        WorkerContent::ContentText {
+            text: text.into(),
+            stream: TextStream::Stderr,
+            origin: ContentOrigin::Server,
         }
     }
 }

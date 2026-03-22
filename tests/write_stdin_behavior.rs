@@ -3,7 +3,10 @@
 mod common;
 
 use common::TestResult;
+use regex_lite::Regex;
 use rmcp::model::RawContent;
+use std::fs;
+use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 use tokio::time::{Duration, Instant, sleep};
 
@@ -43,6 +46,16 @@ fn backend_unavailable(text: &str) -> bool {
         || text.contains(
             "worker protocol error: ipc disconnected while waiting for request completion",
         )
+}
+
+fn spill_path(text: &str) -> Option<PathBuf> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"full output:\s+(/[^]\s]+)").expect("spill-path regex should compile")
+    });
+    re.captures(text)
+        .and_then(|caps| caps.get(1))
+        .map(|path| PathBuf::from(path.as_str()))
 }
 
 async fn wait_until_not_busy(
@@ -231,6 +244,119 @@ async fn write_stdin_large_output_is_not_paged() -> TestResult<()> {
     assert!(
         text.contains("line0120"),
         "expected the full output in one reply, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_spill_file_backfills_earlier_worker_text_and_excludes_timeout_marker()
+-> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let input = "big <- paste(rep('x', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.2); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(0.1); cat('end\\n')";
+    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        spill_path(&first_text).is_none(),
+        "did not expect spill path on first small timeout reply, got: {first_text:?}"
+    );
+
+    sleep(Duration::from_millis(260)).await;
+    let spilled = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let spilled_text = result_text(&spilled);
+    if spilled_text.contains("<<console status: busy") {
+        eprintln!("write_stdin_behavior spill poll remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let path = spill_path(&spilled_text).unwrap_or_else(|| {
+        panic!("expected spill path in oversized poll reply, got: {spilled_text:?}")
+    });
+    let file_text = fs::read_to_string(&path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        file_text.contains("> big <- paste"),
+        "expected echoed input in spill file, got: {file_text:?}"
+    );
+    assert!(
+        file_text.contains("start"),
+        "expected early worker text from timeout reply in spill file, got: {file_text:?}"
+    );
+    assert!(
+        file_text.contains("mid080"),
+        "expected oversized poll output in spill file, got: {file_text:?}"
+    );
+    assert!(
+        file_text.contains("end"),
+        "expected later worker text in spill file, got: {file_text:?}"
+    );
+    assert!(
+        !file_text.contains("<<console status: busy"),
+        "did not expect timeout marker in spill file, got: {file_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let input = "big <- paste(rep('y', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.2); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(0.35); cat('tail\\n')";
+    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    sleep(Duration::from_millis(260)).await;
+    let spilled = session.write_stdin_raw_with("", Some(0.1)).await?;
+    let spilled_text = result_text(&spilled);
+    let path = match spill_path(&spilled_text) {
+        Some(path) => path,
+        None if spilled_text.contains("<<console status: busy") => {
+            eprintln!("write_stdin_behavior spill poll remained busy; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+        None => panic!("expected spill path in first oversized poll reply, got: {spilled_text:?}"),
+    };
+
+    sleep(Duration::from_millis(450)).await;
+    let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let final_text = result_text(&final_poll);
+    if final_text.contains("<<console status: busy") {
+        eprintln!("write_stdin_behavior final poll remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let file_text = fs::read_to_string(&path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        final_text.contains("tail"),
+        "expected small final poll output inline, got: {final_text:?}"
+    );
+    assert!(
+        spill_path(&final_text).is_none(),
+        "did not expect spill path to be repeated on later small poll, got: {final_text:?}"
+    );
+    assert!(
+        file_text.contains("tail"),
+        "expected later small poll output to append to existing spill file, got: {file_text:?}"
     );
 
     Ok(())

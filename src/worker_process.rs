@@ -513,6 +513,13 @@ impl WorkerManager {
         self.ensure_process()
     }
 
+    /// Exposes whether a timed-out logical request still owns future empty-input polls.
+    pub fn pending_request(&self) -> bool {
+        self.pending_request
+    }
+
+    /// Entry point for the public `repl` tool.
+    /// This handles control prefixes, timeout-follow-up polling, and busy rejection before new input is sent.
     pub fn write_stdin(
         &mut self,
         text: String,
@@ -590,7 +597,7 @@ impl WorkerManager {
                 error_code,
                 ..
             } = &mut reply.reply;
-            contents.push(WorkerContent::stderr(
+            contents.push(WorkerContent::server_stderr(
                 "[repl] input discarded while worker busy",
             ));
             *is_error = true;
@@ -619,6 +626,8 @@ impl WorkerManager {
         Ok(reply)
     }
 
+    /// Serves empty-input polls and busy follow-up replies for a timed-out request.
+    /// Each poll only returns newly available output, but the server may keep appending it to one transcript file.
     fn poll_pending_output(&mut self, timeout: Duration) -> Result<ReplyWithOffset, WorkerError> {
         let poll_start = std::time::Instant::now();
         let mut timed_out = false;
@@ -694,6 +703,8 @@ impl WorkerManager {
         })
     }
 
+    /// Drains detached output that arrived before the next accepted request so it can be prefixed
+    /// into that request's visible reply.
     fn prepare_input_context(&mut self) -> InputContext {
         let FormattedPendingOutput {
             contents,
@@ -742,7 +753,7 @@ impl WorkerManager {
         let mut contents = context.prefix_contents;
         let formatted = self.drain_formatted_output();
         contents.extend(formatted.contents);
-        contents.push(WorkerContent::stderr(format!("worker error: {err}")));
+        contents.push(WorkerContent::server_stderr(format!("worker error: {err}")));
         ReplyWithOffset {
             reply: WorkerReply::Output {
                 contents,
@@ -1396,7 +1407,7 @@ impl WorkerManager {
         });
         let is_error = saw_stderr;
         if !meta.is_empty() {
-            contents.push(WorkerContent::stderr(format!("[repl] {meta}")));
+            contents.push(WorkerContent::server_stderr(format!("[repl] {meta}")));
         }
 
         ReplyWithOffset {
@@ -1917,7 +1928,7 @@ fn maybe_trim_echo_prefix(
         if remaining.is_empty() {
             break;
         }
-        let WorkerContent::ContentText { text, stream } = content else {
+        let WorkerContent::ContentText { text, stream, .. } = content else {
             return;
         };
         if !matches!(stream, TextStream::Stdout) {
@@ -2036,13 +2047,13 @@ fn normalize_input_newlines(text: &str) -> String {
 fn timeout_status_content(timeout: Duration) -> WorkerContent {
     let elapsed_ms = duration_to_millis(timeout);
     let elapsed_ms = (elapsed_ms / TIMEOUT_STATUS_GRANULARITY_MS) * TIMEOUT_STATUS_GRANULARITY_MS;
-    WorkerContent::stdout(format!(
+    WorkerContent::server_stdout(format!(
         "<<console status: busy, write_stdin timeout reached; elapsed_ms={elapsed_ms}>>"
     ))
 }
 
 fn idle_status_content() -> WorkerContent {
-    WorkerContent::stdout("<<console status: idle>>")
+    WorkerContent::server_stdout("<<console status: idle>>")
 }
 
 const TIMEOUT_STATUS_GRANULARITY_MS: u64 = 100;
@@ -2062,7 +2073,7 @@ fn append_prompt_if_missing(contents: &mut Vec<WorkerContent>, prompt: Option<St
     {
         return;
     }
-    contents.push(WorkerContent::stdout(prompt));
+    contents.push(WorkerContent::worker_stdout(prompt));
 }
 
 fn strip_trailing_prompt(contents: &mut Vec<WorkerContent>, prompt: &str) {
@@ -2075,7 +2086,7 @@ fn strip_trailing_prompt(contents: &mut Vec<WorkerContent>, prompt: &str) {
     let Some(idx) = idx else {
         return;
     };
-    let WorkerContent::ContentText { text, stream } = &contents[idx] else {
+    let WorkerContent::ContentText { text, stream, .. } = &contents[idx] else {
         return;
     };
     let Some(prefix) = text.strip_suffix(prompt) else {
@@ -2087,6 +2098,7 @@ fn strip_trailing_prompt(contents: &mut Vec<WorkerContent>, prompt: &str) {
         contents[idx] = WorkerContent::ContentText {
             text: prefix.to_string(),
             stream: *stream,
+            origin: crate::worker_protocol::ContentOrigin::Worker,
         };
     }
 }
@@ -2098,7 +2110,7 @@ fn strip_prompt_from_contents(contents: &mut Vec<WorkerContent>, prompt: &str) {
     let mut idx = 0usize;
     while idx < contents.len() {
         let remove = match &contents[idx] {
-            WorkerContent::ContentText { text, stream } => {
+            WorkerContent::ContentText { text, stream, .. } => {
                 if !matches!(stream, crate::worker_protocol::TextStream::Stdout) {
                     false
                 } else if text == prompt {
@@ -2110,6 +2122,7 @@ fn strip_prompt_from_contents(contents: &mut Vec<WorkerContent>, prompt: &str) {
                         contents[idx] = WorkerContent::ContentText {
                             text: prefix.to_string(),
                             stream: *stream,
+                            origin: crate::worker_protocol::ContentOrigin::Worker,
                         };
                         false
                     }

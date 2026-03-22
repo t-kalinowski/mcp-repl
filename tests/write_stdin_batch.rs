@@ -3,6 +3,10 @@ mod common;
 #[cfg(not(windows))]
 use common::McpSnapshot;
 use common::TestResult;
+use regex_lite::Regex;
+use std::fs;
+use std::path::PathBuf;
+use std::sync::OnceLock;
 #[cfg(not(windows))]
 use tokio::time::{Duration, sleep};
 
@@ -30,6 +34,16 @@ fn backend_unavailable(text: &str) -> bool {
         || text.contains(
             "worker protocol error: ipc disconnected while waiting for request completion",
         )
+}
+
+fn spill_path(text: &str) -> Option<PathBuf> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"full output:\s+(/[^]\s]+)").expect("spill-path regex should compile")
+    });
+    re.captures(text)
+        .and_then(|caps| caps.get(1))
+        .map(|path| PathBuf::from(path.as_str()))
 }
 
 #[cfg(not(windows))]
@@ -251,15 +265,37 @@ async fn write_stdin_preserves_huge_echo_with_output() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
+    let spill_path = spill_path(&text);
+    let spill_text = spill_path.as_ref().map(fs::read_to_string).transpose()?;
     session.cancel().await?;
     assert!(
-        text.contains("ok") && text.contains("done"),
-        "expected output from both cat() calls, got: {text:?}"
+        text.contains("full output:")
+            || (text.contains("x500 <- 500") && text.contains("y500 <- 500")),
+        "expected either an inline transcript or a spill path, got: {text:?}"
     );
-    assert!(
-        text.contains("x500 <- 500") && text.contains("y500 <- 500"),
-        "expected echoed transcript to be preserved, got: {text:?}"
-    );
+    if let Some(spill_text) = spill_text {
+        assert!(
+            spill_text.contains("x500 <- 500") && spill_text.contains("y500 <- 500"),
+            "expected full echoed transcript in spill file, got: {spill_text:?}"
+        );
+        assert!(
+            spill_text.contains("ok") && spill_text.contains("done"),
+            "expected output from both cat() calls in spill file, got: {spill_text:?}"
+        );
+        assert!(
+            text.contains("done"),
+            "expected the inline tail to keep the final output, got: {text:?}"
+        );
+    } else {
+        assert!(
+            text.contains("ok") && text.contains("done"),
+            "expected output from both cat() calls inline, got: {text:?}"
+        );
+        assert!(
+            text.contains("x500 <- 500") && text.contains("y500 <- 500"),
+            "expected echoed transcript to be preserved inline, got: {text:?}"
+        );
+    }
     assert!(
         !text.contains("echoed input elided"),
         "did not expect echo elision marker, got: {text:?}"
