@@ -4,8 +4,12 @@ mod common;
 
 use base64::Engine as _;
 use common::TestResult;
+use regex_lite::Regex;
 use rmcp::model::{CallToolResult, RawContent};
 use serde::Serialize;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tempfile::tempdir;
 
 #[derive(Debug)]
@@ -36,6 +40,24 @@ fn result_text(result: &CallToolResult) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn events_log_path(text: &str) -> Option<PathBuf> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(/[^]\s]+/events\.log)").expect("events-log regex should compile")
+    });
+    re.captures(text)
+        .and_then(|caps| caps.get(1))
+        .map(|path| PathBuf::from(path.as_str()))
+}
+
+fn image_file_names(dir: &Path) -> TestResult<Vec<String>> {
+    let mut names = fs::read_dir(dir)?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<Vec<_>, _>>()?;
+    names.sort();
+    Ok(names)
 }
 
 fn response_snapshot(result: &CallToolResult) -> serde_json::Value {
@@ -799,6 +821,95 @@ async fn python_plot_emitted_after_large_output() -> TestResult<()> {
         !images.is_empty(),
         "expected plot image even after truncation"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_mixed_plot_replies_spill_bundle_and_keep_first_and_last_images() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let mut session = common::spawn_python_server().await?;
+
+    let input = format!(
+        "{}; exec(\"for i in range(1, 7):\\n    print(f'warn{{i:03d}}')\\n    plt.figure(i)\\n    plt.clf()\\n    plt.plot(list(range(1, 11)))\\n    plt.title(f'plot{{i:03d}}')\\n    plt.show()\")",
+        python_plot_preamble()
+    );
+    let result = session.write_stdin_raw_with(&input, Some(60.0)).await?;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "mixed plot spill reported an error: {}",
+        result_text(&result)
+    );
+
+    let text = result_text(&result);
+    let events_log = events_log_path(&text).unwrap_or_else(|| {
+        panic!("expected spill bundle events.log path in response, got: {text:?}")
+    });
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+    let events = fs::read_to_string(&events_log)?;
+    let image_names = image_file_names(&bundle_dir.join("images"))?;
+    let images = extract_images(&result);
+
+    assert_eq!(
+        images.len(),
+        2,
+        "expected spill reply to keep exactly two inline images"
+    );
+    assert_eq!(
+        image_names,
+        vec![
+            "001.png".to_string(),
+            "002.png".to_string(),
+            "003.png".to_string(),
+            "004.png".to_string(),
+            "005.png".to_string(),
+            "006.png".to_string(),
+        ],
+        "expected sequential image names in spill bundle"
+    );
+    assert_eq!(
+        images[0].bytes,
+        fs::read(bundle_dir.join("images/001.png"))?,
+        "expected first inline image to match first spilled image"
+    );
+    assert_eq!(
+        images[1].bytes,
+        fs::read(bundle_dir.join("images/006.png"))?,
+        "expected second inline image to match last spilled image"
+    );
+    assert!(
+        text.contains("events.log"),
+        "expected response to teach client about events.log, got: {text:?}"
+    );
+    assert!(
+        events.starts_with("v1\ntext transcript.txt\nimages images/\n"),
+        "expected events.log header, got: {events:?}"
+    );
+    assert!(
+        events.contains("T lines="),
+        "expected text range entries in events.log, got: {events:?}"
+    );
+    assert!(
+        events.contains("I images/001.png") && events.contains("I images/006.png"),
+        "expected first/last image entries in events.log, got: {events:?}"
+    );
+    assert!(
+        transcript.contains("warn001") && transcript.contains("warn006"),
+        "expected transcript.txt to contain worker text, got: {transcript:?}"
+    );
+    assert!(
+        !transcript.contains("images/001.png"),
+        "did not expect transcript.txt to contain image paths, got: {transcript:?}"
+    );
+
+    session.cancel().await?;
 
     Ok(())
 }

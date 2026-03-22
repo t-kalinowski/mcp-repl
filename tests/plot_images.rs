@@ -4,8 +4,12 @@ mod common;
 
 use base64::Engine as _;
 use common::{TestResult, spawn_server, spawn_server_with_pager_page_chars};
+use regex_lite::Regex;
 use rmcp::model::{CallToolResult, RawContent};
 use serde::Serialize;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use tempfile::tempdir;
 
 #[derive(Debug)]
@@ -36,6 +40,24 @@ fn result_text(result: &CallToolResult) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn events_log_path(text: &str) -> Option<PathBuf> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r"(/[^]\s]+/events\.log)").expect("events-log regex should compile")
+    });
+    re.captures(text)
+        .and_then(|caps| caps.get(1))
+        .map(|path| PathBuf::from(path.as_str()))
+}
+
+fn image_file_names(dir: &Path) -> TestResult<Vec<String>> {
+    let mut names = fs::read_dir(dir)?
+        .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<Vec<_>, _>>()?;
+    names.sort();
+    Ok(names)
 }
 
 fn backend_unavailable(text: &str) -> bool {
@@ -502,7 +524,6 @@ async fn plots_emit_images_when_paged_output() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    session.cancel().await?;
 
     assert_ne!(
         result.is_error,
@@ -711,7 +732,6 @@ async fn plot_updates_in_single_request_collapse() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    session.cancel().await?;
 
     assert_ne!(
         result.is_error,
@@ -745,7 +765,6 @@ plot(1:10)
         session.cancel().await?;
         return Ok(());
     }
-    session.cancel().await?;
 
     assert_ne!(
         result.is_error,
@@ -769,6 +788,164 @@ plot(1:10)
         !images.is_empty(),
         "expected plot image even after truncation"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mixed_plot_replies_spill_bundle_and_keep_first_and_last_images() -> TestResult<()> {
+    let mut session = spawn_server().await?;
+
+    let input = r#"
+for (i in 1:6) {
+  cat(sprintf("warn%03d\n", i))
+  plot(1:10, main = sprintf("plot%03d", i))
+}
+"#;
+    let result = session.write_stdin_raw_with(input, Some(60.0)).await?;
+    if any_backend_unavailable(&[&result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "mixed plot spill reported an error: {}",
+        result_text(&result)
+    );
+
+    let text = result_text(&result);
+    let events_log = events_log_path(&text).unwrap_or_else(|| {
+        panic!("expected spill bundle events.log path in response, got: {text:?}")
+    });
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+    let events = fs::read_to_string(&events_log)?;
+    let image_names = image_file_names(&bundle_dir.join("images"))?;
+    let images = extract_images(&result);
+
+    assert_eq!(
+        images.len(),
+        2,
+        "expected spill reply to keep exactly two inline images"
+    );
+    assert_eq!(
+        image_names,
+        vec![
+            "001.png".to_string(),
+            "002.png".to_string(),
+            "003.png".to_string(),
+            "004.png".to_string(),
+            "005.png".to_string(),
+            "006.png".to_string(),
+        ],
+        "expected sequential image names in spill bundle"
+    );
+    assert_eq!(
+        images[0].bytes,
+        fs::read(bundle_dir.join("images/001.png"))?,
+        "expected first inline image to match first spilled image"
+    );
+    assert_eq!(
+        images[1].bytes,
+        fs::read(bundle_dir.join("images/006.png"))?,
+        "expected second inline image to match last spilled image"
+    );
+    assert!(
+        text.contains("events.log"),
+        "expected response to teach client about events.log, got: {text:?}"
+    );
+    assert!(
+        events.starts_with("v1\ntext transcript.txt\nimages images/\n"),
+        "expected events.log header, got: {events:?}"
+    );
+    assert!(
+        events.contains("T lines="),
+        "expected text range entries in events.log, got: {events:?}"
+    );
+    assert!(
+        events.contains("I images/001.png") && events.contains("I images/006.png"),
+        "expected first/last image entries in events.log, got: {events:?}"
+    );
+    assert!(
+        transcript.contains("warn001") && transcript.contains("warn006"),
+        "expected transcript.txt to contain worker text, got: {transcript:?}"
+    );
+    assert!(
+        !transcript.contains("images/001.png"),
+        "did not expect transcript.txt to contain image paths, got: {transcript:?}"
+    );
+
+    session.cancel().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_image_spill_bundle_backfills_earlier_worker_text() -> TestResult<()> {
+    let mut session = spawn_server().await?;
+
+    let input = r#"
+cat("warn000\n")
+flush.console()
+Sys.sleep(0.25)
+for (i in 1:6) {
+  cat(sprintf("warn%03d\n", i))
+  plot(1:10, main = sprintf("plot%03d", i))
+}
+"#;
+    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let first_text = result_text(&first);
+    if any_backend_unavailable(&[&first]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        events_log_path(&first_text).is_none(),
+        "did not expect spill bundle on first small timeout reply, got: {first_text:?}"
+    );
+
+    let result = session.write_stdin_raw_with("", Some(60.0)).await?;
+    let text = result_text(&result);
+    if text.contains("<<console status: busy") {
+        eprintln!("plot_images timeout spill poll remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "timeout image spill reported an error: {}",
+        text
+    );
+
+    let events_log = events_log_path(&text).unwrap_or_else(|| {
+        panic!("expected spill bundle events.log path in timeout poll, got: {text:?}")
+    });
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+    let events = fs::read_to_string(&events_log)?;
+
+    assert!(
+        transcript.contains("warn000"),
+        "expected transcript.txt to backfill early timeout text, got: {transcript:?}"
+    );
+    assert!(
+        transcript.contains("warn006"),
+        "expected transcript.txt to include later text, got: {transcript:?}"
+    );
+    assert!(
+        events.contains("I images/001.png") && events.contains("I images/006.png"),
+        "expected events.log to cover the full image set, got: {events:?}"
+    );
+
+    session.cancel().await?;
 
     Ok(())
 }
