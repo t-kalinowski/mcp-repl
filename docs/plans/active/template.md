@@ -8,8 +8,34 @@
 ## Status
 
 - State: template
-- Owner: unassigned
 - Last updated: 2026-03-21
+- Current phase: planning
+
+## Current Direction
+
+- Describe the design currently being pursued.
+- Explain why it is the preferred path right now.
+
+## Phase Status
+
+- Phase 0: completed / active / pending
+- Phase 1: completed / active / pending
+
+## Locked Decisions
+
+- Record decisions that should not be revisited without new evidence.
+
+## Open Questions
+
+- Record decisions that are still unresolved.
+
+## Next Safe Slice
+
+- Describe the next bounded implementation or discovery step.
+
+## Stop Conditions
+
+- Note what should cause an agent to stop and update the plan before continuing.
 
 ## Decision Log
 

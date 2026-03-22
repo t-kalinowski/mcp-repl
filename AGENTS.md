@@ -19,7 +19,7 @@ Keep this file short. It is a table of contents, not the full manual.
 - `docs/testing.md`: public verification surface and snapshot workflow.
 - `docs/debugging.md`: debug logs, `--debug-repl`, and stdio tracing.
 - `docs/sandbox.md`: sandbox modes and writable-root policy.
-- `docs/plans/README.md`: when to create checked-in execution plans.
+- `docs/plans/AGENTS.md`: when to create checked-in execution plans.
 
 ## Snapshot Workflow
 

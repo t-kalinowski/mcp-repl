@@ -28,7 +28,7 @@ fn agents_is_short_and_points_to_main_docs() {
         "docs/testing.md",
         "docs/debugging.md",
         "docs/sandbox.md",
-        "docs/plans/README.md",
+        "docs/plans/AGENTS.md",
     ] {
         assert!(agents.contains(required), "missing {required} in AGENTS.md");
     }
@@ -45,7 +45,7 @@ fn docs_index_lists_main_docs() {
         "docs/debugging.md",
         "docs/sandbox.md",
         "docs/worker_sideband_protocol.md",
-        "docs/plans/README.md",
+        "docs/plans/AGENTS.md",
     ] {
         assert_exists(&root.join(required));
         assert!(
@@ -59,7 +59,7 @@ fn docs_index_lists_main_docs() {
 fn plans_layout_exists() {
     let root = repo_root();
     for required in [
-        "docs/plans/README.md",
+        "docs/plans/AGENTS.md",
         "docs/plans/active",
         "docs/plans/completed",
         "docs/plans/tech-debt.md",

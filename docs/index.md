@@ -11,7 +11,7 @@ checked-in execution plans without relying on stale notes.
 - `docs/debugging.md`: debug logs, `--debug-repl`, and wire tracing.
 - `docs/sandbox.md`: sandbox modes, writable roots, and client-driven sandbox updates.
 - `docs/worker_sideband_protocol.md`: server/worker IPC contract.
-- `docs/plans/README.md`: when to write a checked-in execution plan and where it lives.
+- `docs/plans/AGENTS.md`: when to write a checked-in execution plan and where it lives.
 
 ## Normative Docs
 
