@@ -16,6 +16,11 @@
 - Describe the design currently being pursued.
 - Explain why it is the preferred path right now.
 
+## Long-Term Direction
+
+- Describe the intended end-state architecture if it differs from the current phase.
+- Call out which parts of the current implementation strategy are temporary.
+
 ## Phase Status
 
 - Phase 0: completed / active / pending

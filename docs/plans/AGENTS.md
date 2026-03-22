@@ -40,6 +40,11 @@ Create a Markdown file in `docs/plans/active/` with these headings:
 - The design currently being pursued.
 - Why it is the preferred path right now.
 
+## Long-Term Direction
+
+- The intended end-state architecture, if it differs from the current bounded phase.
+- What parts of the current phase are temporary tactics rather than the long-term design.
+
 ## Phase Status
 
 - Phase 0: completed / active / pending
@@ -68,6 +73,9 @@ Create a Markdown file in `docs/plans/active/` with these headings:
 
 Add or remove sections only when it reduces ambiguity. The goal is to preserve design history and current state
 without turning the plan into a changelog.
+
+When the current phase deliberately takes a simpler path for iteration, say so explicitly and record the tradeoff.
+Do not let a temporary implementation tactic become the apparent product definition just because it is the current slice.
 
 ## Lifecycle
 

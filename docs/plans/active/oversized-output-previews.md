@@ -18,6 +18,13 @@
 - The preferred design is server-owned stable segment transcripts plus oversized text previews.
 - Polling remains the primary agent workflow. The transcript path is a fallback when the inline preview is not enough.
 - In the current phase, the formatter should run only after the server has produced the exact visible reply text. That is a deliberate simplification for iteration, not the final architecture target.
+- This phase accepts a worse memory profile in exchange for simpler implementation and faster design iteration while the public behavior is still being refined.
+
+## Long-Term Direction
+
+- The likely long-term direction is a more eager, state-machine-driven consumer of tape output rather than a pure seal-time formatter.
+- The long-term design should preserve the same public behavior contract while reducing memory footprint and making output handling more incremental.
+- The current seal-time phase exists to validate the public UX and transcript model first. It should not be treated as proof that the long-term implementation must remain seal-time.
 
 ## Phase Status
 
@@ -25,7 +32,7 @@
 - Phase 1: completed. Multiple design rounds narrowed the space: no modal pager, no default read tool, no live reader-thread formatting, and no worker-owned transcript files.
 - Phase 2: active. Lock the public text format, segment lifecycle, and server/worker responsibilities for text-only v1.
 - Phase 3: pending. Implement server-owned transcript storage, segment coordination, and the seal-time formatter as the first bounded implementation step.
-- Phase 4: pending. Replace the seal-time-only implementation with a more eager/state-machine-driven design once the public behavior is validated.
+- Phase 4: pending. Revisit the implementation architecture after the public behavior is validated and move toward a more eager/state-machine-driven design.
 - Phase 5: pending. Update tool descriptions and replace pager-oriented tests and snapshots for the default public surface.
 
 ## Locked Decisions
@@ -86,6 +93,7 @@
 - Stop if mixed text+image replies cannot stay unchanged without hidden reordering; keep them out of v1.
 - Stop if background-segment behavior remains ambiguous after implementation starts; update the plan and get a decision before proceeding.
 - Stop if the implementation starts hard-coding seal-time mechanics into the public contract. Seal-time is a phase tactic, not the product definition.
+- Stop if the current phase starts accumulating complexity whose only purpose is to preserve the seal-time tactic. If the tactic is getting in the way, record the issue and revisit the phased rollout.
 
 ## Decision Log
 
@@ -101,4 +109,5 @@
 - 2026-03-21: The formatter must live on the server side because the exact visible text is finalized there after image collapsing and prompt/error normalization.
 - 2026-03-21: Transcript files must be server-owned and tied to server lifetime, not worker lifetime. A single `repl()` call may span worker death, dump, or restart and still needs one stable segment path.
 - 2026-03-21: Scope v1 to text-only oversized replies and leave mixed text+image replies unchanged.
-- 2026-03-21: The long-term direction may evolve toward a more eager/state-machine-driven consumer of tape output. Do not let the current seal-time phase rename or redefine the broader initiative.
+- 2026-03-21: The current seal-time phase is a bounded implementation step chosen to keep iteration simple while the public behavior is still moving.
+- 2026-03-21: The likely long-term direction is a more eager/state-machine-driven consumer of tape output with a better memory profile. Do not let the current seal-time phase rename or redefine the broader initiative.
