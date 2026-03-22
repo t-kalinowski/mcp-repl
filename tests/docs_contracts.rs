@@ -14,26 +14,25 @@ fn assert_exists(path: &Path) {
     assert!(path.exists(), "expected {} to exist", path.display());
 }
 
-fn markdown_links(text: &str) -> Vec<String> {
-    let mut links = Vec::new();
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    while i + 3 < bytes.len() {
-        if bytes[i] == b']' && bytes[i + 1] == b'(' {
-            let start = i + 2;
-            if let Some(end_rel) = text[start..].find(')') {
-                links.push(text[start..start + end_rel].to_string());
-                i = start + end_rel + 1;
-                continue;
-            }
-        }
-        i += 1;
-    }
-    links
-}
-
 fn has_heading(text: &str, heading: &str) -> bool {
     text.lines().any(|line| line.trim() == heading)
+}
+
+fn assert_uses_plain_paths(text: &str, label: &str) {
+    for forbidden in [
+        "](",
+        "[`",
+        "[docs/",
+        "[README.md]",
+        "[AGENTS.md]",
+        "[src/",
+        "[tests/",
+    ] {
+        assert!(
+            !text.contains(forbidden),
+            "{label} should use plain paths instead of markdown links"
+        );
+    }
 }
 
 #[test]
@@ -174,24 +173,17 @@ fn normative_docs_do_not_use_stale_mcp_console_name() {
 }
 
 #[test]
-fn docs_index_links_resolve_inside_repo() {
-    let docs_index_path = repo_root().join("docs/index.md");
-    let docs_index = read(&docs_index_path);
-    let docs_dir = docs_index_path
-        .parent()
-        .expect("docs/index.md should have a parent");
-
-    for link in markdown_links(&docs_index) {
-        if link.starts_with("http://")
-            || link.starts_with("https://")
-            || link.starts_with('#')
-            || link.starts_with("mailto:")
-        {
-            continue;
-        }
-
-        let normalized = link.strip_prefix("./").unwrap_or(&link);
-        let path = docs_dir.join(normalized);
-        assert!(path.exists(), "broken link in docs/index.md: {link}");
+fn agent_docs_prefer_plain_paths_over_markdown_links() {
+    let root = repo_root();
+    for relative in [
+        "AGENTS.md",
+        "docs/index.md",
+        "docs/architecture.md",
+        "docs/testing.md",
+        "docs/plans/README.md",
+    ] {
+        let path = root.join(relative);
+        let text = read(&path);
+        assert_uses_plain_paths(&text, relative);
     }
 }

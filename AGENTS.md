@@ -14,12 +14,12 @@ Keep this file short. It is a table of contents, not the full manual.
 
 ## Start Here
 
-- [docs/index.md](docs/index.md): source-of-truth map for repository docs.
-- [docs/architecture.md](docs/architecture.md): subsystem map for the binary, worker, sandbox, and eval surfaces.
-- [docs/testing.md](docs/testing.md): public verification surface and snapshot workflow.
-- [docs/debugging.md](docs/debugging.md): debug logs, `--debug-repl`, and stdio tracing.
-- [docs/sandbox.md](docs/sandbox.md): sandbox modes and writable-root policy.
-- [docs/plans/README.md](docs/plans/README.md): when to create checked-in execution plans.
+- `docs/index.md`: source-of-truth map for repository docs.
+- `docs/architecture.md`: subsystem map for the binary, worker, sandbox, and eval surfaces.
+- `docs/testing.md`: public verification surface and snapshot workflow.
+- `docs/debugging.md`: debug logs, `--debug-repl`, and stdio tracing.
+- `docs/sandbox.md`: sandbox modes and writable-root policy.
+- `docs/plans/README.md`: when to create checked-in execution plans.
 
 ## Snapshot Workflow
 
