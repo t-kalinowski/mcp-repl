@@ -3,7 +3,6 @@
 mod common;
 
 use common::TestResult;
-use regex_lite::Regex;
 use rmcp::model::RawContent;
 use std::fs;
 use std::path::PathBuf;
@@ -50,23 +49,19 @@ fn backend_unavailable(text: &str) -> bool {
 }
 
 fn bundle_events_log_path(text: &str) -> Option<PathBuf> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        Regex::new(r"(/[^]\s]+/events\.log)").expect("events-log regex should compile")
-    });
-    re.captures(text)
-        .and_then(|caps| caps.get(1))
-        .map(|path| PathBuf::from(path.as_str()))
+    disclosed_path(text, "events.log")
 }
 
 fn bundle_transcript_path(text: &str) -> Option<PathBuf> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        Regex::new(r"(/[^]\s]+/transcript\.txt)").expect("transcript regex should compile")
-    });
-    re.captures(text)
-        .and_then(|caps| caps.get(1))
-        .map(|path| PathBuf::from(path.as_str()))
+    disclosed_path(text, "transcript.txt")
+}
+
+fn disclosed_path(text: &str, suffix: &str) -> Option<PathBuf> {
+    let end = text.find(suffix)?.saturating_add(suffix.len());
+    let start = text[..end]
+        .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '[' | '('))
+        .map_or(0, |idx| idx.saturating_add(1));
+    Some(PathBuf::from(&text[start..end]))
 }
 
 fn bundle_root(path: &std::path::Path) -> PathBuf {

@@ -3,10 +3,8 @@ mod common;
 #[cfg(not(windows))]
 use common::McpSnapshot;
 use common::TestResult;
-use regex_lite::Regex;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::OnceLock;
 #[cfg(not(windows))]
 use tokio::time::{Duration, sleep};
 
@@ -37,13 +35,26 @@ fn backend_unavailable(text: &str) -> bool {
 }
 
 fn bundle_transcript_path(text: &str) -> Option<PathBuf> {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        Regex::new(r"(/[^]\s]+/transcript\.txt)").expect("transcript regex should compile")
-    });
-    re.captures(text)
-        .and_then(|caps| caps.get(1))
-        .map(|path| PathBuf::from(path.as_str()))
+    disclosed_path(text, "transcript.txt")
+}
+
+fn disclosed_path(text: &str, suffix: &str) -> Option<PathBuf> {
+    let end = text.find(suffix)?.saturating_add(suffix.len());
+    let start = text[..end]
+        .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '[' | '('))
+        .map_or(0, |idx| idx.saturating_add(1));
+    Some(PathBuf::from(&text[start..end]))
+}
+
+#[test]
+fn disclosed_path_parses_windows_paths() {
+    let text = "...[full output: C:\\Users\\runner\\AppData\\Local\\Temp\\mcp-repl-output\\output-0001\\transcript.txt]...";
+    assert_eq!(
+        bundle_transcript_path(text),
+        Some(PathBuf::from(
+            r"C:\Users\runner\AppData\Local\Temp\mcp-repl-output\output-0001\transcript.txt"
+        ))
+    );
 }
 
 #[cfg(not(windows))]
