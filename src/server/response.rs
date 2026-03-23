@@ -135,82 +135,102 @@ impl ResponseState {
         pending_request_after: bool,
     ) -> CallToolResult {
         let material = prepare_reply_material(reply);
-
-        if material.error_code == Some(WorkerErrorCode::Timeout)
-            && self.active_timeout_bundle.is_none()
+        let mut active_timeout_bundle = self.active_timeout_bundle.take();
+        if material.error_code == Some(WorkerErrorCode::Timeout) && active_timeout_bundle.is_none()
         {
-            let bundle = self
-                .output_store
-                .new_bundle()
-                .expect("failed to create timeout output bundle");
-            self.active_timeout_bundle = Some(bundle);
+            match self.output_store.new_bundle() {
+                Ok(bundle) => active_timeout_bundle = Some(bundle),
+                Err(err) => {
+                    eprintln!("dropping timeout bundle setup after output-bundle error: {err}");
+                }
+            }
         }
 
-        let active_append = if let Some(active) = self.active_timeout_bundle.as_mut() {
-            Some(
-                active
-                    .append_items(&mut self.output_store, &material.items)
-                    .expect("failed to append timeout output bundle"),
-            )
-        } else {
-            None
-        };
-
-        let contents = if let Some(active) = self.active_timeout_bundle.as_ref() {
-            let append = active_append
-                .as_ref()
-                .expect("active timeout bundle append result should exist");
-            let retained_worker_text = worker_text_from_items(&append.retained_items);
-            if append.omitted_this_reply {
-                compact_text_bundle_items(
-                    append.retained_items.clone(),
-                    &retained_worker_text,
-                    active,
-                )
-            } else if active.next_image_number > 0
-                && should_use_output_bundle(
-                    material.image_count.max(active.next_image_number),
-                    material.estimated_cost,
-                )
-            {
-                compact_output_bundle_items(&append.retained_items, active)
-            } else if material.worker_text.chars().count() > INLINE_TEXT_BUDGET {
-                compact_text_bundle_items(
-                    append.retained_items.clone(),
-                    &retained_worker_text,
-                    active,
-                )
-            } else {
-                materialize_items(append.retained_items.clone())
+        let contents = if let Some(mut active) = active_timeout_bundle {
+            match active.append_items(&mut self.output_store, &material.items) {
+                Ok(append) => {
+                    let retained_worker_text = worker_text_from_items(&append.retained_items);
+                    let contents = if append.omitted_this_reply {
+                        compact_text_bundle_items(
+                            append.retained_items.clone(),
+                            &retained_worker_text,
+                            &active,
+                        )
+                    } else if active.next_image_number > 0
+                        && should_use_output_bundle(
+                            material.image_count.max(active.next_image_number),
+                            material.estimated_cost,
+                        )
+                    {
+                        compact_output_bundle_items(&append.retained_items, &active)
+                    } else if material.worker_text.chars().count() > INLINE_TEXT_BUDGET {
+                        compact_text_bundle_items(
+                            append.retained_items.clone(),
+                            &retained_worker_text,
+                            &active,
+                        )
+                    } else {
+                        materialize_items(append.retained_items.clone())
+                    };
+                    if pending_request_after {
+                        self.active_timeout_bundle = Some(active);
+                    }
+                    contents
+                }
+                Err(err) => {
+                    eprintln!("dropping timeout bundle content after output-bundle error: {err}");
+                    materialize_items(server_only_items(material.items))
+                }
             }
         } else if material.image_count > 0
             && should_use_output_bundle(material.image_count, material.estimated_cost)
         {
-            let mut bundle = self
-                .output_store
-                .new_bundle()
-                .expect("failed to create output bundle");
-            let append = bundle
-                .append_items(&mut self.output_store, &material.items)
-                .expect("failed to append output bundle");
-            compact_output_bundle_items(&append.retained_items, &bundle)
+            match self.output_store.new_bundle() {
+                Ok(mut bundle) => {
+                    match bundle.append_items(&mut self.output_store, &material.items) {
+                        Ok(append) => compact_output_bundle_items(&append.retained_items, &bundle),
+                        Err(err) => {
+                            eprintln!(
+                                "dropping output-bundled content after output-bundle error: {err}"
+                            );
+                            materialize_items(server_only_items(material.items))
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("dropping output-bundle setup after output-bundle error: {err}");
+                    materialize_items(server_only_items(material.items))
+                }
+            }
         } else if material.worker_text.chars().count() > INLINE_TEXT_BUDGET {
-            let mut bundle = self
-                .output_store
-                .new_bundle()
-                .expect("failed to create output bundle");
-            let append = bundle
-                .append_items(&mut self.output_store, &material.items)
-                .expect("failed to append output bundle");
-            let retained_worker_text = worker_text_from_items(&append.retained_items);
-            compact_text_bundle_items(append.retained_items, &retained_worker_text, &bundle)
+            match self.output_store.new_bundle() {
+                Ok(mut bundle) => {
+                    match bundle.append_items(&mut self.output_store, &material.items) {
+                        Ok(append) => {
+                            let retained_worker_text =
+                                worker_text_from_items(&append.retained_items);
+                            compact_text_bundle_items(
+                                append.retained_items,
+                                &retained_worker_text,
+                                &bundle,
+                            )
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "dropping output-bundled content after output-bundle error: {err}"
+                            );
+                            materialize_items(server_only_items(material.items))
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("dropping output-bundle setup after output-bundle error: {err}");
+                    materialize_items(server_only_items(material.items))
+                }
+            }
         } else {
             materialize_items(material.items)
         };
-
-        if !pending_request_after {
-            self.active_timeout_bundle = None;
-        }
 
         finalize_batch(contents, material.is_error)
     }
@@ -789,6 +809,13 @@ fn materialize_items(items: Vec<ReplyItem>) -> Vec<Content> {
             ReplyItem::WorkerText(text) | ReplyItem::ServerText(text) => Content::text(text),
             ReplyItem::Image(image) => image_to_content(&image),
         })
+        .collect()
+}
+
+fn server_only_items(items: Vec<ReplyItem>) -> Vec<ReplyItem> {
+    items
+        .into_iter()
+        .filter(|item| matches!(item, ReplyItem::ServerText(_)))
         .collect()
 }
 

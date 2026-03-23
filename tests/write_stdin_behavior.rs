@@ -8,6 +8,7 @@ use rmcp::model::RawContent;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard, OnceLock};
+use tempfile::tempdir;
 use tokio::time::{Duration, Instant, sleep};
 
 fn test_mutex() -> &'static Mutex<()> {
@@ -72,6 +73,25 @@ fn bundle_root(path: &PathBuf) -> PathBuf {
     path.parent()
         .expect("bundle artifact should have a parent bundle dir")
         .to_path_buf()
+}
+
+async fn wait_for_timeout_bundle_dir(temp_root: &std::path::Path) -> TestResult<PathBuf> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        for entry in fs::read_dir(temp_root)? {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            if !file_name.to_string_lossy().starts_with("mcp-repl-output-") {
+                continue;
+            }
+            let bundle_dir = entry.path().join("output-0001");
+            if bundle_dir.exists() {
+                return Ok(bundle_dir);
+            }
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+    Err("timed out waiting for timeout output bundle dir".into())
 }
 
 async fn wait_for_path_to_disappear(path: &PathBuf) -> TestResult<()> {
@@ -430,6 +450,57 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
     assert!(
         file_text.contains("tail"),
         "expected later small poll output to append to existing spill file, got: {file_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_bundle_file_creation_failure_drops_content_without_panicking() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let temp = tempdir()?;
+    let mut session = spawn_behavior_session_with_env_vars(vec![(
+        "TMPDIR".to_string(),
+        temp.path().display().to_string(),
+    )])
+    .await?;
+
+    let input = "big <- paste(rep('z', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.2); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(0.1); cat('end\\n')";
+    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let bundle_dir = wait_for_timeout_bundle_dir(temp.path()).await?;
+    fs::remove_dir_all(&bundle_dir)?;
+
+    sleep(Duration::from_millis(260)).await;
+    let spilled = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let spilled_text = result_text(&spilled);
+
+    let follow_up = session.write_stdin_raw_with("1+1", Some(2.0)).await?;
+    let follow_up_text = result_text(&follow_up);
+
+    session.cancel().await?;
+
+    assert!(
+        !spilled_text.contains("worker error:"),
+        "did not expect bundle write failure to surface as a worker error: {spilled_text:?}"
+    );
+    assert!(
+        bundle_transcript_path(&spilled_text).is_none(),
+        "did not expect a transcript path after bundle file creation failed: {spilled_text:?}"
+    );
+    assert!(
+        !spilled_text.contains("mid080"),
+        "expected oversized worker text to be dropped after bundle file creation failed: {spilled_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("[1] 2"),
+        "expected session to stay alive after bundle file creation failed: {follow_up_text:?}"
     );
 
     Ok(())
