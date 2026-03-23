@@ -48,11 +48,13 @@ struct ActiveOutputBundle {
     id: u64,
     paths: OutputBundlePaths,
     next_image_number: usize,
+    current_image_history_number: usize,
+    history_image_count: usize,
     transcript_bytes: usize,
     transcript_lines: usize,
     omitted_tail: bool,
     omission_recorded: bool,
-    pre_index_image_files: Vec<String>,
+    pre_index_image_paths: Vec<String>,
 }
 
 struct BundleAppendResult {
@@ -66,6 +68,7 @@ struct OutputBundlePaths {
     transcript: PathBuf,
     events_log: PathBuf,
     images_dir: PathBuf,
+    images_history_dir: PathBuf,
 }
 
 struct StoredBundle {
@@ -91,14 +94,16 @@ enum ReplyItem {
 struct ReplyImage {
     data: String,
     mime_type: String,
+    is_new: bool,
 }
 
 struct ReplyMaterial {
-    items: Vec<ReplyItem>,
+    inline_items: Vec<ReplyItem>,
+    bundle_items: Vec<ReplyItem>,
     worker_text: String,
     is_error: bool,
     error_code: Option<WorkerErrorCode>,
-    image_count: usize,
+    bundle_image_count: usize,
 }
 
 impl ResponseState {
@@ -150,7 +155,7 @@ impl ResponseState {
         }
 
         let contents = if let Some(mut active) = active_timeout_bundle {
-            match active.append_items(&mut self.output_store, &material.items) {
+            match active.append_items(&mut self.output_store, &material.bundle_items) {
                 Ok(append) => {
                     let retained_worker_text = worker_text_from_items(&append.retained_items);
                     let contents = if append.omitted_this_reply {
@@ -161,7 +166,7 @@ impl ResponseState {
                         )
                     } else if active.next_image_number > 0
                         && should_use_output_bundle(
-                            material.image_count.max(active.next_image_number),
+                            active.history_image_count,
                             material.worker_text.chars().count(),
                         )
                     {
@@ -173,7 +178,7 @@ impl ResponseState {
                             &active,
                         )
                     } else {
-                        materialize_items(append.retained_items.clone())
+                        materialize_items(material.inline_items.clone())
                     };
                     if pending_request_after {
                         self.active_timeout_bundle = Some(active);
@@ -182,33 +187,36 @@ impl ResponseState {
                 }
                 Err(err) => {
                     eprintln!("dropping timeout bundle content after output-bundle error: {err}");
-                    materialize_items(server_only_items(material.items))
+                    materialize_items(server_only_items(material.inline_items))
                 }
             }
-        } else if material.image_count > 0
-            && should_use_output_bundle(material.image_count, material.worker_text.chars().count())
+        } else if material.bundle_image_count > 0
+            && should_use_output_bundle(
+                material.bundle_image_count,
+                material.worker_text.chars().count(),
+            )
         {
             match self.output_store.new_bundle() {
                 Ok(mut bundle) => {
-                    match bundle.append_items(&mut self.output_store, &material.items) {
+                    match bundle.append_items(&mut self.output_store, &material.bundle_items) {
                         Ok(append) => compact_output_bundle_items(&append.retained_items, &bundle),
                         Err(err) => {
                             eprintln!(
                                 "dropping output-bundled content after output-bundle error: {err}"
                             );
-                            materialize_items(server_only_items(material.items))
+                            materialize_items(server_only_items(material.inline_items))
                         }
                     }
                 }
                 Err(err) => {
                     eprintln!("dropping output-bundle setup after output-bundle error: {err}");
-                    materialize_items(server_only_items(material.items))
+                    materialize_items(server_only_items(material.inline_items))
                 }
             }
         } else if text_should_spill(material.worker_text.chars().count()) {
             match self.output_store.new_bundle() {
                 Ok(mut bundle) => {
-                    match bundle.append_items(&mut self.output_store, &material.items) {
+                    match bundle.append_items(&mut self.output_store, &material.bundle_items) {
                         Ok(append) => {
                             let retained_worker_text =
                                 worker_text_from_items(&append.retained_items);
@@ -222,17 +230,17 @@ impl ResponseState {
                             eprintln!(
                                 "dropping output-bundled content after output-bundle error: {err}"
                             );
-                            materialize_items(server_only_items(material.items))
+                            materialize_items(server_only_items(material.inline_items))
                         }
                     }
                 }
                 Err(err) => {
                     eprintln!("dropping output-bundle setup after output-bundle error: {err}");
-                    materialize_items(server_only_items(material.items))
+                    materialize_items(server_only_items(material.inline_items))
                 }
             }
         } else {
-            materialize_items(material.items)
+            materialize_items(material.inline_items)
         };
 
         finalize_batch(contents, material.is_error)
@@ -277,6 +285,7 @@ impl OutputStore {
         let dir = self.root_path().join(format!("output-{:04}", self.next_id));
         fs::create_dir_all(&dir).map_err(WorkerError::Io)?;
         let images_dir = dir.join("images");
+        let images_history_dir = images_dir.join("history");
         let transcript = dir.join("transcript.txt");
         let events_log = dir.join("events.log");
         self.bundles.push_back(StoredBundle {
@@ -291,13 +300,16 @@ impl OutputStore {
                 transcript,
                 events_log,
                 images_dir,
+                images_history_dir,
             },
             next_image_number: 0,
+            current_image_history_number: 0,
+            history_image_count: 0,
             transcript_bytes: 0,
             transcript_lines: 0,
             omitted_tail: false,
             omission_recorded: false,
-            pre_index_image_files: Vec::new(),
+            pre_index_image_paths: Vec::new(),
         })
     }
 
@@ -353,6 +365,39 @@ impl OutputStore {
             .expect("bundle metadata should exist for append");
         bundle.bytes_on_disk = bundle.bytes_on_disk.saturating_add(bytes);
         self.total_bytes = self.total_bytes.saturating_add(bytes);
+    }
+
+    fn record_file_replace(&mut self, bundle_id: u64, old_bytes: u64, new_bytes: u64) {
+        if old_bytes == new_bytes {
+            return;
+        }
+        let bundle = self
+            .bundles
+            .iter_mut()
+            .find(|bundle| bundle.id == bundle_id)
+            .expect("bundle metadata should exist for file replacement");
+        if new_bytes > old_bytes {
+            let delta = new_bytes - old_bytes;
+            bundle.bytes_on_disk = bundle.bytes_on_disk.saturating_add(delta);
+            self.total_bytes = self.total_bytes.saturating_add(delta);
+        } else {
+            let delta = old_bytes - new_bytes;
+            bundle.bytes_on_disk = bundle.bytes_on_disk.saturating_sub(delta);
+            self.total_bytes = self.total_bytes.saturating_sub(delta);
+        }
+    }
+
+    fn record_file_removal(&mut self, bundle_id: u64, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let bundle = self
+            .bundles
+            .iter_mut()
+            .find(|bundle| bundle.id == bundle_id)
+            .expect("bundle metadata should exist for file removal");
+        bundle.bytes_on_disk = bundle.bytes_on_disk.saturating_sub(bytes);
+        self.total_bytes = self.total_bytes.saturating_sub(bytes);
     }
 
     fn prune_for_new_bundle(&mut self, initial_bytes: u64) -> Result<(), WorkerError> {
@@ -580,26 +625,70 @@ impl ActiveOutputBundle {
         if self.has_text() && !self.has_events_log() {
             self.materialize_events_log(store)?;
         }
-        let next_number = self.next_image_number.saturating_add(1);
         let extension = image_extension(&image.mime_type);
-        let file_name = format!("{next_number:03}.{extension}");
-        let path = self.paths.images_dir.join(&file_name);
+        let starts_new_image = image.is_new || self.next_image_number == 0;
+        let image_number = if starts_new_image {
+            self.next_image_number.saturating_add(1)
+        } else {
+            self.next_image_number
+        };
+        let history_number = if starts_new_image {
+            1
+        } else {
+            self.current_image_history_number.saturating_add(1)
+        };
+        let history_rel_path =
+            format!("images/history/{image_number:03}/{history_number:03}.{extension}");
+        let history_path = self
+            .paths
+            .images_history_dir
+            .join(format!("{image_number:03}/{history_number:03}.{extension}"));
+        let alias_path = self
+            .paths
+            .images_dir
+            .join(format!("{image_number:03}.{extension}"));
         let bytes = STANDARD
             .decode(image.data.as_bytes())
             .map_err(|err| WorkerError::Protocol(format!("invalid image data: {err}")))?;
-        let row = format!("I images/{file_name}\n");
-        let granted = store.prepare_append_capacity(self.id, (bytes.len() + row.len()) as u64)?;
-        if granted < (bytes.len() + row.len()) as u64 {
+        let alias_old_path = self.existing_image_alias_path(image_number);
+        let alias_old_len = alias_old_path
+            .as_ref()
+            .and_then(|path| fs::metadata(path).ok())
+            .map_or(0, |metadata| metadata.len());
+        let alias_growth = (bytes.len() as u64).saturating_sub(alias_old_len);
+        let row = format!("I {history_rel_path}\n");
+        let required = bytes.len() as u64 + row.len() as u64 + alias_growth;
+        let granted = store.prepare_append_capacity(self.id, required)?;
+        if granted < required {
             return Ok(None);
         }
-        fs::write(&path, &bytes).map_err(WorkerError::Io)?;
+        let history_parent = history_path
+            .parent()
+            .expect("history file should have a parent directory");
+        fs::create_dir_all(history_parent).map_err(WorkerError::Io)?;
+        fs::write(&history_path, &bytes).map_err(WorkerError::Io)?;
         store.record_append(self.id, bytes.len() as u64);
+        if let Some(old_path) = alias_old_path.as_ref()
+            && old_path != &alias_path
+        {
+            fs::remove_file(old_path).map_err(WorkerError::Io)?;
+            store.record_file_removal(self.id, alias_old_len);
+        }
+        let replace_old_len = if alias_old_path.as_ref() == Some(&alias_path) {
+            alias_old_len
+        } else {
+            0
+        };
+        fs::write(&alias_path, &bytes).map_err(WorkerError::Io)?;
+        store.record_file_replace(self.id, replace_old_len, bytes.len() as u64);
         if self.has_events_log() {
             store.append_bundle_bytes(self.id, &self.paths.events_log, row.as_bytes())?;
         } else {
-            self.pre_index_image_files.push(file_name);
+            self.pre_index_image_paths.push(history_rel_path);
         }
-        self.next_image_number = next_number;
+        self.next_image_number = image_number;
+        self.current_image_history_number = history_number;
+        self.history_image_count = self.history_image_count.saturating_add(1);
         Ok(Some(ReplyItem::Image(image.clone())))
     }
 
@@ -637,8 +726,8 @@ impl ActiveOutputBundle {
         if self.has_text() {
             bytes.extend_from_slice(self.backfill_text_row().as_bytes());
         } else {
-            for image_name in &self.pre_index_image_files {
-                bytes.extend_from_slice(format!("I images/{image_name}\n").as_bytes());
+            for image_path in &self.pre_index_image_paths {
+                bytes.extend_from_slice(format!("I {image_path}\n").as_bytes());
             }
         }
         if self.omitted_tail {
@@ -655,7 +744,7 @@ impl ActiveOutputBundle {
         }
         std::fs::File::create(&self.paths.events_log).map_err(WorkerError::Io)?;
         store.append_bundle_bytes(self.id, &self.paths.events_log, &bytes)?;
-        self.pre_index_image_files.clear();
+        self.pre_index_image_paths.clear();
         Ok(())
     }
 
@@ -700,6 +789,17 @@ impl ActiveOutputBundle {
             }
         }
         self.paths.images_dir.join(format!("{stem}.png"))
+    }
+
+    fn existing_image_alias_path(&self, index: usize) -> Option<PathBuf> {
+        let stem = format!("{index:03}");
+        for extension in ["png", "jpg", "jpeg", "gif", "webp", "svg"] {
+            let path = self.paths.images_dir.join(format!("{stem}.{extension}"));
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        None
     }
 }
 
@@ -747,10 +847,8 @@ fn prepare_reply_material(reply: WorkerReply) -> ReplyMaterial {
         } => (contents, is_error, error_code),
     };
 
-    let contents = collapse_image_updates(contents);
-    let mut items = Vec::with_capacity(contents.len());
+    let mut bundle_items = Vec::with_capacity(contents.len());
     let mut worker_text = String::new();
-    let mut image_count = 0usize;
 
     for content in contents {
         match content {
@@ -766,29 +864,34 @@ fn prepare_reply_material(reply: WorkerReply) -> ReplyMaterial {
                 match origin {
                     ContentOrigin::Worker => {
                         worker_text.push_str(&text);
-                        items.push(ReplyItem::WorkerText(text));
+                        bundle_items.push(ReplyItem::WorkerText(text));
                     }
-                    ContentOrigin::Server => items.push(ReplyItem::ServerText(text)),
+                    ContentOrigin::Server => bundle_items.push(ReplyItem::ServerText(text)),
                 }
             }
             WorkerContent::ContentImage {
                 data,
                 mime_type,
                 id: _,
-                is_new: _,
-            } => {
-                image_count = image_count.saturating_add(1);
-                items.push(ReplyItem::Image(ReplyImage { data, mime_type }));
-            }
+                is_new,
+            } => bundle_items.push(ReplyItem::Image(ReplyImage {
+                data,
+                mime_type,
+                is_new,
+            })),
         }
     }
 
+    let inline_items = collapse_image_updates(bundle_items.clone());
+    let bundle_image_count = count_images(&bundle_items);
+
     ReplyMaterial {
-        items,
+        inline_items,
+        bundle_items,
         worker_text,
         is_error,
         error_code,
-        image_count,
+        bundle_image_count,
     }
 }
 
@@ -817,6 +920,13 @@ fn server_only_items(items: Vec<ReplyItem>) -> Vec<ReplyItem> {
 
 fn image_to_content(image: &ReplyImage) -> Content {
     content_image(image.data.clone(), image.mime_type.clone())
+}
+
+fn count_images(items: &[ReplyItem]) -> usize {
+    items
+        .iter()
+        .filter(|item| matches!(item, ReplyItem::Image(_)))
+        .count()
 }
 
 fn worker_text_from_items(items: &[ReplyItem]) -> String {
@@ -1165,14 +1275,14 @@ fn ensure_nonempty_contents(contents: &mut Vec<Content>) {
     }
 }
 
-fn collapse_image_updates(contents: Vec<WorkerContent>) -> Vec<WorkerContent> {
-    let mut group_for_index: Vec<Option<usize>> = vec![None; contents.len()];
+fn collapse_image_updates(items: Vec<ReplyItem>) -> Vec<ReplyItem> {
+    let mut group_for_index: Vec<Option<usize>> = vec![None; items.len()];
     let mut last_in_group: Vec<usize> = Vec::new();
     let mut current_group: Option<usize> = None;
 
-    for (idx, content) in contents.iter().enumerate() {
-        if let WorkerContent::ContentImage { is_new, .. } = content {
-            if *is_new || current_group.is_none() {
+    for (idx, item) in items.iter().enumerate() {
+        if let ReplyItem::Image(image) = item {
+            if image.is_new || current_group.is_none() {
                 current_group = Some(last_in_group.len());
                 last_in_group.push(idx);
             }
@@ -1182,15 +1292,15 @@ fn collapse_image_updates(contents: Vec<WorkerContent>) -> Vec<WorkerContent> {
         }
     }
 
-    contents
+    items
         .into_iter()
         .enumerate()
-        .filter_map(|(idx, content)| match &content {
-            WorkerContent::ContentImage { .. } => match group_for_index[idx] {
-                Some(group) if last_in_group.get(group).copied() == Some(idx) => Some(content),
+        .filter_map(|(idx, item)| match &item {
+            ReplyItem::Image(_) => match group_for_index[idx] {
+                Some(group) if last_in_group.get(group).copied() == Some(idx) => Some(item),
                 _ => None,
             },
-            _ => Some(content),
+            _ => Some(item),
         })
         .collect()
 }

@@ -13,11 +13,14 @@
   - `transcript.txt`
   - `events.log`
   - `images/001.png`, `002.png`, ...
+  - `images/history/001/001.png`, `001/002.png`, ...
 - `events.log` covers the full normalized stream, not just the omitted middle.
 - `T` rows include both line and byte ranges into `transcript.txt`.
-- `I` rows include only the relative image path.
+- `I` rows include only the relative history image path.
 - Output bundle compaction uses one merged pass over normalized reply items.
 - The visible output-bundle reply keeps the first and last image inline.
+- Same-reply plot updates stay collapsed inline, but the bundle retains their full image history.
+- Top-level files under `images/` are final aliases; `images/history/` stores ordered image history.
 - The truncation notice points to `events.log`.
 
 ## Guardrails

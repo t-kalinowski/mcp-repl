@@ -52,12 +52,37 @@ fn events_log_path(text: &str) -> Option<PathBuf> {
         .map(|path| PathBuf::from(path.as_str()))
 }
 
-fn image_file_names(dir: &Path) -> TestResult<Vec<String>> {
+fn top_level_entry_names(dir: &Path) -> TestResult<Vec<String>> {
     let mut names = fs::read_dir(dir)?
         .map(|entry| entry.map(|entry| entry.file_name().to_string_lossy().into_owned()))
         .collect::<Result<Vec<_>, _>>()?;
     names.sort();
     Ok(names)
+}
+
+fn relative_file_paths(root: &Path) -> TestResult<Vec<String>> {
+    let mut paths = Vec::new();
+    collect_relative_file_paths(root, root, &mut paths)?;
+    paths.sort();
+    Ok(paths)
+}
+
+fn collect_relative_file_paths(root: &Path, dir: &Path, out: &mut Vec<String>) -> TestResult<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if entry.file_type()?.is_dir() {
+            collect_relative_file_paths(root, &path, out)?;
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .expect("file should be under root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.push(relative);
+    }
+    Ok(())
 }
 
 fn response_snapshot(result: &CallToolResult) -> serde_json::Value {
@@ -880,7 +905,8 @@ async fn python_mixed_plot_replies_output_bundle_and_keep_first_and_last_images(
         .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
     let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
     let events = fs::read_to_string(&events_log)?;
-    let image_names = image_file_names(&bundle_dir.join("images"))?;
+    let top_level_images = top_level_entry_names(&bundle_dir.join("images"))?;
+    let history_files = relative_file_paths(&bundle_dir.join("images/history"))?;
     let images = extract_images(&result);
 
     assert_eq!(
@@ -889,7 +915,7 @@ async fn python_mixed_plot_replies_output_bundle_and_keep_first_and_last_images(
         "expected output-bundle reply to keep exactly two inline images"
     );
     assert_eq!(
-        image_names,
+        top_level_images,
         vec![
             "001.png".to_string(),
             "002.png".to_string(),
@@ -897,18 +923,31 @@ async fn python_mixed_plot_replies_output_bundle_and_keep_first_and_last_images(
             "004.png".to_string(),
             "005.png".to_string(),
             "006.png".to_string(),
+            "history".to_string(),
         ],
-        "expected sequential image names in output bundle"
+        "expected top-level final image aliases in output bundle"
+    );
+    assert_eq!(
+        history_files,
+        vec![
+            "001/001.png".to_string(),
+            "002/001.png".to_string(),
+            "003/001.png".to_string(),
+            "004/001.png".to_string(),
+            "005/001.png".to_string(),
+            "006/001.png".to_string(),
+        ],
+        "expected image history files grouped under images/history"
     );
     assert_eq!(
         images[0].bytes,
         fs::read(bundle_dir.join("images/001.png"))?,
-        "expected first inline image to match first output-bundle image"
+        "expected first inline image to match first top-level final alias"
     );
     assert_eq!(
         images[1].bytes,
         fs::read(bundle_dir.join("images/006.png"))?,
-        "expected second inline image to match last output-bundle image"
+        "expected second inline image to match last top-level final alias"
     );
     assert!(
         text.contains("events.log"),
@@ -923,7 +962,8 @@ async fn python_mixed_plot_replies_output_bundle_and_keep_first_and_last_images(
         "expected text range entries in events.log, got: {events:?}"
     );
     assert!(
-        events.contains("I images/001.png") && events.contains("I images/006.png"),
+        events.contains("I images/history/001/001.png")
+            && events.contains("I images/history/006/001.png"),
         "expected first/last image entries in events.log, got: {events:?}"
     );
     assert!(
@@ -931,11 +971,88 @@ async fn python_mixed_plot_replies_output_bundle_and_keep_first_and_last_images(
         "expected transcript.txt to contain worker text, got: {transcript:?}"
     );
     assert!(
-        !transcript.contains("images/001.png"),
+        !transcript.contains("images/history/001/001.png"),
         "did not expect transcript.txt to contain image paths, got: {transcript:?}"
     );
 
     session.cancel().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_same_reply_plot_updates_bundle_preserves_image_history() -> TestResult<()> {
+    if !python_plot_tests_enabled() {
+        return Ok(());
+    }
+    let mut session = common::spawn_python_server().await?;
+
+    let input = format!(
+        "{}; exec(\"big = 'h' * {}\\nprint('HISTORY_START')\\nprint(big)\\nprint('HISTORY_END')\\nplt.figure(1)\\nplt.clf()\\nplt.plot(list(range(1, 11)))\\nplt.plot(list(range(2, 10)), list(range(2, 10)))\\nplt.plot(list(range(3, 9)), list(range(3, 9)))\\nplt.show()\")",
+        python_plot_preamble(),
+        5000,
+    );
+    let result = session.write_stdin_raw_with(&input, Some(60.0)).await?;
+    session.cancel().await?;
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "same-reply plot history bundle reported an error: {}",
+        result_text(&result)
+    );
+
+    let text = result_text(&result);
+    let events_log = events_log_path(&text).unwrap_or_else(|| {
+        panic!("expected output bundle events.log path in response, got: {text:?}")
+    });
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+    let events = fs::read_to_string(&events_log)?;
+    let top_level_images = top_level_entry_names(&bundle_dir.join("images"))?;
+    let history_files = relative_file_paths(&bundle_dir.join("images/history"))?;
+    let images = extract_images(&result);
+
+    assert_eq!(
+        images.len(),
+        1,
+        "expected same-reply updates to stay collapsed inline"
+    );
+    assert_eq!(
+        top_level_images,
+        vec!["001.png".to_string(), "history".to_string()],
+        "expected one top-level final alias plus history"
+    );
+    assert_eq!(
+        history_files,
+        vec![
+            "001/001.png".to_string(),
+            "001/002.png".to_string(),
+            "001/003.png".to_string(),
+        ],
+        "expected every same-reply image update in bundle history"
+    );
+    assert_eq!(
+        images[0].bytes,
+        fs::read(bundle_dir.join("images/001.png"))?,
+        "expected inline image to match final top-level alias"
+    );
+    assert_eq!(
+        fs::read(bundle_dir.join("images/001.png"))?,
+        fs::read(bundle_dir.join("images/history/001/003.png"))?,
+        "expected final alias to match the last history entry"
+    );
+    assert!(
+        transcript.contains("HISTORY_START") && transcript.contains("HISTORY_END"),
+        "expected transcript.txt to contain worker text, got: {transcript:?}"
+    );
+    assert!(
+        events.contains("I images/history/001/001.png")
+            && events.contains("I images/history/001/003.png"),
+        "expected events.log to cover the full same-reply history, got: {events:?}"
+    );
 
     Ok(())
 }
