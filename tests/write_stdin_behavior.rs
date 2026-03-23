@@ -131,6 +131,11 @@ async fn wait_until_not_busy(
     Err(format!("worker remained busy after polling: {text:?}").into())
 }
 
+const INLINE_TEXT_BUDGET_CHARS: usize = 3500;
+const INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS: usize = INLINE_TEXT_BUDGET_CHARS * 5 / 4;
+const UNDER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_BUDGET_CHARS + 200;
+const OVER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS + 200;
+
 async fn spawn_behavior_session() -> TestResult<common::McpTestSession> {
     spawn_behavior_session_with_env_vars(Vec::new()).await
 }
@@ -304,6 +309,73 @@ async fn write_stdin_large_output_is_not_paged() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_text_slightly_over_inline_budget_stays_inline() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let input = format!(
+        "big <- paste(rep('u', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('UNDER_START\\n'); cat(big); cat('\\nUNDER_END\\n')"
+    );
+    let result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("UNDER_START") && text.contains("UNDER_END"),
+        "expected full under-threshold text inline, got: {text:?}"
+    );
+    assert!(
+        bundle_transcript_path(&text).is_none(),
+        "did not expect transcript path for under-threshold text, got: {text:?}"
+    );
+    assert!(
+        !text.contains("full output:"),
+        "did not expect truncation marker for under-threshold text, got: {text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_text_above_hard_spill_threshold_uses_output_bundle_dir() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let input = format!(
+        "big <- paste(rep('v', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('OVER_START\\n'); cat(big); cat('\\nOVER_END\\n')"
+    );
+    let result = session.write_stdin_raw_with(&input, Some(30.0)).await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let transcript_path = bundle_transcript_path(&text).unwrap_or_else(|| {
+        panic!("expected transcript path in over-threshold reply, got: {text:?}")
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        transcript.contains("OVER_START") && transcript.contains("OVER_END"),
+        "expected transcript bundle to contain the full over-threshold worker text, got: {transcript:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn text_only_oversized_reply_uses_output_bundle_dir() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
@@ -393,6 +465,58 @@ async fn timeout_output_bundle_backfills_earlier_worker_text_and_excludes_timeou
     assert!(
         !file_text.contains("<<console status: busy"),
         "did not expect timeout marker in spill file, got: {file_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn timeout_output_bundle_is_disclosed_only_after_poll_crosses_hard_spill_threshold()
+-> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let input = format!(
+        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); big <- paste(rep('t', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); Sys.sleep(0.25); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n')"
+    );
+    let first = session.write_stdin_raw_with(&input, Some(0.05)).await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        first_text.contains("SMALL_START") && first_text.contains("SMALL_END"),
+        "expected under-threshold timeout text inline, got: {first_text:?}"
+    );
+    assert!(
+        bundle_transcript_path(&first_text).is_none(),
+        "did not expect transcript path before a poll crosses the hard spill threshold, got: {first_text:?}"
+    );
+
+    sleep(Duration::from_millis(300)).await;
+    let spilled = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let spilled_text = result_text(&spilled);
+    if spilled_text.contains("<<console status: busy") {
+        eprintln!("write_stdin_behavior spill poll remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let transcript_path = bundle_transcript_path(&spilled_text).unwrap_or_else(|| {
+        panic!("expected transcript path once the poll crossed the hard spill threshold, got: {spilled_text:?}")
+    });
+    let file_text = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        file_text.contains("SMALL_START") && file_text.contains("SMALL_END"),
+        "expected transcript file to backfill earlier under-threshold timeout text, got: {file_text:?}"
+    );
+    assert!(
+        file_text.contains("BIG_START") && file_text.contains("BIG_END"),
+        "expected transcript file to include the over-threshold poll text, got: {file_text:?}"
     );
 
     Ok(())
@@ -632,7 +756,7 @@ async fn output_bundle_prunes_oldest_inactive_bundle_when_total_size_limit_is_hi
     let mut bundles = Vec::new();
     for label in ["m", "n"] {
         let input = format!(
-            "big <- paste(rep('{label}', 80), collapse = ''); for (i in 1:45) cat(sprintf('{label}%03d %s\\n', i, big))"
+            "big <- paste(rep('{label}', 120), collapse = ''); for (i in 1:45) cat(sprintf('{label}%03d %s\\n', i, big))"
         );
         let result = session.write_stdin_raw_with(input, Some(30.0)).await?;
         let result = wait_until_not_busy(&mut session, result).await?;

@@ -219,6 +219,11 @@ fn assert_no_images(result: &CallToolResult, context: &str) {
     );
 }
 
+const INLINE_TEXT_BUDGET_CHARS: usize = 3500;
+const INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS: usize = INLINE_TEXT_BUDGET_CHARS * 5 / 4;
+const UNDER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_BUDGET_CHARS + 200;
+const OVER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS + 200;
+
 fn assert_plot_snapshot(name: &str, snapshot: &PlotTranscriptSnapshot) -> TestResult<()> {
     let serialized = serde_json::to_string_pretty(snapshot)?;
     if cfg!(target_os = "macos") {
@@ -813,6 +818,112 @@ plot(1:10)
         !images.is_empty(),
         "expected plot image even after truncation"
     );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mixed_plot_reply_with_four_images_and_under_grace_text_stays_inline() -> TestResult<()> {
+    let mut session = spawn_server().await?;
+
+    let input = format!(
+        r#"
+big <- paste(rep("u", {UNDER_HARD_SPILL_TEXT_LEN}), collapse = "")
+cat("UNDER_START\n")
+cat(big)
+cat("\nUNDER_END\n")
+for (i in 1:4) {{
+  plot(1:10, main = sprintf("plot%03d", i))
+}}
+"#
+    );
+    let result = session.write_stdin_raw_with(&input, Some(60.0)).await?;
+    if any_backend_unavailable(&[&result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "under-grace mixed plot reply reported an error: {}",
+        result_text(&result)
+    );
+
+    let text = result_text(&result);
+    let images = extract_images(&result);
+
+    assert!(
+        text.contains("UNDER_START") && text.contains("UNDER_END"),
+        "expected under-grace mixed reply text inline, got: {text:?}"
+    );
+    assert!(
+        events_log_path(&text).is_none(),
+        "did not expect mixed output bundle for under-grace text, got: {text:?}"
+    );
+    assert_eq!(
+        images.len(),
+        4,
+        "expected four inline images when text stays under the hard spill threshold"
+    );
+
+    session.cancel().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mixed_plot_reply_with_two_images_and_over_grace_text_uses_output_bundle() -> TestResult<()>
+{
+    let mut session = spawn_server().await?;
+
+    let input = format!(
+        r#"
+big <- paste(rep("v", {OVER_HARD_SPILL_TEXT_LEN}), collapse = "")
+cat("OVER_START\n")
+cat(big)
+cat("\nOVER_END\n")
+for (i in 1:2) {{
+  plot(1:10, main = sprintf("plot%03d", i))
+}}
+"#
+    );
+    let result = session.write_stdin_raw_with(&input, Some(60.0)).await?;
+    if any_backend_unavailable(&[&result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "over-grace mixed plot reply reported an error: {}",
+        result_text(&result)
+    );
+
+    let text = result_text(&result);
+    let events_log = events_log_path(&text).unwrap_or_else(|| {
+        panic!("expected output bundle events.log path in over-grace mixed reply, got: {text:?}")
+    });
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+    let images = extract_images(&result);
+
+    assert_eq!(
+        images.len(),
+        2,
+        "expected output-bundle mixed reply to keep both endpoint images inline"
+    );
+    assert!(
+        transcript.contains("OVER_START") && transcript.contains("OVER_END"),
+        "expected transcript.txt to contain the over-grace worker text, got: {transcript:?}"
+    );
+
+    session.cancel().await?;
 
     Ok(())
 }

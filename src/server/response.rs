@@ -12,8 +12,12 @@ use crate::worker_process::WorkerError;
 use crate::worker_protocol::{ContentOrigin, WorkerContent, WorkerErrorCode, WorkerReply};
 
 const INLINE_TEXT_BUDGET: usize = 3500;
+const INLINE_TEXT_HARD_SPILL_THRESHOLD_NUMERATOR: usize = 5;
+const INLINE_TEXT_HARD_SPILL_THRESHOLD_DENOMINATOR: usize = 4;
+const INLINE_TEXT_HARD_SPILL_THRESHOLD: usize = INLINE_TEXT_BUDGET
+    * INLINE_TEXT_HARD_SPILL_THRESHOLD_NUMERATOR
+    / INLINE_TEXT_HARD_SPILL_THRESHOLD_DENOMINATOR;
 const IMAGE_OUTPUT_BUNDLE_THRESHOLD: usize = 5;
-const INLINE_IMAGE_COST: usize = 900;
 const HEAD_TEXT_BUDGET: usize = INLINE_TEXT_BUDGET / 3;
 const PRE_LAST_TEXT_BUDGET: usize = INLINE_TEXT_BUDGET / 5;
 const POST_LAST_TEXT_BUDGET: usize = INLINE_TEXT_BUDGET / 8;
@@ -95,7 +99,6 @@ struct ReplyMaterial {
     is_error: bool,
     error_code: Option<WorkerErrorCode>,
     image_count: usize,
-    estimated_cost: usize,
 }
 
 impl ResponseState {
@@ -159,11 +162,11 @@ impl ResponseState {
                     } else if active.next_image_number > 0
                         && should_use_output_bundle(
                             material.image_count.max(active.next_image_number),
-                            material.estimated_cost,
+                            material.worker_text.chars().count(),
                         )
                     {
                         compact_output_bundle_items(&append.retained_items, &active)
-                    } else if material.worker_text.chars().count() > INLINE_TEXT_BUDGET {
+                    } else if text_should_spill(material.worker_text.chars().count()) {
                         compact_text_bundle_items(
                             append.retained_items.clone(),
                             &retained_worker_text,
@@ -183,7 +186,7 @@ impl ResponseState {
                 }
             }
         } else if material.image_count > 0
-            && should_use_output_bundle(material.image_count, material.estimated_cost)
+            && should_use_output_bundle(material.image_count, material.worker_text.chars().count())
         {
             match self.output_store.new_bundle() {
                 Ok(mut bundle) => {
@@ -202,7 +205,7 @@ impl ResponseState {
                     materialize_items(server_only_items(material.items))
                 }
             }
-        } else if material.worker_text.chars().count() > INLINE_TEXT_BUDGET {
+        } else if text_should_spill(material.worker_text.chars().count()) {
             match self.output_store.new_bundle() {
                 Ok(mut bundle) => {
                     match bundle.append_items(&mut self.output_store, &material.items) {
@@ -748,7 +751,6 @@ fn prepare_reply_material(reply: WorkerReply) -> ReplyMaterial {
     let mut items = Vec::with_capacity(contents.len());
     let mut worker_text = String::new();
     let mut image_count = 0usize;
-    let mut estimated_cost = 0usize;
 
     for content in contents {
         match content {
@@ -764,13 +766,9 @@ fn prepare_reply_material(reply: WorkerReply) -> ReplyMaterial {
                 match origin {
                     ContentOrigin::Worker => {
                         worker_text.push_str(&text);
-                        estimated_cost = estimated_cost.saturating_add(text.chars().count());
                         items.push(ReplyItem::WorkerText(text));
                     }
-                    ContentOrigin::Server => {
-                        estimated_cost = estimated_cost.saturating_add(text.chars().count());
-                        items.push(ReplyItem::ServerText(text))
-                    }
+                    ContentOrigin::Server => items.push(ReplyItem::ServerText(text)),
                 }
             }
             WorkerContent::ContentImage {
@@ -780,7 +778,6 @@ fn prepare_reply_material(reply: WorkerReply) -> ReplyMaterial {
                 is_new: _,
             } => {
                 image_count = image_count.saturating_add(1);
-                estimated_cost = estimated_cost.saturating_add(INLINE_IMAGE_COST);
                 items.push(ReplyItem::Image(ReplyImage { data, mime_type }));
             }
         }
@@ -792,7 +789,6 @@ fn prepare_reply_material(reply: WorkerReply) -> ReplyMaterial {
         is_error,
         error_code,
         image_count,
-        estimated_cost,
     }
 }
 
@@ -894,8 +890,12 @@ fn compact_output_bundle_items(items: &[ReplyItem], bundle: &ActiveOutputBundle)
     out
 }
 
-fn should_use_output_bundle(image_count: usize, estimated_cost: usize) -> bool {
-    image_count >= IMAGE_OUTPUT_BUNDLE_THRESHOLD || estimated_cost > INLINE_TEXT_BUDGET
+fn should_use_output_bundle(image_count: usize, worker_text_chars: usize) -> bool {
+    image_count >= IMAGE_OUTPUT_BUNDLE_THRESHOLD || text_should_spill(worker_text_chars)
+}
+
+fn text_should_spill(worker_text_chars: usize) -> bool {
+    worker_text_chars > INLINE_TEXT_HARD_SPILL_THRESHOLD
 }
 
 fn build_output_bundle_notice(bundle: &ActiveOutputBundle) -> String {
