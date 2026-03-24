@@ -251,14 +251,18 @@ async fn python_detached_idle_output_does_not_bundle_follow_up_reply() -> TestRe
 
     let setup = session
         .write_stdin_raw_with(
-            r#"import os, sys, time
-pid = os.fork()
-if pid == 0:
-    time.sleep(0.3)
-    for i in range(160):
-        sys.stdout.write(f"IDLE_{i:03d} {'x' * 80}\n")
-    sys.stdout.flush()
-    os._exit(0)
+            r#"import subprocess, sys
+script = """import sys, time
+time.sleep(0.3)
+for i in range(160):
+    sys.stdout.write("IDLE_%03d " % i + ("x" * 80) + "\\n")
+sys.stdout.flush()
+"""
+subprocess.Popen(
+    [sys.executable, "-c", script],
+    stdin=subprocess.DEVNULL,
+    close_fds=False,
+)
 print("parent ready")
 "#,
             Some(5.0),
