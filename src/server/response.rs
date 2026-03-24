@@ -123,12 +123,6 @@ pub(crate) enum TimeoutBundleReuse {
     FollowUpInput,
 }
 
-#[derive(Clone, Copy)]
-enum ActiveTimeoutBundleAppendMode {
-    FullReply,
-    DetachedPrefixOnly,
-}
-
 impl ResponseState {
     pub(crate) fn new() -> Result<Self, WorkerError> {
         Ok(Self {
@@ -193,18 +187,18 @@ impl ResponseState {
     ) -> CallToolResult {
         let material = prepare_reply_material(reply, detached_prefix_item_count);
         let mut active_timeout_bundle = self.active_timeout_bundle.take();
-        let mut append_mode = match timeout_bundle_reuse {
-            TimeoutBundleReuse::None => None,
-            TimeoutBundleReuse::FullReply => Some(ActiveTimeoutBundleAppendMode::FullReply),
-            TimeoutBundleReuse::FollowUpInput if pending_request_after => {
-                Some(ActiveTimeoutBundleAppendMode::FullReply)
-            }
-            TimeoutBundleReuse::FollowUpInput if !material.detached_prefix_items.is_empty() => {
-                Some(ActiveTimeoutBundleAppendMode::DetachedPrefixOnly)
-            }
-            TimeoutBundleReuse::FollowUpInput => None,
-        };
-        if append_mode.is_none()
+        if matches!(timeout_bundle_reuse, TimeoutBundleReuse::FollowUpInput) {
+            let contents = self.finalize_follow_up_reply(
+                &material,
+                pending_request_after,
+                active_timeout_bundle,
+            );
+            return finalize_batch(contents, material.is_error);
+        }
+
+        let reuse_active_timeout_bundle =
+            matches!(timeout_bundle_reuse, TimeoutBundleReuse::FullReply);
+        if !reuse_active_timeout_bundle
             && let Some(active) = active_timeout_bundle.take()
             && let Err(err) = self.finish_bundle(active)
         {
@@ -213,10 +207,7 @@ impl ResponseState {
         if material.error_code == Some(WorkerErrorCode::Timeout) && active_timeout_bundle.is_none()
         {
             match self.output_store.new_bundle() {
-                Ok(bundle) => {
-                    active_timeout_bundle = Some(bundle);
-                    append_mode = Some(ActiveTimeoutBundleAppendMode::FullReply);
-                }
+                Ok(bundle) => active_timeout_bundle = Some(bundle),
                 Err(err) => {
                     eprintln!("dropping timeout bundle setup after output-bundle error: {err}");
                 }
@@ -224,124 +215,14 @@ impl ResponseState {
         }
 
         let contents = if let Some(mut active) = active_timeout_bundle {
-            let append_items = match append_mode.unwrap_or(ActiveTimeoutBundleAppendMode::FullReply)
-            {
-                ActiveTimeoutBundleAppendMode::FullReply => &material.bundle_items,
-                ActiveTimeoutBundleAppendMode::DetachedPrefixOnly => {
-                    &material.detached_prefix_items
-                }
-            };
-            match active.append_items(&mut self.output_store, append_items) {
-                Ok(append) => {
-                    let contents = match append_mode
-                        .unwrap_or(ActiveTimeoutBundleAppendMode::FullReply)
-                    {
-                        ActiveTimeoutBundleAppendMode::FullReply => {
-                            let retained_worker_text =
-                                worker_text_from_items(&append.retained_items);
-                            if append.omitted_this_reply {
-                                active.disclosed = true;
-                                compact_text_bundle_items(
-                                    append.retained_items.clone(),
-                                    &retained_worker_text,
-                                    &active,
-                                )
-                            } else if active.next_image_number > 0
-                                && should_use_output_bundle(
-                                    active.history_image_count,
-                                    material.worker_text.chars().count(),
-                                )
-                            {
-                                active.disclosed = true;
-                                compact_output_bundle_items(&append.retained_items, &active)
-                            } else if text_should_spill(material.worker_text.chars().count()) {
-                                active.disclosed = true;
-                                compact_text_bundle_items(
-                                    append.retained_items.clone(),
-                                    &retained_worker_text,
-                                    &active,
-                                )
-                            } else {
-                                materialize_items(material.inline_items.clone())
-                            }
-                        }
-                        ActiveTimeoutBundleAppendMode::DetachedPrefixOnly => {
-                            let retained_worker_text =
-                                worker_text_from_items(&append.retained_items);
-                            if append.omitted_this_reply {
-                                active.disclosed = true;
-                                let mut contents = compact_text_bundle_items(
-                                    append.retained_items.clone(),
-                                    &retained_worker_text,
-                                    &active,
-                                );
-                                contents
-                                    .extend(materialize_items(material.reply_inline_items.clone()));
-                                contents
-                            } else if active.next_image_number > 0
-                                && should_use_output_bundle(
-                                    active.history_image_count,
-                                    material.detached_prefix_worker_text.chars().count(),
-                                )
-                            {
-                                active.disclosed = true;
-                                let mut contents =
-                                    compact_output_bundle_items(&append.retained_items, &active);
-                                contents
-                                    .extend(materialize_items(material.reply_inline_items.clone()));
-                                contents
-                            } else if text_should_spill(
-                                material.detached_prefix_worker_text.chars().count(),
-                            ) {
-                                active.disclosed = true;
-                                let mut contents = compact_text_bundle_items(
-                                    append.retained_items.clone(),
-                                    &retained_worker_text,
-                                    &active,
-                                );
-                                contents
-                                    .extend(materialize_items(material.reply_inline_items.clone()));
-                                contents
-                            } else if !material.reply_bundle_items.is_empty()
-                                && count_images(&material.reply_bundle_items) > 0
-                                && should_use_output_bundle(
-                                    count_images(&material.reply_bundle_items),
-                                    material.reply_worker_text.chars().count(),
-                                )
-                            {
-                                let mut contents =
-                                    materialize_items(material.detached_prefix_items.clone());
-                                contents.extend(compact_reply_items_with_new_bundle(
-                                    &mut self.output_store,
-                                    &material.reply_bundle_items,
-                                    &material.reply_inline_items,
-                                    &material.reply_worker_text,
-                                    false,
-                                    Some(active.id),
-                                ));
-                                contents
-                            } else if text_should_spill(material.reply_worker_text.chars().count())
-                            {
-                                let mut contents =
-                                    materialize_items(material.detached_prefix_items.clone());
-                                contents.extend(compact_reply_items_with_new_bundle(
-                                    &mut self.output_store,
-                                    &material.reply_bundle_items,
-                                    &material.reply_inline_items,
-                                    &material.reply_worker_text,
-                                    true,
-                                    Some(active.id),
-                                ));
-                                contents
-                            } else {
-                                let mut contents =
-                                    materialize_items(material.detached_prefix_items.clone());
-                                contents
-                                    .extend(materialize_items(material.reply_inline_items.clone()));
-                                contents
-                            }
-                        }
-                    };
+            match render_active_bundle_contents(
+                &mut self.output_store,
+                &mut active,
+                &material.bundle_items,
+                &material.inline_items,
+                &material.worker_text,
+            ) {
+                Ok(contents) => {
                     if pending_request_after {
                         self.active_timeout_bundle = Some(active);
                     } else if let Err(err) = self.finish_bundle(active) {
@@ -460,6 +341,135 @@ impl ResponseState {
         };
 
         finalize_batch(contents, material.is_error)
+    }
+
+    fn finalize_follow_up_reply(
+        &mut self,
+        material: &ReplyMaterial,
+        pending_request_after: bool,
+        active_timeout_bundle: Option<ActiveOutputBundle>,
+    ) -> Vec<Content> {
+        let (mut contents, protected_bundle_id) =
+            self.render_follow_up_detached_prefix(material, active_timeout_bundle);
+
+        if material.error_code == Some(WorkerErrorCode::Timeout) {
+            match self.output_store.new_bundle_preserving(protected_bundle_id) {
+                Ok(mut bundle) => {
+                    match render_active_bundle_contents(
+                        &mut self.output_store,
+                        &mut bundle,
+                        &material.reply_bundle_items,
+                        &material.reply_inline_items,
+                        &material.reply_worker_text,
+                    ) {
+                        Ok(reply_contents) => {
+                            contents.extend(reply_contents);
+                            if pending_request_after {
+                                self.active_timeout_bundle = Some(bundle);
+                            } else if let Err(err) = self.finish_bundle(bundle) {
+                                eprintln!(
+                                    "dropping closed timeout bundle after output-bundle error: {err}"
+                                );
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "dropping timeout bundle content after output-bundle error: {err}"
+                            );
+                            if let Err(err) = self.finish_bundle(bundle) {
+                                eprintln!(
+                                    "dropping closed timeout bundle after output-bundle error: {err}"
+                                );
+                            }
+                            contents.extend(compact_reply_without_output_bundle(material));
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("dropping timeout bundle setup after output-bundle error: {err}");
+                    contents.extend(compact_reply_without_output_bundle(material));
+                }
+            }
+        } else {
+            contents.extend(render_reply_items(
+                &mut self.output_store,
+                &material.reply_bundle_items,
+                &material.reply_inline_items,
+                &material.reply_worker_text,
+                protected_bundle_id,
+            ));
+        }
+
+        contents
+    }
+
+    fn render_follow_up_detached_prefix(
+        &mut self,
+        material: &ReplyMaterial,
+        active_timeout_bundle: Option<ActiveOutputBundle>,
+    ) -> (Vec<Content>, Option<u64>) {
+        let Some(mut active) = active_timeout_bundle else {
+            if should_spill_detached_prefix_only(material) {
+                match self.output_store.new_bundle() {
+                    Ok(mut bundle) => {
+                        match bundle
+                            .append_items(&mut self.output_store, &material.detached_prefix_items)
+                        {
+                            Ok(append) => {
+                                let retained_worker_text =
+                                    worker_text_from_items(&append.retained_items);
+                                let contents = compact_text_bundle_items(
+                                    append.retained_items,
+                                    &retained_worker_text,
+                                    &bundle,
+                                );
+                                return (contents, None);
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "dropping detached idle bundle after output-bundle error: {err}"
+                                );
+                                if let Err(cleanup_err) = self.finish_bundle(bundle) {
+                                    eprintln!(
+                                        "dropping closed output bundle after output-bundle error: {cleanup_err}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("dropping output-bundle setup after output-bundle error: {err}");
+                    }
+                }
+            }
+            return (
+                materialize_items(material.detached_prefix_items.clone()),
+                None,
+            );
+        };
+
+        let contents = if material.detached_prefix_items.is_empty() {
+            Vec::new()
+        } else {
+            match render_active_bundle_contents(
+                &mut self.output_store,
+                &mut active,
+                &material.detached_prefix_items,
+                &material.detached_prefix_items,
+                &material.detached_prefix_worker_text,
+            ) {
+                Ok(contents) => contents,
+                Err(err) => {
+                    eprintln!("dropping timeout bundle content after output-bundle error: {err}");
+                    materialize_items(material.detached_prefix_items.clone())
+                }
+            }
+        };
+        let protected_bundle_id = active.was_disclosed().then_some(active.id);
+        if let Err(err) = self.finish_bundle(active) {
+            eprintln!("dropping closed timeout bundle after output-bundle error: {err}");
+        }
+        (contents, protected_bundle_id)
     }
 }
 
@@ -1392,6 +1402,40 @@ fn compact_output_without_bundle_items(items: &[ReplyItem]) -> Vec<Content> {
     out
 }
 
+fn render_active_bundle_contents(
+    output_store: &mut OutputStore,
+    active: &mut ActiveOutputBundle,
+    bundle_items: &[ReplyItem],
+    inline_items: &[ReplyItem],
+    worker_text: &str,
+) -> Result<Vec<Content>, WorkerError> {
+    let append = active.append_items(output_store, bundle_items)?;
+    let retained_worker_text = worker_text_from_items(&append.retained_items);
+
+    if append.omitted_this_reply {
+        active.disclosed = true;
+        Ok(compact_text_bundle_items(
+            append.retained_items.clone(),
+            &retained_worker_text,
+            active,
+        ))
+    } else if active.next_image_number > 0
+        && should_use_output_bundle(active.history_image_count, worker_text.chars().count())
+    {
+        active.disclosed = true;
+        Ok(compact_output_bundle_items(&append.retained_items, active))
+    } else if text_should_spill(worker_text.chars().count()) {
+        active.disclosed = true;
+        Ok(compact_text_bundle_items(
+            append.retained_items.clone(),
+            &retained_worker_text,
+            active,
+        ))
+    } else {
+        Ok(materialize_items(inline_items.to_vec()))
+    }
+}
+
 fn compact_without_output_bundle(material: &ReplyMaterial) -> Vec<Content> {
     if material.bundle_image_count > 0
         && should_use_output_bundle(
@@ -1402,6 +1446,55 @@ fn compact_without_output_bundle(material: &ReplyMaterial) -> Vec<Content> {
         return compact_output_without_bundle_items(&material.inline_items);
     }
     compact_text_without_bundle_items(material.inline_items.clone(), &material.worker_text)
+}
+
+fn compact_reply_without_output_bundle(material: &ReplyMaterial) -> Vec<Content> {
+    let reply_image_count = count_images(&material.reply_bundle_items);
+    if reply_image_count > 0
+        && should_use_output_bundle(
+            reply_image_count,
+            material.reply_worker_text.chars().count(),
+        )
+    {
+        return compact_output_without_bundle_items(&material.reply_inline_items);
+    }
+    compact_text_without_bundle_items(
+        material.reply_inline_items.clone(),
+        &material.reply_worker_text,
+    )
+}
+
+fn render_reply_items(
+    output_store: &mut OutputStore,
+    reply_bundle_items: &[ReplyItem],
+    reply_inline_items: &[ReplyItem],
+    reply_worker_text: &str,
+    protected_bundle_id: Option<u64>,
+) -> Vec<Content> {
+    let reply_image_count = count_images(reply_bundle_items);
+    if reply_image_count > 0
+        && should_use_output_bundle(reply_image_count, reply_worker_text.chars().count())
+    {
+        return compact_reply_items_with_new_bundle(
+            output_store,
+            reply_bundle_items,
+            reply_inline_items,
+            reply_worker_text,
+            false,
+            protected_bundle_id,
+        );
+    }
+    if text_should_spill(reply_worker_text.chars().count()) {
+        return compact_reply_items_with_new_bundle(
+            output_store,
+            reply_bundle_items,
+            reply_inline_items,
+            reply_worker_text,
+            true,
+            protected_bundle_id,
+        );
+    }
+    materialize_items(reply_inline_items.to_vec())
 }
 
 fn compact_reply_items_with_new_bundle(
@@ -2179,6 +2272,77 @@ mod tests {
         assert!(
             !follow_up_transcript.contains("TAIL\n"),
             "did not expect the detached timeout tail in the fresh follow-up bundle: {follow_up_transcript:?}"
+        );
+    }
+
+    #[test]
+    fn timed_out_follow_up_reply_gets_its_own_active_bundle() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let mut bundle = state
+            .output_store
+            .new_bundle()
+            .expect("timeout bundle should initialize");
+        bundle
+            .append_worker_text(&mut state.output_store, "HEAD\n")
+            .expect("existing timeout text should append");
+        bundle.disclosed = true;
+        let timeout_transcript_path = bundle.paths.transcript.clone();
+        state.active_timeout_bundle = Some(bundle);
+
+        let large_follow_up = format!(
+            "FOLLOW_UP_START\n{}\nFOLLOW_UP_END\n",
+            "q".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200)
+        );
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout("TAIL\n"),
+                    WorkerContent::worker_stdout(large_follow_up.clone()),
+                ],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::FollowUpInput,
+            1,
+        );
+
+        let text = result_text(&result);
+        let follow_up_transcript_path = disclosed_path(&text, "transcript.txt")
+            .unwrap_or_else(|| panic!("expected timed-out follow-up bundle path, got: {text:?}"));
+        let timeout_transcript = fs::read_to_string(&timeout_transcript_path)
+            .unwrap_or_else(|err| panic!("expected timeout transcript to be readable: {err}"));
+        let follow_up_transcript = fs::read_to_string(&follow_up_transcript_path)
+            .unwrap_or_else(|err| panic!("expected follow-up transcript to be readable: {err}"));
+        let active_transcript_path = state
+            .active_timeout_bundle
+            .as_ref()
+            .map(|active| active.paths.transcript.clone())
+            .expect("expected timed-out follow-up to install a new active timeout bundle");
+
+        assert_ne!(
+            follow_up_transcript_path, timeout_transcript_path,
+            "expected the timed-out follow-up reply to use a new bundle path"
+        );
+        assert_eq!(
+            active_transcript_path, follow_up_transcript_path,
+            "expected the fresh follow-up turn to own the active timeout bundle"
+        );
+        assert!(
+            timeout_transcript.contains("HEAD\nTAIL\n"),
+            "expected detached timeout tail to stay on the previous timeout bundle path, got: {timeout_transcript:?}"
+        );
+        assert!(
+            !timeout_transcript.contains("FOLLOW_UP_START"),
+            "did not expect fresh follow-up output on the previous timeout bundle path: {timeout_transcript:?}"
+        );
+        assert!(
+            follow_up_transcript.contains("FOLLOW_UP_START")
+                && follow_up_transcript.contains("FOLLOW_UP_END"),
+            "expected fresh follow-up output in the new timeout bundle, got: {follow_up_transcript:?}"
+        );
+        assert!(
+            !follow_up_transcript.contains("TAIL\n"),
+            "did not expect detached timeout tail in the fresh follow-up bundle: {follow_up_transcript:?}"
         );
     }
 
