@@ -2,6 +2,7 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::RawContent;
+use std::path::PathBuf;
 use tokio::time::{Duration, Instant, sleep};
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
@@ -14,6 +15,16 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn bundle_transcript_path(text: &str) -> Option<PathBuf> {
+    let end = text
+        .find("transcript.txt")?
+        .saturating_add("transcript.txt".len());
+    let start = text[..end]
+        .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '[' | '('))
+        .map_or(0, |idx| idx.saturating_add(1));
+    Some(PathBuf::from(&text[start..end]))
 }
 
 fn require_python() -> bool {
@@ -229,6 +240,72 @@ async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
     }
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_detached_idle_output_does_not_bundle_follow_up_reply() -> TestResult<()> {
+    let Some(mut session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let setup = session
+        .write_stdin_raw_with(
+            r#"import os, sys, time
+pid = os.fork()
+if pid == 0:
+    time.sleep(0.3)
+    for i in range(160):
+        sys.stdout.write(f"IDLE_{i:03d} {'x' * 80}\n")
+    sys.stdout.flush()
+    os._exit(0)
+print("parent ready")
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let setup_text = result_text(&setup);
+    if is_busy_response(&setup_text) {
+        eprintln!("python detached-idle setup remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        setup_text.contains("parent ready"),
+        "expected detached-idle setup reply, got: {setup_text:?}"
+    );
+
+    sleep(Duration::from_millis(1500)).await;
+    let follow_up = session
+        .write_stdin_raw_with("print('FOLLOWUP_OK')", Some(5.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    if is_busy_response(&follow_up_text) {
+        eprintln!("python detached-idle follow-up remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let transcript_path = bundle_transcript_path(&follow_up_text).unwrap_or_else(|| {
+        panic!("expected detached idle output to disclose transcript path, got: {follow_up_text:?}")
+    });
+    let transcript = std::fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("FOLLOWUP_OK"),
+        "expected follow-up output inline, got: {follow_up_text:?}"
+    );
+    assert!(
+        transcript.contains("IDLE_000"),
+        "expected detached idle output in transcript bundle, got: {transcript:?}"
+    );
+    assert!(
+        !transcript.contains("FOLLOWUP_OK"),
+        "did not expect follow-up output to be bundled with detached idle output: {transcript:?}"
+    );
+
     Ok(())
 }
 

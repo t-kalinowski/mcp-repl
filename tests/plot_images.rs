@@ -189,6 +189,10 @@ fn extract_images(result: &CallToolResult) -> Vec<ImageData> {
         .collect()
 }
 
+fn text_occurrences(text: &str, needle: &str) -> usize {
+    text.match_indices(needle).count()
+}
+
 fn parse_text_event_rows(events: &str) -> Vec<TextEventRow> {
     events
         .lines()
@@ -1007,6 +1011,71 @@ for (i in 1:2) {{
     );
     assert!(
         transcript.contains("OVER_START") && transcript.contains("OVER_END"),
+        "expected transcript.txt to contain the over-grace worker text, got: {transcript:?}"
+    );
+
+    session.cancel().await?;
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn single_image_over_grace_text_does_not_duplicate_pre_image_preview() -> TestResult<()> {
+    let mut session = spawn_server().await?;
+
+    let input = format!(
+        r#"
+cat("PRE_UNIQUE_START\n")
+cat(paste(rep("p", 240), collapse = ""))
+cat("\nPRE_UNIQUE_END\n")
+plot(1:10, main = "single-plot")
+big <- paste(rep("v", {OVER_HARD_SPILL_TEXT_LEN}), collapse = "")
+cat("POST_START\n")
+cat(big)
+cat("\nPOST_END\n")
+"#
+    );
+    let result = session.write_stdin_raw_with(&input, Some(60.0)).await?;
+    if any_backend_unavailable(&[&result]) {
+        eprintln!("plot_images backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    assert_ne!(
+        result.is_error,
+        Some(true),
+        "single-image output bundle reported an error: {}",
+        result_text(&result)
+    );
+
+    let text = result_text(&result);
+    let images = extract_images(&result);
+    let events_log = events_log_path(&text).unwrap_or_else(|| {
+        panic!("expected output bundle events.log path in single-image reply, got: {text:?}")
+    });
+    let bundle_dir = events_log
+        .parent()
+        .unwrap_or_else(|| panic!("events.log missing parent: {events_log:?}"));
+    let transcript = fs::read_to_string(bundle_dir.join("transcript.txt"))?;
+
+    assert_eq!(
+        images.len(),
+        1,
+        "expected single-image reply to keep exactly one inline image"
+    );
+    assert_eq!(
+        text_occurrences(&text, "\nPRE_UNIQUE_START\n"),
+        1,
+        "did not expect duplicated pre-image preview text, got: {text:?}"
+    );
+    assert_eq!(
+        text_occurrences(&text, "\nPRE_UNIQUE_END\n"),
+        1,
+        "did not expect duplicated pre-image preview tail, got: {text:?}"
+    );
+    assert!(
+        transcript.contains("POST_START") && transcript.contains("POST_END"),
         "expected transcript.txt to contain the over-grace worker text, got: {transcript:?}"
     );
 

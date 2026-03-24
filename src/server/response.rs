@@ -106,6 +106,11 @@ struct ReplyMaterial {
     inline_items: Vec<ReplyItem>,
     bundle_items: Vec<ReplyItem>,
     worker_text: String,
+    detached_prefix_items: Vec<ReplyItem>,
+    detached_prefix_worker_text: String,
+    reply_inline_items: Vec<ReplyItem>,
+    reply_bundle_items: Vec<ReplyItem>,
+    reply_worker_text: String,
     is_error: bool,
     error_code: Option<WorkerErrorCode>,
     bundle_image_count: usize,
@@ -131,11 +136,15 @@ impl ResponseState {
         result: Result<WorkerReply, WorkerError>,
         pending_request_after: bool,
         reuse_active_timeout_bundle: bool,
+        detached_prefix_item_count: usize,
     ) -> CallToolResult {
         match result {
-            Ok(reply) => {
-                self.finalize_reply(reply, pending_request_after, reuse_active_timeout_bundle)
-            }
+            Ok(reply) => self.finalize_reply(
+                reply,
+                pending_request_after,
+                reuse_active_timeout_bundle,
+                detached_prefix_item_count,
+            ),
             Err(err) => {
                 eprintln!("worker write stdin error: {err}");
                 if let Some(active) = self.active_timeout_bundle.take()
@@ -157,8 +166,9 @@ impl ResponseState {
         reply: WorkerReply,
         pending_request_after: bool,
         reuse_active_timeout_bundle: bool,
+        detached_prefix_item_count: usize,
     ) -> CallToolResult {
-        let material = prepare_reply_material(reply);
+        let material = prepare_reply_material(reply, detached_prefix_item_count);
         let mut active_timeout_bundle = self.active_timeout_bundle.take();
         if !reuse_active_timeout_bundle
             && let Some(active) = active_timeout_bundle.take()
@@ -221,6 +231,41 @@ impl ResponseState {
                             "dropping closed timeout bundle after output-bundle error: {err}"
                         );
                     }
+                    compact_without_output_bundle(&material)
+                }
+            }
+        } else if should_spill_detached_prefix_only(&material) {
+            match self.output_store.new_bundle() {
+                Ok(mut bundle) => {
+                    match bundle
+                        .append_items(&mut self.output_store, &material.detached_prefix_items)
+                    {
+                        Ok(append) => {
+                            let retained_worker_text =
+                                worker_text_from_items(&append.retained_items);
+                            let mut contents = compact_text_bundle_items(
+                                append.retained_items,
+                                &retained_worker_text,
+                                &bundle,
+                            );
+                            contents.extend(materialize_items(material.reply_inline_items.clone()));
+                            contents
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "dropping detached idle bundle after output-bundle error: {err}"
+                            );
+                            if let Err(cleanup_err) = self.finish_bundle(bundle) {
+                                eprintln!(
+                                    "dropping closed output bundle after output-bundle error: {cleanup_err}"
+                                );
+                            }
+                            compact_without_output_bundle(&material)
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("dropping output-bundle setup after output-bundle error: {err}");
                     compact_without_output_bundle(&material)
                 }
             }
@@ -923,7 +968,7 @@ fn omission_event_line_len() -> usize {
 
 /// Normalizes one worker reply into renderable items while preserving the split between
 /// worker-originated transcript text and inline-only server notices.
-fn prepare_reply_material(reply: WorkerReply) -> ReplyMaterial {
+fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize) -> ReplyMaterial {
     let (contents, is_error, error_code) = match reply {
         WorkerReply::Output {
             contents,
@@ -936,8 +981,13 @@ fn prepare_reply_material(reply: WorkerReply) -> ReplyMaterial {
 
     let mut bundle_items = Vec::with_capacity(contents.len());
     let mut worker_text = String::new();
+    let mut detached_prefix_items = Vec::new();
+    let mut detached_prefix_worker_text = String::new();
+    let mut reply_bundle_items = Vec::new();
+    let mut reply_worker_text = String::new();
 
-    for content in contents {
+    for (index, content) in contents.into_iter().enumerate() {
+        let is_detached_prefix = index < detached_prefix_item_count;
         match content {
             WorkerContent::ContentText { text, origin, .. } => {
                 let text = if matches!(origin, ContentOrigin::Worker) {
@@ -948,34 +998,59 @@ fn prepare_reply_material(reply: WorkerReply) -> ReplyMaterial {
                 if text.is_empty() {
                     continue;
                 }
-                match origin {
+                let item = match origin {
                     ContentOrigin::Worker => {
                         worker_text.push_str(&text);
-                        bundle_items.push(ReplyItem::WorkerText(text));
+                        if is_detached_prefix {
+                            detached_prefix_worker_text.push_str(&text);
+                        } else {
+                            reply_worker_text.push_str(&text);
+                        }
+                        ReplyItem::WorkerText(text)
                     }
-                    ContentOrigin::Server => bundle_items.push(ReplyItem::ServerText(text)),
+                    ContentOrigin::Server => ReplyItem::ServerText(text),
+                };
+                if is_detached_prefix {
+                    detached_prefix_items.push(item.clone());
+                } else {
+                    reply_bundle_items.push(item.clone());
                 }
+                bundle_items.push(item);
             }
             WorkerContent::ContentImage {
                 data,
                 mime_type,
                 id: _,
                 is_new,
-            } => bundle_items.push(ReplyItem::Image(ReplyImage {
-                data,
-                mime_type,
-                is_new,
-            })),
+            } => {
+                let item = ReplyItem::Image(ReplyImage {
+                    data,
+                    mime_type,
+                    is_new,
+                });
+                if is_detached_prefix {
+                    detached_prefix_items.push(item.clone());
+                } else {
+                    reply_bundle_items.push(item.clone());
+                }
+                bundle_items.push(item);
+            }
         }
     }
 
     let inline_items = collapse_image_updates(bundle_items.clone());
+    let reply_inline_items = collapse_image_updates(reply_bundle_items.clone());
     let bundle_image_count = count_images(&bundle_items);
 
     ReplyMaterial {
         inline_items,
         bundle_items,
         worker_text,
+        detached_prefix_items,
+        detached_prefix_worker_text,
+        reply_inline_items,
+        reply_bundle_items,
+        reply_worker_text,
         is_error,
         error_code,
         bundle_image_count,
@@ -1091,7 +1166,7 @@ fn compact_output_bundle_items(items: &[ReplyItem], bundle: &ActiveOutputBundle)
         HEAD_TEXT_BUDGET,
     );
     if !head_text.is_empty() {
-        out.push(Content::text(head_text));
+        out.push(Content::text(head_text.clone()));
     }
     if let Some(image) = first_anchor {
         out.push(image);
@@ -1100,7 +1175,16 @@ fn compact_output_bundle_items(items: &[ReplyItem], bundle: &ActiveOutputBundle)
         bundle,
         displayed_anchor_count,
     )));
-    let pre_last_text = collect_suffix_text_before(items, last_image_idx, PRE_LAST_TEXT_BUDGET);
+    let pre_last_text = if last_image_idx == first_image_idx {
+        collect_non_overlapping_suffix_text_before(
+            items,
+            last_image_idx,
+            &head_text,
+            PRE_LAST_TEXT_BUDGET,
+        )
+    } else {
+        collect_suffix_text_before(items, last_image_idx, PRE_LAST_TEXT_BUDGET)
+    };
     if !pre_last_text.is_empty() {
         out.push(Content::text(pre_last_text));
     }
@@ -1129,7 +1213,7 @@ fn compact_output_without_bundle_items(items: &[ReplyItem]) -> Vec<Content> {
         HEAD_TEXT_BUDGET,
     );
     if !head_text.is_empty() {
-        out.push(Content::text(head_text));
+        out.push(Content::text(head_text.clone()));
     }
     if let Some(index) = first_image_idx
         && let ReplyItem::Image(image) = &items[index]
@@ -1139,7 +1223,16 @@ fn compact_output_without_bundle_items(items: &[ReplyItem]) -> Vec<Content> {
     out.push(Content::text(build_output_bundle_unavailable_notice(
         count_images(items),
     )));
-    let pre_last_text = collect_suffix_text_before(items, last_image_idx, PRE_LAST_TEXT_BUDGET);
+    let pre_last_text = if last_image_idx == first_image_idx {
+        collect_non_overlapping_suffix_text_before(
+            items,
+            last_image_idx,
+            &head_text,
+            PRE_LAST_TEXT_BUDGET,
+        )
+    } else {
+        collect_suffix_text_before(items, last_image_idx, PRE_LAST_TEXT_BUDGET)
+    };
     if !pre_last_text.is_empty() {
         out.push(Content::text(pre_last_text));
     }
@@ -1166,6 +1259,16 @@ fn compact_without_output_bundle(material: &ReplyMaterial) -> Vec<Content> {
         return compact_output_without_bundle_items(&material.inline_items);
     }
     compact_text_without_bundle_items(material.inline_items.clone(), &material.worker_text)
+}
+
+fn should_spill_detached_prefix_only(material: &ReplyMaterial) -> bool {
+    !material.detached_prefix_items.is_empty()
+        && count_images(&material.detached_prefix_items) == 0
+        && text_should_spill(material.detached_prefix_worker_text.chars().count())
+        && !should_use_output_bundle(
+            count_images(&material.reply_bundle_items),
+            material.reply_worker_text.chars().count(),
+        )
 }
 
 fn should_use_output_bundle(image_count: usize, worker_text_chars: usize) -> bool {
@@ -1265,6 +1368,29 @@ fn collect_suffix_text_before(items: &[ReplyItem], index: Option<usize>, budget:
     parts.concat()
 }
 
+fn collect_non_overlapping_suffix_text_before(
+    items: &[ReplyItem],
+    index: Option<usize>,
+    head_text: &str,
+    budget: usize,
+) -> String {
+    let tail_text = collect_suffix_text_before(items, index, budget);
+    let Some(index) = index else {
+        return tail_text;
+    };
+    let total_chars = items[..index]
+        .iter()
+        .filter_map(item_text)
+        .map(|text| text.chars().count())
+        .sum::<usize>();
+    let overlap = head_text
+        .chars()
+        .count()
+        .saturating_add(tail_text.chars().count())
+        .saturating_sub(total_chars);
+    drop_prefix_chars(&tail_text, overlap)
+}
+
 fn collect_prefix_text_after(items: &[ReplyItem], index: Option<usize>, budget: usize) -> String {
     let Some(index) = index else {
         return String::new();
@@ -1278,6 +1404,13 @@ fn item_text(item: &ReplyItem) -> Option<&str> {
         ReplyItem::WorkerText(text) | ReplyItem::ServerText(text) => Some(text),
         ReplyItem::Image(_) => None,
     }
+}
+
+fn drop_prefix_chars(text: &str, count: usize) -> String {
+    if count == 0 {
+        return text.to_string();
+    }
+    text.chars().skip(count).collect()
 }
 
 fn push_prefix_text(out: &mut String, text: &str, budget: usize) {
@@ -1569,6 +1702,7 @@ mod tests {
     use base64::Engine as _;
     use std::fs;
     use std::io;
+    use std::path::PathBuf;
 
     use rmcp::model::RawContent;
     use tempfile::Builder;
@@ -1586,6 +1720,14 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn disclosed_path(text: &str, suffix: &str) -> Option<PathBuf> {
+        let end = text.find(suffix)?.saturating_add(suffix.len());
+        let start = text[..end]
+            .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '[' | '('))
+            .map_or(0, |idx| idx.saturating_add(1));
+        Some(PathBuf::from(&text[start..end]))
     }
 
     fn fail_output_store_root_creation() -> io::Result<tempfile::TempDir> {
@@ -1659,6 +1801,47 @@ mod tests {
     }
 
     #[test]
+    fn detached_prefix_spills_without_swallowing_follow_up_reply() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let detached_prefix = format!(
+            "IDLE_START\n{}\nIDLE_END\n",
+            "x".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200)
+        );
+        let follow_up = "FOLLOWUP_OK\n".to_string();
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout(detached_prefix),
+                    WorkerContent::worker_stdout(follow_up.clone()),
+                ],
+                None,
+            )),
+            false,
+            false,
+            1,
+        );
+
+        let text = result_text(&result);
+        let transcript_path = disclosed_path(&text, "transcript.txt")
+            .unwrap_or_else(|| panic!("expected detached prefix transcript path, got: {text:?}"));
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected transcript to be readable: {err}"));
+
+        assert!(
+            text.contains(&follow_up),
+            "expected follow-up reply inline, got: {text:?}"
+        );
+        assert!(
+            transcript.contains("IDLE_START") && transcript.contains("IDLE_END"),
+            "expected detached prefix transcript content, got: {transcript:?}"
+        );
+        assert!(
+            !transcript.contains("FOLLOWUP_OK"),
+            "did not expect follow-up reply to be appended to detached prefix bundle: {transcript:?}"
+        );
+    }
+
+    #[test]
     fn output_bundle_setup_failure_returns_pathless_truncated_reply() {
         let mut state = ResponseState::new().expect("response state should initialize");
         state.output_store.create_root = fail_output_store_root_creation;
@@ -1677,6 +1860,7 @@ mod tests {
             }),
             false,
             false,
+            0,
         );
 
         let text = result_text(&result);
@@ -1710,6 +1894,7 @@ mod tests {
             )),
             false,
             true,
+            0,
         );
 
         let text = result_text(&result);
@@ -1747,6 +1932,7 @@ mod tests {
             )),
             false,
             false,
+            0,
         );
 
         let text = result_text(&result);
@@ -1772,7 +1958,8 @@ mod tests {
             })
             .collect();
 
-        let result = state.finalize_worker_result(Ok(worker_reply(contents, None)), false, false);
+        let result =
+            state.finalize_worker_result(Ok(worker_reply(contents, None)), false, false, 0);
 
         let text = result_text(&result);
         assert!(
@@ -1867,6 +2054,7 @@ mod tests {
             )),
             false,
             true,
+            0,
         );
 
         let text = result_text(&result);

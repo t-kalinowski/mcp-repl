@@ -438,6 +438,7 @@ pub struct WorkerManager {
     pending_request: bool,
     pending_request_started_at: Option<std::time::Instant>,
     session_end_seen: bool,
+    last_detached_prefix_item_count: usize,
     last_prompt: Option<String>,
     last_spawn: Option<std::time::Instant>,
     spawn_count: u64,
@@ -496,6 +497,7 @@ impl WorkerManager {
             pending_request: false,
             pending_request_started_at: None,
             session_end_seen: false,
+            last_detached_prefix_item_count: 0,
             last_prompt: None,
             last_spawn: None,
             spawn_count: 0,
@@ -518,6 +520,10 @@ impl WorkerManager {
         self.pending_request
     }
 
+    pub fn detached_prefix_item_count(&self) -> usize {
+        self.last_detached_prefix_item_count
+    }
+
     /// Entry point for the public `repl` tool.
     /// This handles control prefixes, timeout-follow-up polling, and busy rejection before new input is sent.
     pub fn write_stdin(
@@ -528,6 +534,7 @@ impl WorkerManager {
         _page_bytes_override: Option<u64>,
         _echo_input: bool,
     ) -> Result<WorkerReply, WorkerError> {
+        self.last_detached_prefix_item_count = 0;
         if let Some((control, remaining)) = split_write_stdin_control_prefix(&text) {
             self.clear_guardrail_busy_event();
             let control_reply = match control {
@@ -754,6 +761,7 @@ impl WorkerManager {
         err: &WorkerError,
         context: InputContext,
     ) -> ReplyWithOffset {
+        self.last_detached_prefix_item_count = context.prefix_contents.len();
         let mut contents = context.prefix_contents;
         let formatted = self.drain_final_formatted_output();
         contents.extend(formatted.contents);
@@ -774,6 +782,7 @@ impl WorkerManager {
         request: RequestState,
         context: InputContext,
     ) -> Result<ReplyWithOffset, WorkerError> {
+        self.last_detached_prefix_item_count = context.prefix_contents.len();
         match self.wait_for_request_completion(request.timeout) {
             Ok(completion) => {
                 let mut session_end = completion.session_end_seen;
@@ -1245,6 +1254,7 @@ impl WorkerManager {
         self.pending_request = false;
         self.pending_request_started_at = None;
         self.session_end_seen = false;
+        self.last_detached_prefix_item_count = 0;
         self.last_prompt = None;
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }

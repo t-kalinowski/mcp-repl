@@ -736,6 +736,68 @@ async fn timeout_bundle_stops_before_ctrl_d_restart_output() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn timeout_bundle_stops_before_fresh_follow_up_output() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let input = "big <- paste(rep('n', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.2); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(0.2); cat('tail\\n')";
+    let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    sleep(Duration::from_millis(260)).await;
+    let spilled = session
+        .write_stdin_raw_unterminated_with("", Some(0.1))
+        .await?;
+    let spilled_text = result_text(&spilled);
+    let transcript_path = match bundle_transcript_path(&spilled_text) {
+        Some(path) => path,
+        None if spilled_text.contains("<<console status: busy") => {
+            eprintln!("write_stdin_behavior spill poll remained busy; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+        None => {
+            panic!("expected transcript path in oversized timeout poll, got: {spilled_text:?}")
+        }
+    };
+    let transcript_before = fs::read_to_string(&transcript_path)?;
+
+    sleep(Duration::from_millis(260)).await;
+    let follow_up = session
+        .write_stdin_raw_with("cat('NEW_TURN\\n')", Some(2.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    if follow_up_text.contains("<<console status: busy") {
+        eprintln!("write_stdin_behavior fresh follow-up remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let transcript_after = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("NEW_TURN"),
+        "expected fresh follow-up output inline, got: {follow_up_text:?}"
+    );
+    assert!(
+        !transcript_after.contains("NEW_TURN"),
+        "did not expect fresh follow-up output to append to prior timeout bundle: {transcript_after:?}"
+    );
+    assert!(
+        transcript_after.contains(&transcript_before),
+        "expected original timeout bundle contents to remain intact"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn output_bundle_prunes_oldest_inactive_bundle_when_count_limit_exceeded() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session_with_env_vars(vec![

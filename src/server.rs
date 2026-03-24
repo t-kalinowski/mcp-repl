@@ -85,16 +85,18 @@ impl SharedServer {
     ) -> Result<CallToolResult, McpError> {
         let worker_timeout = apply_tool_call_margin(timeout);
         let server_timeout = apply_safety_margin(timeout);
-        let reuse_active_timeout_bundle = !matches!(input.chars().next(), Some('\u{3}' | '\u{4}'));
         self.run_state(move |state| {
+            let reuse_active_timeout_bundle = should_reuse_timeout_bundle(&input);
             let result =
                 state
                     .worker
                     .write_stdin(input, worker_timeout, server_timeout, None, false);
+            let detached_prefix_item_count = state.worker.detached_prefix_item_count();
             state.response.finalize_worker_result(
                 result,
                 state.worker.pending_request(),
                 reuse_active_timeout_bundle,
+                detached_prefix_item_count,
             )
         })
         .await
@@ -243,6 +245,13 @@ impl SharedServer {
     }
 }
 
+fn should_reuse_timeout_bundle(input: &str) -> bool {
+    if matches!(input.chars().next(), Some('\u{3}' | '\u{4}')) {
+        return false;
+    }
+    input.is_empty() || input.chars().all(|ch| matches!(ch, '\r' | '\n'))
+}
+
 fn server_info() -> ServerInfo {
     ServerInfo::new(
         ServerCapabilities::builder()
@@ -362,6 +371,7 @@ macro_rules! define_backend_tool_server {
                             result,
                             state.worker.pending_request(),
                             false,
+                            0,
                         )
                     })
                     .await?;
