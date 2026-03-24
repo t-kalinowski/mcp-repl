@@ -416,6 +416,7 @@ impl ResponseState {
                             .append_items(&mut self.output_store, &material.detached_prefix_items)
                         {
                             Ok(append) => {
+                                bundle.disclosed = true;
                                 let retained_worker_text =
                                     worker_text_from_items(&append.retained_items);
                                 let contents = compact_text_bundle_items(
@@ -423,7 +424,7 @@ impl ResponseState {
                                     &retained_worker_text,
                                     &bundle,
                                 );
-                                return (contents, None);
+                                return (contents, Some(bundle.id));
                             }
                             Err(err) => {
                                 eprintln!(
@@ -2343,6 +2344,44 @@ mod tests {
         assert!(
             !follow_up_transcript.contains("TAIL\n"),
             "did not expect detached timeout tail in the fresh follow-up bundle: {follow_up_transcript:?}"
+        );
+    }
+
+    #[test]
+    fn disclosed_detached_prefix_bundle_survives_timeout_follow_up_quota_pressure() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        state.output_store.limits.max_bundle_count = 1;
+        let detached_prefix = format!(
+            "IDLE_START\n{}\nIDLE_END\n",
+            "d".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200)
+        );
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout(detached_prefix),
+                    WorkerContent::worker_stdout("FOLLOW_UP_TIMEOUT\n"),
+                ],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::FollowUpInput,
+            1,
+        );
+
+        let text = result_text(&result);
+        let transcript_path = disclosed_path(&text, "transcript.txt")
+            .unwrap_or_else(|| panic!("expected detached-prefix transcript path, got: {text:?}"));
+        let transcript = fs::read_to_string(&transcript_path).unwrap_or_else(|err| {
+            panic!("expected disclosed detached-prefix path to stay readable: {err}")
+        });
+
+        assert!(
+            transcript.contains("IDLE_START") && transcript.contains("IDLE_END"),
+            "expected detached-prefix transcript to survive same-reply timeout allocation, got: {transcript:?}"
+        );
+        assert!(
+            !transcript.contains("FOLLOW_UP_TIMEOUT"),
+            "did not expect fresh follow-up output in detached-prefix transcript: {transcript:?}"
         );
     }
 

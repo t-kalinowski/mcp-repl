@@ -14,8 +14,14 @@ struct PendingOutputTapeInner {
     next_seq: u64,
     progress_seq: u64,
     events: VecDeque<PendingOutputEvent>,
-    stdout_tail: Vec<u8>,
-    stderr_tail: Vec<u8>,
+    stdout_tail: PendingTextTail,
+    stderr_tail: PendingTextTail,
+}
+
+#[derive(Default)]
+struct PendingTextTail {
+    bytes: Vec<u8>,
+    origin: Option<ContentOrigin>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -191,8 +197,18 @@ impl PendingOutputTape {
             .expect("pending output tape mutex poisoned");
         note_progress(&mut guard);
         flush_tail(&mut guard, other_stream(stream), false);
-        tail_mut(&mut guard, stream).extend_from_slice(bytes);
-        commit_complete_lines(&mut guard, stream, origin);
+        if tail_mut(&mut guard, stream)
+            .origin
+            .is_some_and(|tail_origin| tail_origin != origin)
+        {
+            flush_tail(&mut guard, stream, false);
+        }
+        let tail = tail_mut(&mut guard, stream);
+        if tail.origin.is_none() {
+            tail.origin = Some(origin);
+        }
+        tail.bytes.extend_from_slice(bytes);
+        commit_complete_lines(&mut guard, stream);
     }
 }
 
@@ -338,7 +354,7 @@ fn other_stream(stream: TextStream) -> TextStream {
     }
 }
 
-fn tail_mut(inner: &mut PendingOutputTapeInner, stream: TextStream) -> &mut Vec<u8> {
+fn tail_mut(inner: &mut PendingOutputTapeInner, stream: TextStream) -> &mut PendingTextTail {
     match stream {
         TextStream::Stdout => &mut inner.stdout_tail,
         TextStream::Stderr => &mut inner.stderr_tail,
@@ -364,18 +380,22 @@ fn append_complete_bytes(
     });
 }
 
-fn commit_complete_lines(
-    inner: &mut PendingOutputTapeInner,
-    stream: TextStream,
-    origin: ContentOrigin,
-) {
+fn commit_complete_lines(inner: &mut PendingOutputTapeInner, stream: TextStream) {
     loop {
-        let line = {
+        let (origin, line, tail_empty) = {
             let tail = tail_mut(inner, stream);
-            let Some(newline_idx) = tail.iter().position(|byte| *byte == b'\n') else {
+            let Some(newline_idx) = tail.bytes.iter().position(|byte| *byte == b'\n') else {
                 break;
             };
-            tail.drain(..=newline_idx).collect::<Vec<u8>>()
+            let origin = tail
+                .origin
+                .expect("text tail should record origin while bytes are buffered");
+            let line = tail.bytes.drain(..=newline_idx).collect::<Vec<u8>>();
+            let tail_empty = tail.bytes.is_empty();
+            if tail_empty {
+                tail.origin = None;
+            }
+            (origin, line, tail_empty)
         };
         let seq = next_seq(inner);
         inner.events.push_back(PendingOutputEvent::TextFragment {
@@ -385,29 +405,39 @@ fn commit_complete_lines(
             bytes: line,
             terminated: true,
         });
+        if tail_empty {
+            break;
+        }
     }
 }
 
 fn flush_tail(inner: &mut PendingOutputTapeInner, stream: TextStream, flush_incomplete: bool) {
-    let bytes = {
+    let (origin, bytes) = {
         let tail = tail_mut(inner, stream);
-        if tail.is_empty() {
+        if tail.bytes.is_empty() {
             return;
         }
-        let mut flush_len = flushable_prefix_len(tail);
+        let mut flush_len = flushable_prefix_len(&tail.bytes);
         if flush_incomplete && flush_len == 0 {
-            flush_len = tail.len();
+            flush_len = tail.bytes.len();
         }
         if flush_len == 0 {
             return;
         }
-        tail.drain(..flush_len).collect::<Vec<u8>>()
+        let origin = tail
+            .origin
+            .expect("text tail should record origin while bytes are buffered");
+        let bytes = tail.bytes.drain(..flush_len).collect::<Vec<u8>>();
+        if tail.bytes.is_empty() {
+            tail.origin = None;
+        }
+        (origin, bytes)
     };
     let seq = next_seq(inner);
     inner.events.push_back(PendingOutputEvent::TextFragment {
         seq,
         stream,
-        origin: ContentOrigin::Worker,
+        origin,
         bytes,
         terminated: false,
     });
@@ -420,8 +450,8 @@ fn last_text_fragment_bytes(events: &VecDeque<PendingOutputEvent>) -> Option<&[u
     }
 }
 
-fn tail_has_flushable_bytes(bytes: &[u8]) -> bool {
-    flushable_prefix_len(bytes) > 0
+fn tail_has_flushable_bytes(tail: &PendingTextTail) -> bool {
+    flushable_prefix_len(&tail.bytes) > 0
 }
 
 fn flushable_prefix_len(bytes: &[u8]) -> usize {
@@ -580,6 +610,34 @@ mod tests {
                 stream: TextStream::Stderr,
                 origin: ContentOrigin::Server,
             }]
+        );
+    }
+
+    #[test]
+    fn buffered_server_stderr_tail_preserves_server_origin_when_flushed() {
+        let tape = PendingOutputTape::new();
+        tape.append_server_stderr_bytes(b"[repl] guardrail");
+        tape.append_stdout_bytes(b"ok\n");
+
+        let snapshot = tape.drain_snapshot();
+        assert_eq!(
+            snapshot.events,
+            vec![
+                PendingOutputEvent::TextFragment {
+                    seq: 0,
+                    stream: TextStream::Stderr,
+                    origin: ContentOrigin::Server,
+                    bytes: b"[repl] guardrail".to_vec(),
+                    terminated: false,
+                },
+                PendingOutputEvent::TextFragment {
+                    seq: 1,
+                    stream: TextStream::Stdout,
+                    origin: ContentOrigin::Worker,
+                    bytes: b"ok\n".to_vec(),
+                    terminated: true,
+                },
+            ]
         );
     }
 
