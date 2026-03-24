@@ -258,7 +258,7 @@ impl SharedServer {
 }
 
 fn timeout_bundle_reuse(input: &str) -> TimeoutBundleReuse {
-    if input.is_empty() || input.chars().all(|ch| matches!(ch, '\r' | '\n')) {
+    if input.is_empty() {
         return TimeoutBundleReuse::FullReply;
     }
 

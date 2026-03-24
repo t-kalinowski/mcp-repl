@@ -416,7 +416,7 @@ impl McpTestSession {
         timeout: Option<f64>,
     ) -> Result<rmcp::model::CallToolResult, ServiceError> {
         let mut input = input.into();
-        if !input.ends_with('\n') {
+        if !input.is_empty() && !input.ends_with('\n') {
             input.push('\n');
         }
         let timeout = normalized_test_timeout(timeout);

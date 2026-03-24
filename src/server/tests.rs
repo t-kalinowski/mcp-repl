@@ -142,6 +142,22 @@ fn repl_tool_descriptions_include_language_specific_affordances() {
     assert!(python.contains("help()"));
 }
 
+#[test]
+fn timeout_bundle_reuse_treats_blank_lines_as_fresh_input() {
+    assert!(matches!(
+        super::timeout_bundle_reuse(""),
+        super::response::TimeoutBundleReuse::FullReply
+    ));
+    assert!(matches!(
+        super::timeout_bundle_reuse("\n"),
+        super::response::TimeoutBundleReuse::FollowUpInput
+    ));
+    assert!(matches!(
+        super::timeout_bundle_reuse("\r\n"),
+        super::response::TimeoutBundleReuse::FollowUpInput
+    ));
+}
+
 fn split_lines(text: &str) -> Vec<String> {
     if text.is_empty() {
         return Vec::new();

@@ -1377,12 +1377,14 @@ cat("TAIL_ONLY\n")
     );
     assert_eq!(
         final_text
-            .matches(
-                "> cat(\"TAIL_ONLY\\n\")\nTAIL_ONLY\n> [repl] input discarded while worker busy"
-            )
+            .matches("> cat(\"TAIL_ONLY\\n\")\nTAIL_ONLY")
             .count(),
         1,
         "expected trailing timeout text segment to appear once, got: {final_text:?}"
+    );
+    assert!(
+        !final_text.contains("[repl] input discarded while worker busy"),
+        "did not expect empty-poll completion to inject a busy-discard notice: {final_text:?}"
     );
 
     session.cancel().await?;

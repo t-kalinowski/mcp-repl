@@ -302,8 +302,41 @@ impl ResponseState {
                                 contents
                                     .extend(materialize_items(material.reply_inline_items.clone()));
                                 contents
+                            } else if !material.reply_bundle_items.is_empty()
+                                && count_images(&material.reply_bundle_items) > 0
+                                && should_use_output_bundle(
+                                    count_images(&material.reply_bundle_items),
+                                    material.reply_worker_text.chars().count(),
+                                )
+                            {
+                                let mut contents =
+                                    materialize_items(material.detached_prefix_items.clone());
+                                contents.extend(compact_reply_items_with_new_bundle(
+                                    &mut self.output_store,
+                                    &material.reply_bundle_items,
+                                    &material.reply_inline_items,
+                                    &material.reply_worker_text,
+                                    false,
+                                ));
+                                contents
+                            } else if text_should_spill(material.reply_worker_text.chars().count())
+                            {
+                                let mut contents =
+                                    materialize_items(material.detached_prefix_items.clone());
+                                contents.extend(compact_reply_items_with_new_bundle(
+                                    &mut self.output_store,
+                                    &material.reply_bundle_items,
+                                    &material.reply_inline_items,
+                                    &material.reply_worker_text,
+                                    true,
+                                ));
+                                contents
                             } else {
-                                materialize_items(material.inline_items.clone())
+                                let mut contents =
+                                    materialize_items(material.detached_prefix_items.clone());
+                                contents
+                                    .extend(materialize_items(material.reply_inline_items.clone()));
+                                contents
                             }
                         }
                     };
@@ -1358,6 +1391,51 @@ fn compact_without_output_bundle(material: &ReplyMaterial) -> Vec<Content> {
     compact_text_without_bundle_items(material.inline_items.clone(), &material.worker_text)
 }
 
+fn compact_reply_items_with_new_bundle(
+    output_store: &mut OutputStore,
+    reply_bundle_items: &[ReplyItem],
+    reply_inline_items: &[ReplyItem],
+    reply_worker_text: &str,
+    text_only: bool,
+) -> Vec<Content> {
+    match output_store.new_bundle() {
+        Ok(mut bundle) => match bundle.append_items(output_store, reply_bundle_items) {
+            Ok(append) => {
+                if text_only {
+                    let retained_worker_text = worker_text_from_items(&append.retained_items);
+                    compact_text_bundle_items(append.retained_items, &retained_worker_text, &bundle)
+                } else {
+                    compact_output_bundle_items(&append.retained_items, &bundle)
+                }
+            }
+            Err(err) => {
+                eprintln!("dropping output-bundled content after output-bundle error: {err}");
+                if let Err(cleanup_err) = output_store.remove_bundle(bundle.id) {
+                    eprintln!(
+                        "dropping closed output bundle after output-bundle error: {cleanup_err}"
+                    );
+                }
+                if text_only {
+                    compact_text_without_bundle_items(
+                        reply_inline_items.to_vec(),
+                        reply_worker_text,
+                    )
+                } else {
+                    compact_output_without_bundle_items(reply_inline_items)
+                }
+            }
+        },
+        Err(err) => {
+            eprintln!("dropping output-bundle setup after output-bundle error: {err}");
+            if text_only {
+                compact_text_without_bundle_items(reply_inline_items.to_vec(), reply_worker_text)
+            } else {
+                compact_output_without_bundle_items(reply_inline_items)
+            }
+        }
+    }
+}
+
 fn should_spill_detached_prefix_only(material: &ReplyMaterial) -> bool {
     !material.detached_prefix_items.is_empty()
         && count_images(&material.detached_prefix_items) == 0
@@ -2025,6 +2103,68 @@ mod tests {
         assert!(
             !transcript.contains("NEW_TURN"),
             "did not expect new request output to append to the timeout bundle: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn large_follow_up_reply_still_compacts_after_detached_timeout_tail() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let mut bundle = state
+            .output_store
+            .new_bundle()
+            .expect("timeout bundle should initialize");
+        bundle
+            .append_worker_text(&mut state.output_store, "HEAD\n")
+            .expect("existing timeout text should append");
+        bundle.disclosed = true;
+        let timeout_transcript_path = bundle.paths.transcript.clone();
+        state.active_timeout_bundle = Some(bundle);
+
+        let large_follow_up = format!(
+            "FOLLOW_UP_START\n{}\nFOLLOW_UP_END\n",
+            "y".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200)
+        );
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout("TAIL\n"),
+                    WorkerContent::worker_stdout(large_follow_up.clone()),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FollowUpInput,
+            1,
+        );
+
+        let text = result_text(&result);
+        let follow_up_transcript_path = disclosed_path(&text, "transcript.txt")
+            .unwrap_or_else(|| panic!("expected oversized follow-up bundle path, got: {text:?}"));
+        let timeout_transcript = fs::read_to_string(&timeout_transcript_path)
+            .unwrap_or_else(|err| panic!("expected timeout transcript to be readable: {err}"));
+        let follow_up_transcript = fs::read_to_string(&follow_up_transcript_path)
+            .unwrap_or_else(|err| panic!("expected follow-up transcript to be readable: {err}"));
+
+        assert_ne!(
+            follow_up_transcript_path, timeout_transcript_path,
+            "expected the large follow-up reply to use its own bundle path"
+        );
+        assert!(
+            timeout_transcript.contains("HEAD\nTAIL\n"),
+            "expected detached timeout tail to stay on the timeout bundle path, got: {timeout_transcript:?}"
+        );
+        assert!(
+            !timeout_transcript.contains("FOLLOW_UP_START"),
+            "did not expect fresh follow-up output on the timeout bundle path: {timeout_transcript:?}"
+        );
+        assert!(
+            follow_up_transcript.contains("FOLLOW_UP_START")
+                && follow_up_transcript.contains("FOLLOW_UP_END"),
+            "expected follow-up transcript to contain the large fresh reply, got: {follow_up_transcript:?}"
+        );
+        assert!(
+            !follow_up_transcript.contains("TAIL\n"),
+            "did not expect the detached timeout tail in the fresh follow-up bundle: {follow_up_transcript:?}"
         );
     }
 
