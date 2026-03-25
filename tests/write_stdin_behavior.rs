@@ -71,7 +71,7 @@ fn bundle_root(path: &std::path::Path) -> PathBuf {
 }
 
 async fn wait_for_timeout_bundle_dir(temp_root: &std::path::Path) -> TestResult<PathBuf> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + test_duration(5, 15);
     while Instant::now() < deadline {
         for entry in fs::read_dir(temp_root)? {
             let entry = entry?;
@@ -130,6 +130,39 @@ const INLINE_TEXT_BUDGET_CHARS: usize = 3500;
 const INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS: usize = INLINE_TEXT_BUDGET_CHARS * 5 / 4;
 const UNDER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_BUDGET_CHARS + 200;
 const OVER_HARD_SPILL_TEXT_LEN: usize = INLINE_TEXT_HARD_SPILL_THRESHOLD_CHARS + 200;
+
+fn test_timeout_secs(default_secs: f64, windows_secs: f64) -> f64 {
+    if cfg!(windows) {
+        windows_secs
+    } else {
+        default_secs
+    }
+}
+
+fn test_duration(default_secs: u64, windows_secs: u64) -> Duration {
+    Duration::from_secs(if cfg!(windows) {
+        windows_secs
+    } else {
+        default_secs
+    })
+}
+
+fn test_delay_ms(default_ms: u64, windows_ms: u64) -> Duration {
+    Duration::from_millis(if cfg!(windows) {
+        windows_ms
+    } else {
+        default_ms
+    })
+}
+
+fn output_bundle_temp_env_vars(path: &std::path::Path) -> Vec<(String, String)> {
+    let value = path.display().to_string();
+    vec![
+        ("TMPDIR".to_string(), value.clone()),
+        ("TMP".to_string(), value.clone()),
+        ("TEMP".to_string(), value),
+    ]
+}
 
 async fn spawn_behavior_session() -> TestResult<common::McpTestSession> {
     spawn_behavior_session_with_env_vars(Vec::new()).await
@@ -471,10 +504,15 @@ async fn timeout_output_bundle_is_disclosed_only_after_poll_crosses_hard_spill_t
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
+    // Keep the oversized output comfortably behind the initial 50 ms timeout.
+    // The worker timeout path polls in 50 ms slices, so a narrower gap can make
+    // this boundary test flap and disclose the bundle on the first reply.
     let input = format!(
-        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); big <- paste(rep('t', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); Sys.sleep(0.25); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n')"
+        "small <- paste(rep('s', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); big <- paste(rep('t', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('SMALL_START\\n'); cat(small); cat('\\nSMALL_END\\n'); flush.console(); Sys.sleep(0.5); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n')"
     );
-    let first = session.write_stdin_raw_with(&input, Some(0.05)).await?;
+    let first = session
+        .write_stdin_raw_with(&input, Some(test_timeout_secs(0.05, 0.2)))
+        .await?;
     let first_text = result_text(&first);
     if backend_unavailable(&first_text) {
         eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
@@ -490,7 +528,7 @@ async fn timeout_output_bundle_is_disclosed_only_after_poll_crosses_hard_spill_t
         "did not expect transcript path before a poll crosses the hard spill threshold, got: {first_text:?}"
     );
 
-    sleep(Duration::from_millis(300)).await;
+    sleep(test_delay_ms(600, 900)).await;
     let spilled = session.write_stdin_raw_with("", Some(2.0)).await?;
     let spilled_text = result_text(&spilled);
     if spilled_text.contains("<<console status: busy") {
@@ -578,11 +616,8 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
 async fn timeout_bundle_file_creation_failure_preserves_inline_content() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let temp = tempdir()?;
-    let mut session = spawn_behavior_session_with_env_vars(vec![(
-        "TMPDIR".to_string(),
-        temp.path().display().to_string(),
-    )])
-    .await?;
+    let mut session =
+        spawn_behavior_session_with_env_vars(output_bundle_temp_env_vars(temp.path())).await?;
 
     let input = "big <- paste(rep('z', 120), collapse = ''); cat('start\\n'); flush.console(); Sys.sleep(0.2); for (i in 1:80) cat(sprintf('mid%03d %s\\n', i, big)); flush.console(); Sys.sleep(0.1); cat('end\\n')";
     let first = session.write_stdin_raw_with(input, Some(0.05)).await?;
@@ -596,7 +631,7 @@ async fn timeout_bundle_file_creation_failure_preserves_inline_content() -> Test
     let bundle_dir = wait_for_timeout_bundle_dir(temp.path()).await?;
     fs::remove_dir_all(&bundle_dir)?;
 
-    sleep(Duration::from_millis(260)).await;
+    sleep(test_delay_ms(260, 600)).await;
     let spilled = session.write_stdin_raw_with("", Some(2.0)).await?;
     let spilled_text = result_text(&spilled);
 
@@ -629,11 +664,8 @@ async fn timeout_bundle_file_creation_failure_preserves_inline_content() -> Test
 async fn hidden_timeout_bundle_is_removed_after_request_finishes_inline() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let temp = tempdir()?;
-    let mut session = spawn_behavior_session_with_env_vars(vec![(
-        "TMPDIR".to_string(),
-        temp.path().display().to_string(),
-    )])
-    .await?;
+    let mut session =
+        spawn_behavior_session_with_env_vars(output_bundle_temp_env_vars(temp.path())).await?;
 
     let first = session
         .write_stdin_raw_with(
@@ -654,7 +686,7 @@ async fn hidden_timeout_bundle_is_removed_after_request_finishes_inline() -> Tes
 
     let hidden_bundle_dir = wait_for_timeout_bundle_dir(temp.path()).await?;
 
-    sleep(Duration::from_millis(260)).await;
+    sleep(test_delay_ms(260, 600)).await;
     let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
     let final_text = result_text(&final_poll);
     if final_text.contains("<<console status: busy") {
