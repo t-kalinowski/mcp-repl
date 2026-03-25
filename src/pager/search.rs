@@ -779,7 +779,7 @@ pub(super) fn take_matches(
 ) -> (Vec<WorkerContent>, RangeSpan, Vec<(u64, u64)>) {
     if session.hits.is_empty() {
         return (
-            vec![WorkerContent::stderr(pattern_not_found_message(
+            vec![WorkerContent::server_stderr(pattern_not_found_message(
                 &session.pattern.pattern,
                 buffer.current_offset(),
             ))],
@@ -840,7 +840,7 @@ pub(super) fn take_matches(
 
     (
         vec![
-            WorkerContent::stderr(match_header(
+            WorkerContent::server_stderr(match_header(
                 session.hits.len().min(spec.limit),
                 spec.limit,
                 more_available,
@@ -1184,7 +1184,7 @@ pub(super) fn render_search_card(
 ) -> (Vec<WorkerContent>, Option<(u64, u64)>, Option<u64>) {
     let Some(hit) = session.hits.get(session.current_index) else {
         return (
-            vec![WorkerContent::stderr(pattern_not_found_message(
+            vec![WorkerContent::server_stderr(pattern_not_found_message(
                 &session.pattern.pattern,
                 buffer.current_offset(),
             ))],
@@ -1214,15 +1214,18 @@ pub(super) fn render_search_card(
             session.pattern.pattern, hit.match_start
         )
     };
-    let mut contents = vec![WorkerContent::stderr(header)];
+    let mut contents = vec![WorkerContent::server_stderr(header)];
     if let Some(message) = prior_view_message(view_history, hit.match_start) {
-        contents.push(WorkerContent::stderr(message));
+        contents.push(WorkerContent::server_stderr(message));
     }
 
     let line = read_line_text(buffer, hit.line_idx);
     let match_start_in_line = decoded_match_start_in_line(buffer, hit.line_start, hit.match_start);
     if hit.breadcrumb != "root" {
-        contents.push(WorkerContent::stderr(format!("{}\n", hit.breadcrumb)));
+        contents.push(WorkerContent::server_stderr(format!(
+            "{}\n",
+            hit.breadcrumb
+        )));
     }
     let window = snippet_window_around_match(&line, match_start_in_line, &session.pattern.pattern);
     contents.extend(render_match_snippet_contents(
@@ -1348,7 +1351,7 @@ pub(super) fn take_hits_next(
                 let pages_left_now = pages_left_for_buffer(buffer, page_bytes);
                 if output.is_empty() {
                     return (
-                        vec![WorkerContent::stderr(all_matches_shown_message(
+                        vec![WorkerContent::server_stderr(all_matches_shown_message(
                             &hit_state.pattern.pattern,
                         ))],
                         pages_left_now,
@@ -1368,7 +1371,7 @@ pub(super) fn take_hits_next(
                 if output.is_empty() {
                     let start_offset = buffer.current_offset();
                     return (
-                        vec![WorkerContent::stderr(pattern_not_found_message(
+                        vec![WorkerContent::server_stderr(pattern_not_found_message(
                             &hit_state.pattern.pattern,
                             start_offset,
                         ))],

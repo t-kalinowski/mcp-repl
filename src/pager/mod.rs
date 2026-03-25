@@ -885,7 +885,8 @@ impl Pager {
                     next
                 });
             if state.seen_images.contains(&image_id) {
-                *content = WorkerContent::stderr(format!("[pager] image #{num} already shown\n"));
+                *content =
+                    WorkerContent::server_stderr(format!("[pager] image #{num} already shown\n"));
             } else {
                 state.seen_images.insert(image_id);
             }
@@ -1024,7 +1025,7 @@ impl Pager {
     pub(crate) fn handle_command(&mut self, input: &str) -> WorkerReply {
         if self.state.is_none() {
             return pager_reply(
-                vec![WorkerContent::stderr("[pager] no pager active")],
+                vec![WorkerContent::server_stderr("[pager] no pager active")],
                 true,
                 None,
             );
@@ -1033,8 +1034,10 @@ impl Pager {
         let Some(command) = PagerCommand::parse(input) else {
             let page_bytes = page_bytes();
             let pages_left = self.pages_left_for_help(page_bytes);
-            let mut contents = vec![WorkerContent::stderr(non_command_input_message(input))];
-            contents.push(WorkerContent::stderr(self.footer(pages_left)));
+            let mut contents = vec![WorkerContent::server_stderr(non_command_input_message(
+                input,
+            ))];
+            contents.push(WorkerContent::server_stderr(self.footer(pages_left)));
             return pager_reply(contents, false, None);
         };
 
@@ -1043,7 +1046,7 @@ impl Pager {
         if let PagerCommand::Quit = command {
             let footer = self.footer(0);
             self.dismiss();
-            let contents = vec![WorkerContent::stderr(footer)];
+            let contents = vec![WorkerContent::server_stderr(footer)];
             return pager_reply(contents, false, None);
         }
 
@@ -1210,7 +1213,7 @@ impl Pager {
                     } else {
                         state.search_session = None;
                         let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
-                        let contents = vec![WorkerContent::stderr(format!(
+                        let contents = vec![WorkerContent::server_stderr(format!(
                             "[pager] pattern not found: {}",
                             pattern.pattern
                         ))];
@@ -1219,7 +1222,7 @@ impl Pager {
                 }
                 PagerCommand::Where { pattern } => {
                     let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
-                    let contents = vec![WorkerContent::stderr(where_in_buffer(
+                    let contents = vec![WorkerContent::server_stderr(where_in_buffer(
                         &state.buffer,
                         &state.seen_ranges,
                         page_bytes,
@@ -1254,7 +1257,7 @@ impl Pager {
                             .without_last_emitted_update()
                         } else {
                             state.search_session = None;
-                            let contents = vec![WorkerContent::stderr(format!(
+                            let contents = vec![WorkerContent::server_stderr(format!(
                                 "[pager] pattern not found: {}",
                                 pattern.pattern
                             ))];
@@ -1281,7 +1284,7 @@ impl Pager {
                         .with_view_ranges(view_ranges)
                         .without_last_emitted_update()
                     } else {
-                        let contents = vec![WorkerContent::stderr(
+                        let contents = vec![WorkerContent::server_stderr(
                             "[pager] no active search; use `:/PATTERN` or `:matches PATTERN`"
                                 .to_string(),
                         )];
@@ -1312,9 +1315,9 @@ impl Pager {
                         extend_search_session_forward(&state.buffer, session, needed_hits);
                         let moved = move_search_session(session, count, true);
                         if moved == SearchStepOutcome::Boundary {
-                            let contents = vec![WorkerContent::stderr(search_boundary_message(
-                                session, true,
-                            ))];
+                            let contents = vec![WorkerContent::server_stderr(
+                                search_boundary_message(session, true),
+                            )];
                             let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                             CommandOutcome::no_range_keep(contents, pages_left, is_error)
                         } else {
@@ -1364,9 +1367,9 @@ impl Pager {
                             .expect("search session missing after refresh");
                         let moved = move_search_session(session, count, false);
                         if moved == SearchStepOutcome::Boundary {
-                            let contents = vec![WorkerContent::stderr(search_boundary_message(
-                                session, false,
-                            ))];
+                            let contents = vec![WorkerContent::server_stderr(
+                                search_boundary_message(session, false),
+                            )];
                             let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
                             CommandOutcome::no_range_keep(contents, pages_left, is_error)
                         } else {
@@ -1398,7 +1401,7 @@ impl Pager {
                         }
                     } else {
                         let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
-                        let contents = vec![WorkerContent::stderr(
+                        let contents = vec![WorkerContent::server_stderr(
                             "[pager] no active search; use `:/PATTERN` first".to_string(),
                         )];
                         CommandOutcome::no_range_keep(contents, pages_left, is_error)
@@ -1440,14 +1443,14 @@ impl Pager {
                             .without_last_emitted_update()
                         } else {
                             let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
-                            let contents = vec![WorkerContent::stderr(format!(
+                            let contents = vec![WorkerContent::server_stderr(format!(
                                 "[pager] search hit out of range: {index}"
                             ))];
                             CommandOutcome::no_range_keep(contents, pages_left, is_error)
                         }
                     } else {
                         let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
-                        let contents = vec![WorkerContent::stderr(
+                        let contents = vec![WorkerContent::server_stderr(
                             "[pager] no active search; use `:/PATTERN` first".to_string(),
                         )];
                         CommandOutcome::no_range_keep(contents, pages_left, is_error)
@@ -1458,7 +1461,7 @@ impl Pager {
                     let (mut contents, span) =
                         take_line_range(&state.buffer, start, end, &mut state.seen_ranges);
                     if contents.is_empty() {
-                        contents.push(WorkerContent::stderr(
+                        contents.push(WorkerContent::server_stderr(
                             "[pager] no remaining output in range".to_string(),
                         ));
                     }
@@ -1483,7 +1486,7 @@ impl Pager {
                     };
 
                     if let Some(message) = error_message {
-                        let contents = vec![WorkerContent::stderr(message)];
+                        let contents = vec![WorkerContent::server_stderr(message)];
                         CommandOutcome::no_range(contents, pages_left, is_error)
                     } else {
                         let desired_offset = desired_offset.expect("seek offset missing");
@@ -1495,7 +1498,7 @@ impl Pager {
                 }
                 PagerCommand::Help => {
                     let pages_left = pages_left_for_buffer(&state.buffer, page_bytes);
-                    let contents = vec![WorkerContent::stderr(pager_help_text())];
+                    let contents = vec![WorkerContent::server_stderr(pager_help_text())];
                     CommandOutcome::no_range(contents, pages_left, is_error)
                 }
                 PagerCommand::Quit => {
@@ -1534,9 +1537,9 @@ impl Pager {
             if dismiss {
                 let footer = self.footer(0);
                 self.dismiss();
-                contents.push(WorkerContent::stderr(footer));
+                contents.push(WorkerContent::server_stderr(footer));
             } else {
-                contents.push(WorkerContent::stderr(self.footer(pages_left)));
+                contents.push(WorkerContent::server_stderr(self.footer(pages_left)));
             }
         }
 
@@ -1569,7 +1572,7 @@ pub(crate) fn maybe_activate_and_append_footer(
         }
     }
     pager.dedupe_images(contents);
-    contents.push(WorkerContent::stderr(pager.footer(pages_left)));
+    contents.push(WorkerContent::server_stderr(pager.footer(pages_left)));
 }
 
 fn contents_from_output_range(range: OutputRange) -> Vec<WorkerContent> {
@@ -2118,7 +2121,7 @@ fn take_line_range(
 ) -> (Vec<WorkerContent>, RangeSpan) {
     let Some((start_offset, end_offset)) = buffer.line_range_offsets(start_line, end_line) else {
         return (
-            vec![WorkerContent::stderr(
+            vec![WorkerContent::server_stderr(
                 "[pager] line range out of bounds".to_string(),
             )],
             RangeSpan::default(),

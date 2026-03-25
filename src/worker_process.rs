@@ -875,7 +875,7 @@ impl WorkerManager {
         } else {
             self.remember_prompt(resolved_prompt.clone());
             if resolved_prompt.is_none() {
-                contents.push(WorkerContent::stderr(
+                contents.push(WorkerContent::server_stderr(
                     "[repl] protocol error: missing prompt after pager dismiss",
                 ));
             }
@@ -1234,7 +1234,7 @@ impl WorkerManager {
             buffer,
             last_range,
         );
-        contents.push(WorkerContent::stderr(format!("worker error: {err}")));
+        contents.push(WorkerContent::server_stderr(format!("worker error: {err}")));
         ReplyWithOffset {
             reply: WorkerReply::Output {
                 contents,
@@ -2409,7 +2409,7 @@ impl WorkerManager {
         }
 
         if !meta.is_empty() {
-            contents.push(WorkerContent::stderr(format!("[repl] {meta}")));
+            contents.push(WorkerContent::server_stderr(format!("[repl] {meta}")));
         }
 
         pager::maybe_activate_and_append_footer(
@@ -2635,7 +2635,7 @@ fn append_image_groups_after_page(
             break;
         }
         if offset > last_offset {
-            contents.push(WorkerContent::stderr(format!(
+            contents.push(WorkerContent::server_stderr(format!(
                 "[pager] elided output: @{last_offset}..{offset}\n"
             )));
         }

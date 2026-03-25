@@ -6,6 +6,10 @@ mod common;
 use common::McpSnapshot;
 use common::TestResult;
 use rmcp::model::RawContent;
+#[cfg(not(windows))]
+use std::fs;
+#[cfg(not(windows))]
+use std::path::PathBuf;
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -17,6 +21,17 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+#[cfg(not(windows))]
+fn bundle_transcript_path(text: &str) -> Option<PathBuf> {
+    let end = text
+        .find("transcript.txt")?
+        .saturating_add("transcript.txt".len());
+    let start = text[..end]
+        .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '[' | '('))
+        .map_or(0, |idx| idx.saturating_add(1));
+    Some(PathBuf::from(&text[start..end]))
 }
 
 #[cfg(windows)]
@@ -118,6 +133,55 @@ async fn pager_commands_are_handled_server_side() -> TestResult<()> {
     );
 
     session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_matches_bundle_excludes_server_metadata_from_transcript() -> TestResult<()> {
+    let mut session = common::spawn_server_with_pager_page_chars(120).await?;
+
+    let initial = session
+        .write_stdin_raw_with(
+            "line <- paste(rep(\"foo\", 80), collapse = \" \"); for (i in 1:300) cat(sprintf(\"line%04d %s\\n\", i, line))",
+            Some(30.0),
+        )
+        .await?;
+    let initial_text = result_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        initial_text.contains("--More--"),
+        "expected pager to activate, got: {initial_text:?}"
+    );
+
+    let matches = session
+        .write_stdin_raw_with(":matches foo", Some(30.0))
+        .await?;
+    let matches_text = result_text(&matches);
+    let transcript_path = bundle_transcript_path(&matches_text).unwrap_or_else(|| {
+        panic!("expected transcript path for oversized :matches output, got: {matches_text:?}")
+    });
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        matches_text.contains("[pager]"),
+        "expected pager metadata inline, got: {matches_text:?}"
+    );
+    assert!(
+        transcript.contains("line0001") || transcript.contains("line0002"),
+        "expected worker match content in transcript, got: {transcript:?}"
+    );
+    assert!(
+        !transcript.contains("[pager]"),
+        "did not expect pager metadata in transcript, got: {transcript:?}"
+    );
+
     Ok(())
 }
 
