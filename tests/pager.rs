@@ -5,10 +5,8 @@ mod common;
 #[cfg(not(windows))]
 use common::McpSnapshot;
 use common::TestResult;
-#[cfg(windows)]
 use rmcp::model::RawContent;
 
-#[cfg(windows)]
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
         .content
@@ -59,6 +57,67 @@ fn assert_snapshot_or_skip(name: &str, snapshot: &McpSnapshot) -> TestResult<()>
     insta::with_settings!({ snapshot_suffix => "transcript" }, {
         insta::assert_snapshot!(name, transcript);
     });
+    Ok(())
+}
+
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_commands_are_handled_server_side() -> TestResult<()> {
+    let mut session = common::spawn_server_with_pager_page_chars(120).await?;
+
+    let initial = session
+        .write_stdin_raw_with(
+            "line <- paste(rep(\"x\", 200), collapse = \"\"); for (i in 1:200) cat(sprintf(\"line%04d %s\\n\", i, line))",
+            Some(30.0),
+        )
+        .await?;
+    let initial_text = result_text(&initial);
+    if backend_unavailable(&initial_text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        initial_text.contains("--More--"),
+        "expected pager to activate, got: {initial_text:?}"
+    );
+
+    let next = session.write_stdin_raw_with(":next", Some(30.0)).await?;
+    let next_text = result_text(&next);
+    assert!(
+        !next_text.contains("unexpected ':'"),
+        "expected :next to be handled by pager, got: {next_text:?}"
+    );
+    assert!(
+        next_text.contains("--More--") || next_text.contains("(END"),
+        "expected pager output for :next, got: {next_text:?}"
+    );
+
+    let hits = session
+        .write_stdin_raw_with(":hits line0150", Some(30.0))
+        .await?;
+    let hits_text = result_text(&hits);
+    assert!(
+        !hits_text.contains("unexpected ':'"),
+        "expected :hits to be handled by pager, got: {hits_text:?}"
+    );
+    assert!(
+        hits_text.contains("[pager]") || hits_text.contains("#1 @"),
+        "expected pager response for :hits, got: {hits_text:?}"
+    );
+
+    let quit = session.write_stdin_raw_with(":q", Some(30.0)).await?;
+    let quit_text = result_text(&quit);
+    assert!(
+        !quit_text.contains("unexpected ':'"),
+        "expected :q to be handled by pager, got: {quit_text:?}"
+    );
+    assert!(
+        quit_text.contains(">"),
+        "expected prompt after :q, got: {quit_text:?}"
+    );
+
+    session.cancel().await?;
     Ok(())
 }
 
