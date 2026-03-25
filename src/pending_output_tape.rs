@@ -205,7 +205,7 @@ impl PendingOutputTape {
             .origin
             .is_some_and(|tail_origin| tail_origin != origin)
         {
-            flush_tail(&mut guard, stream, false);
+            flush_tail(&mut guard, stream, true);
         }
         let tail = tail_mut(&mut guard, stream);
         if tail.origin.is_none() {
@@ -673,6 +673,34 @@ mod tests {
         assert_eq!(
             snapshot.format_contents().contents,
             vec![WorkerContent::stdout("\\xC3")]
+        );
+    }
+
+    #[test]
+    fn origin_change_flushes_incomplete_tail_before_appending_new_bytes() {
+        let tape = PendingOutputTape::new();
+        tape.append_server_stderr_bytes(&[0xC3]);
+        tape.append_stderr_bytes(b"boom\n");
+
+        let snapshot = tape.drain_snapshot();
+        assert_eq!(
+            snapshot.events,
+            vec![
+                PendingOutputEvent::TextFragment {
+                    seq: 0,
+                    stream: TextStream::Stderr,
+                    origin: ContentOrigin::Server,
+                    bytes: vec![0xC3],
+                    terminated: false,
+                },
+                PendingOutputEvent::TextFragment {
+                    seq: 1,
+                    stream: TextStream::Stderr,
+                    origin: ContentOrigin::Worker,
+                    bytes: b"boom\n".to_vec(),
+                    terminated: true,
+                },
+            ]
         );
     }
 }
