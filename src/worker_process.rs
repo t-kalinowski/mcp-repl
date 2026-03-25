@@ -1071,7 +1071,7 @@ impl WorkerManager {
         let FormattedPendingOutput {
             contents,
             saw_stderr,
-        } = self.drain_formatted_output();
+        } = self.drain_final_formatted_output();
         InputContext {
             prefix_contents: contents,
             prefix_is_error: saw_stderr,

@@ -314,6 +314,93 @@ print("parent ready")
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn python_detached_incomplete_utf8_tail_does_not_merge_into_next_request() -> TestResult<()> {
+    let Some(mut session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let setup = session
+        .write_stdin_raw_with(
+            r#"import subprocess, sys
+script = """import os, sys, time
+time.sleep(0.3)
+for i in range(160):
+    os.write(sys.stdout.fileno(), ("IDLE_%03d " % i + ("x" * 80) + "\\n").encode())
+os.write(sys.stdout.fileno(), bytes([0xC3]))
+"""
+subprocess.Popen(
+    [sys.executable, "-c", script],
+    stdin=subprocess.DEVNULL,
+    close_fds=False,
+)
+print("parent ready")
+"#,
+            Some(5.0),
+        )
+        .await?;
+    let setup_text = result_text(&setup);
+    if is_busy_response(&setup_text) {
+        eprintln!("python detached-incomplete setup remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        setup_text.contains("parent ready"),
+        "expected detached-incomplete setup reply, got: {setup_text:?}"
+    );
+
+    sleep(Duration::from_millis(700)).await;
+    let follow_up = session
+        .write_stdin_raw_with(
+            "import os, sys\nos.write(sys.stdout.fileno(), bytes([0xA9, 0x0A]))\nprint('FOLLOWUP_OK')",
+            Some(5.0),
+        )
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+    if is_busy_response(&follow_up_text) {
+        eprintln!("python detached-incomplete follow-up remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let transcript_path = bundle_transcript_path(&follow_up_text).unwrap_or_else(|| {
+        panic!(
+            "expected detached output transcript path in follow-up reply, got: {follow_up_text:?}"
+        )
+    });
+    let transcript = std::fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("\\xA9"),
+        "expected new request continuation byte to stay split, got: {follow_up_text:?}"
+    );
+    assert!(
+        !follow_up_text.contains("é"),
+        "did not expect cross-request UTF-8 merge, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("FOLLOWUP_OK"),
+        "expected follow-up output, got: {follow_up_text:?}"
+    );
+    assert!(
+        transcript.contains("IDLE_000"),
+        "expected detached idle output in transcript, got: {transcript:?}"
+    );
+    assert!(
+        transcript.contains("\\xC3"),
+        "expected detached lead byte to stay with detached transcript, got: {transcript:?}"
+    );
+    assert!(
+        !transcript.contains("FOLLOWUP_OK"),
+        "did not expect follow-up output in detached transcript: {transcript:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn python_interrupt_discards_buffered_tail_after_timeout() -> TestResult<()> {
     let Some(mut session) = start_python_session().await? else {
         return Ok(());
