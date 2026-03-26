@@ -16,6 +16,7 @@ struct PendingOutputTapeInner {
     events: VecDeque<PendingOutputEvent>,
     stdout_tail: PendingTextTail,
     stderr_tail: PendingTextTail,
+    last_rendered_text: Option<RenderedTextState>,
 }
 
 #[derive(Default)]
@@ -57,12 +58,19 @@ pub(crate) enum PendingSidebandKind {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PendingOutputSnapshot {
     pub events: Vec<PendingOutputEvent>,
+    prior_rendered_text: Option<RenderedTextState>,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct FormattedPendingOutput {
     pub contents: Vec<WorkerContent>,
     pub saw_stderr: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RenderedTextState {
+    stream: TextStream,
+    terminated: bool,
 }
 
 impl PendingOutputTape {
@@ -186,8 +194,12 @@ impl PendingOutputTape {
             .expect("pending output tape mutex poisoned");
         flush_tail(&mut guard, TextStream::Stdout, flush_incomplete);
         flush_tail(&mut guard, TextStream::Stderr, flush_incomplete);
+        let prior_rendered_text = guard.last_rendered_text;
+        let events: Vec<_> = guard.events.drain(..).collect();
+        guard.last_rendered_text = rendered_text_state_after(events.iter(), prior_rendered_text);
         PendingOutputSnapshot {
-            events: guard.events.drain(..).collect(),
+            events,
+            prior_rendered_text,
         }
     }
 
@@ -219,12 +231,14 @@ impl PendingOutputTape {
 impl PendingOutputSnapshot {
     pub(crate) fn format_contents(&self) -> FormattedPendingOutput {
         let mut formatted = FormattedPendingOutput::default();
+        let mut last_rendered_text = self.prior_rendered_text;
         for event in &self.events {
             match event {
                 PendingOutputEvent::TextFragment {
                     stream,
                     origin,
                     bytes,
+                    terminated,
                     ..
                 } => {
                     if bytes.is_empty() {
@@ -238,11 +252,15 @@ impl PendingOutputSnapshot {
                         continue;
                     }
                     let text = if matches!(stream, TextStream::Stderr) {
-                        render_stderr_text(&formatted.contents, rendered)
+                        render_stderr_text(last_rendered_text, rendered)
                     } else {
                         rendered
                     };
                     push_text(&mut formatted.contents, *stream, *origin, text);
+                    last_rendered_text = Some(RenderedTextState {
+                        stream: *stream,
+                        terminated: *terminated,
+                    });
                 }
                 PendingOutputEvent::Image {
                     data,
@@ -250,12 +268,15 @@ impl PendingOutputSnapshot {
                     id,
                     is_new,
                     ..
-                } => formatted.contents.push(WorkerContent::ContentImage {
-                    data: data.clone(),
-                    mime_type: mime_type.clone(),
-                    id: id.clone(),
-                    is_new: *is_new,
-                }),
+                } => {
+                    formatted.contents.push(WorkerContent::ContentImage {
+                        data: data.clone(),
+                        mime_type: mime_type.clone(),
+                        id: id.clone(),
+                        is_new: *is_new,
+                    });
+                    last_rendered_text = None;
+                }
                 PendingOutputEvent::Sideband { .. } => {}
             }
         }
@@ -331,23 +352,18 @@ fn note_progress(inner: &mut PendingOutputTapeInner) {
     inner.progress_seq = inner.progress_seq.saturating_add(1);
 }
 
-fn render_stderr_text(existing_contents: &[WorkerContent], rendered: String) -> String {
-    let needs_separator = existing_contents
-        .last()
-        .and_then(last_text_content)
-        .is_some_and(|text| !text.ends_with('\n'))
-        && !rendered.starts_with('\n');
+fn render_stderr_text(previous_text: Option<RenderedTextState>, rendered: String) -> String {
+    if previous_text
+        .is_some_and(|state| matches!(state.stream, TextStream::Stderr) && !state.terminated)
+    {
+        return rendered;
+    }
+    let needs_separator =
+        previous_text.is_some_and(|state| !state.terminated) && !rendered.starts_with('\n');
     if needs_separator {
         format!("\nstderr: {rendered}")
     } else {
         format!("stderr: {rendered}")
-    }
-}
-
-fn last_text_content(content: &WorkerContent) -> Option<&str> {
-    match content {
-        WorkerContent::ContentText { text, .. } => Some(text.as_str()),
-        WorkerContent::ContentImage { .. } => None,
     }
 }
 
@@ -452,6 +468,32 @@ fn last_text_fragment_bytes(events: &VecDeque<PendingOutputEvent>) -> Option<&[u
         Some(PendingOutputEvent::TextFragment { bytes, .. }) => Some(bytes.as_slice()),
         Some(PendingOutputEvent::Image { .. } | PendingOutputEvent::Sideband { .. }) | None => None,
     }
+}
+
+fn rendered_text_state_after<'a>(
+    events: impl Iterator<Item = &'a PendingOutputEvent>,
+    mut state: Option<RenderedTextState>,
+) -> Option<RenderedTextState> {
+    for event in events {
+        match event {
+            PendingOutputEvent::TextFragment {
+                stream,
+                bytes,
+                terminated,
+                ..
+            } => {
+                if !bytes.is_empty() {
+                    state = Some(RenderedTextState {
+                        stream: *stream,
+                        terminated: *terminated,
+                    });
+                }
+            }
+            PendingOutputEvent::Image { .. } => state = None,
+            PendingOutputEvent::Sideband { .. } => {}
+        }
+    }
+    state
 }
 
 fn tail_has_flushable_bytes(tail: &PendingTextTail) -> bool {
@@ -661,6 +703,25 @@ mod tests {
         assert_eq!(
             second.format_contents().contents,
             vec![WorkerContent::stdout("é\n")]
+        );
+    }
+
+    #[test]
+    fn stderr_continues_partial_line_across_snapshot_drains() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_stderr_bytes(b"abc");
+        let first = tape.drain_snapshot();
+        assert_eq!(
+            first.format_contents().contents,
+            vec![WorkerContent::stderr("stderr: abc")]
+        );
+
+        tape.append_stderr_bytes(b"def\n");
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::stderr("def\n")]
         );
     }
 

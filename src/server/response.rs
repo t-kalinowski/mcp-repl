@@ -409,7 +409,7 @@ impl ResponseState {
         active_timeout_bundle: Option<ActiveOutputBundle>,
     ) -> (Vec<Content>, Option<u64>) {
         let Some(mut active) = active_timeout_bundle else {
-            if should_spill_detached_prefix_only(material) {
+            if should_spill_detached_prefix(material) {
                 match self.output_store.new_bundle() {
                     Ok(mut bundle) => {
                         match bundle
@@ -754,35 +754,49 @@ impl ActiveOutputBundle {
     ) -> Result<BundleAppendResult, WorkerError> {
         let mut retained_items = Vec::with_capacity(items.len());
         let mut omitted_this_reply = false;
-        if self.omitted_tail {
-            return Ok(BundleAppendResult {
-                retained_items,
-                omitted_this_reply,
-            });
-        }
 
         for item in items {
-            let append = match item {
-                ReplyItem::WorkerText(text) => self.append_worker_text(store, text)?,
-                ReplyItem::ServerText(text) => self.append_server_text(store, text)?,
-                ReplyItem::Image(image) => self.append_image(store, image)?,
-            };
-            if let Some(retained_item) = append {
-                let partial_worker_text = matches!(
-                    (item, &retained_item),
-                    (ReplyItem::WorkerText(original), ReplyItem::WorkerText(retained))
-                        if retained.len() < original.len()
-                );
-                retained_items.push(retained_item);
-                if partial_worker_text {
-                    omitted_this_reply = true;
-                    self.apply_omission(store)?;
-                    break;
+            if self.omitted_tail {
+                if let ReplyItem::ServerText(text) = item {
+                    retained_items.push(ReplyItem::ServerText(text.clone()));
                 }
-            } else {
-                omitted_this_reply = true;
-                self.apply_omission(store)?;
-                break;
+                continue;
+            }
+
+            match item {
+                ReplyItem::WorkerText(text) => {
+                    let append = self.append_worker_text(store, text)?;
+                    if let Some(retained_item) = append {
+                        let partial_worker_text = matches!(
+                            &retained_item,
+                            ReplyItem::WorkerText(retained) if retained.len() < text.len()
+                        );
+                        retained_items.push(retained_item);
+                        if partial_worker_text {
+                            omitted_this_reply = true;
+                            self.apply_omission(store)?;
+                        }
+                    } else {
+                        omitted_this_reply = true;
+                        self.apply_omission(store)?;
+                    }
+                }
+                ReplyItem::ServerText(text) => match self.append_server_text(store, text)? {
+                    Some(retained_item) => retained_items.push(retained_item),
+                    None => {
+                        omitted_this_reply = true;
+                        self.apply_omission(store)?;
+                        retained_items.push(ReplyItem::ServerText(text.clone()));
+                    }
+                },
+                ReplyItem::Image(image) => {
+                    if let Some(retained_item) = self.append_image(store, image)? {
+                        retained_items.push(retained_item);
+                    } else {
+                        omitted_this_reply = true;
+                        self.apply_omission(store)?;
+                    }
+                }
             }
         }
 
@@ -1545,13 +1559,17 @@ fn compact_reply_items_with_new_bundle(
 }
 
 fn should_spill_detached_prefix_only(material: &ReplyMaterial) -> bool {
-    !material.detached_prefix_items.is_empty()
-        && count_images(&material.detached_prefix_items) == 0
-        && text_should_spill(material.detached_prefix_worker_text.chars().count())
+    should_spill_detached_prefix(material)
         && !should_use_output_bundle(
             count_images(&material.reply_inline_items),
             material.reply_worker_text.chars().count(),
         )
+}
+
+fn should_spill_detached_prefix(material: &ReplyMaterial) -> bool {
+    !material.detached_prefix_items.is_empty()
+        && count_images(&material.detached_prefix_items) == 0
+        && text_should_spill(material.detached_prefix_worker_text.chars().count())
 }
 
 fn should_use_output_bundle(image_count: usize, worker_text_chars: usize) -> bool {
@@ -2048,6 +2066,22 @@ mod tests {
         Some(PathBuf::from(&text[start..end]))
     }
 
+    fn disclosed_paths(text: &str, suffix: &str) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        let mut offset = 0;
+        while let Some(relative_end) = text[offset..].find(suffix) {
+            let end = offset
+                .saturating_add(relative_end)
+                .saturating_add(suffix.len());
+            let start = text[..end]
+                .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '[' | '('))
+                .map_or(0, |idx| idx.saturating_add(1));
+            paths.push(PathBuf::from(&text[start..end]));
+            offset = end;
+        }
+        paths
+    }
+
     fn fail_output_store_root_creation() -> io::Result<tempfile::TempDir> {
         Err(io::Error::other("simulated tempdir failure"))
     }
@@ -2277,6 +2311,68 @@ mod tests {
     }
 
     #[test]
+    fn detached_prefix_and_large_follow_up_each_compact_on_follow_up_input() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let detached_prefix = format!(
+            "DETACHED_START\n{}\nDETACHED_END\n",
+            "x".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200)
+        );
+        let large_follow_up = format!(
+            "FOLLOW_UP_START\n{}\nFOLLOW_UP_END\n",
+            "y".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200)
+        );
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout(detached_prefix),
+                    WorkerContent::worker_stdout(large_follow_up),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FollowUpInput,
+            1,
+        );
+
+        let text = result_text(&result);
+        let transcript_paths = disclosed_paths(&text, "transcript.txt");
+        assert_eq!(
+            transcript_paths.len(),
+            2,
+            "expected detached prefix and large follow-up to disclose separate bundle paths, got: {text:?}"
+        );
+        assert_ne!(
+            transcript_paths[0], transcript_paths[1],
+            "expected detached prefix and large follow-up to use separate bundle paths"
+        );
+
+        let detached_transcript = fs::read_to_string(&transcript_paths[0]).unwrap_or_else(|err| {
+            panic!("expected detached-prefix transcript to be readable: {err}")
+        });
+        let follow_up_transcript = fs::read_to_string(&transcript_paths[1])
+            .unwrap_or_else(|err| panic!("expected follow-up transcript to be readable: {err}"));
+
+        assert!(
+            detached_transcript.contains("DETACHED_START")
+                && detached_transcript.contains("DETACHED_END"),
+            "expected detached-prefix transcript content, got: {detached_transcript:?}"
+        );
+        assert!(
+            !detached_transcript.contains("FOLLOW_UP_START"),
+            "did not expect large follow-up output in detached-prefix transcript: {detached_transcript:?}"
+        );
+        assert!(
+            follow_up_transcript.contains("FOLLOW_UP_START")
+                && follow_up_transcript.contains("FOLLOW_UP_END"),
+            "expected large follow-up transcript content, got: {follow_up_transcript:?}"
+        );
+        assert!(
+            !follow_up_transcript.contains("DETACHED_START"),
+            "did not expect detached-prefix output in follow-up transcript: {follow_up_transcript:?}"
+        );
+    }
+
+    #[test]
     fn timed_out_follow_up_reply_gets_its_own_active_bundle() {
         let mut state = ResponseState::new().expect("response state should initialize");
         let mut bundle = state
@@ -2471,6 +2567,49 @@ mod tests {
         assert!(
             text.contains("START") && text.contains("END"),
             "expected truncated fallback reply to preserve worker output preview, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn timeout_busy_marker_survives_bundle_quota_truncation() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        state.output_store.limits.max_bundle_bytes = 2048;
+        let oversized_text = format!(
+            "START\n{}\nEND\n",
+            "q".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200)
+        );
+        let busy_marker = "<<console status: busy, write_stdin timeout reached; elapsed_ms=50>>";
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout(oversized_text),
+                    WorkerContent::server_stdout(busy_marker),
+                ],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        let text = result_text(&result);
+        let transcript_path = disclosed_path(&text, "transcript.txt").unwrap_or_else(|| {
+            panic!("expected transcript path in timed-out reply, got: {text:?}")
+        });
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected timeout transcript to be readable: {err}"));
+
+        assert!(
+            text.contains("later content omitted"),
+            "expected omission notice after bundle cap, got: {text:?}"
+        );
+        assert!(
+            text.contains(busy_marker),
+            "expected timeout busy marker to remain inline after bundle truncation, got: {text:?}"
+        );
+        assert!(
+            !transcript.contains(busy_marker),
+            "did not expect timeout busy marker in transcript bundle, got: {transcript:?}"
         );
     }
 

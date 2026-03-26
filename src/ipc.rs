@@ -255,7 +255,6 @@ impl ServerIpcConnection {
                                     guard.readline_unmatched_since = None;
                                 }
                             }
-                            #[cfg(feature = "pager")]
                             guard.echo_events.push_back(echo_event.clone());
                             reader_cvar.notify_all();
                             drop(guard);
@@ -370,13 +369,11 @@ impl ServerIpcConnection {
         guard.prompt_history.drain(..).collect()
     }
 
-    #[cfg(feature = "pager")]
     pub fn take_echo_events(&self) -> Vec<IpcEchoEvent> {
         let mut guard = self.inbox.lock().unwrap();
         guard.echo_events.drain(..).collect()
     }
 
-    #[cfg(feature = "pager")]
     pub fn pending_echo_event_count(&self) -> usize {
         let guard = self.inbox.lock().unwrap();
         guard.echo_events.len()
@@ -1337,31 +1334,6 @@ fn take_backend_info(guard: &mut ServerIpcInbox) -> Option<WorkerToServerIpcMess
         .iter()
         .position(|msg| matches!(msg, WorkerToServerIpcMessage::BackendInfo { .. }))?;
     guard.queue.remove(idx)
-}
-
-#[cfg(all(test, not(feature = "pager")))]
-mod non_pager_tests {
-    use super::*;
-    use std::thread;
-    use std::time::Duration;
-
-    #[test]
-    fn default_build_does_not_retain_echo_events() {
-        let (server, worker) = test_connection_pair().expect("ipc pair");
-        worker
-            .send(WorkerToServerIpcMessage::ReadlineResult {
-                prompt: "> ".to_string(),
-                line: "1+1\n".to_string(),
-            })
-            .expect("send readline result");
-        thread::sleep(Duration::from_millis(20));
-
-        let guard = server.inbox.lock().expect("ipc inbox mutex poisoned");
-        assert!(
-            guard.echo_events.is_empty(),
-            "default build should not retain readline echo events",
-        );
-    }
 }
 
 #[cfg(all(test, target_family = "windows"))]
