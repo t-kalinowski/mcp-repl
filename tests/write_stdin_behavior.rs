@@ -70,23 +70,18 @@ fn bundle_root(path: &std::path::Path) -> PathBuf {
         .to_path_buf()
 }
 
-async fn wait_for_timeout_bundle_dir(temp_root: &std::path::Path) -> TestResult<PathBuf> {
-    let deadline = Instant::now() + test_duration(5, 15);
-    while Instant::now() < deadline {
-        for entry in fs::read_dir(temp_root)? {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            if !file_name.to_string_lossy().starts_with("mcp-repl-output-") {
-                continue;
-            }
-            let bundle_dir = entry.path().join("output-0001");
-            if bundle_dir.exists() {
-                return Ok(bundle_dir);
-            }
+fn has_timeout_bundle_dir(temp_root: &std::path::Path) -> TestResult<bool> {
+    for entry in fs::read_dir(temp_root)? {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        if !file_name.to_string_lossy().starts_with("mcp-repl-output-") {
+            continue;
         }
-        sleep(Duration::from_millis(20)).await;
+        if entry.path().join("output-0001").exists() {
+            return Ok(true);
+        }
     }
-    Err("timed out waiting for timeout output bundle dir".into())
+    Ok(false)
 }
 
 async fn wait_for_path_to_disappear(path: &std::path::Path) -> TestResult<()> {
@@ -137,14 +132,6 @@ fn test_timeout_secs(default_secs: f64, windows_secs: f64) -> f64 {
     } else {
         default_secs
     }
-}
-
-fn test_duration(default_secs: u64, windows_secs: u64) -> Duration {
-    Duration::from_secs(if cfg!(windows) {
-        windows_secs
-    } else {
-        default_secs
-    })
 }
 
 fn test_delay_ms(default_ms: u64, windows_ms: u64) -> Duration {
@@ -719,8 +706,7 @@ async fn timeout_bundle_file_creation_failure_preserves_inline_content() -> Test
         return Ok(());
     }
 
-    let bundle_dir = wait_for_timeout_bundle_dir(temp.path()).await?;
-    fs::remove_dir_all(&bundle_dir)?;
+    fs::remove_dir_all(temp.path())?;
 
     sleep(test_delay_ms(260, 600)).await;
     let spilled = session.write_stdin_raw_with("", Some(2.0)).await?;
@@ -775,7 +761,10 @@ async fn hidden_timeout_bundle_is_removed_after_request_finishes_inline() -> Tes
         "did not expect timeout bundle disclosure on first small timeout reply, got: {first_text:?}"
     );
 
-    let hidden_bundle_dir = wait_for_timeout_bundle_dir(temp.path()).await?;
+    assert!(
+        !has_timeout_bundle_dir(temp.path())?,
+        "did not expect a hidden timeout bundle directory before disclosure"
+    );
 
     sleep(test_delay_ms(260, 600)).await;
     let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
@@ -786,7 +775,6 @@ async fn hidden_timeout_bundle_is_removed_after_request_finishes_inline() -> Tes
         return Ok(());
     }
 
-    wait_for_path_to_disappear(&hidden_bundle_dir).await?;
     session.cancel().await?;
 
     assert!(
@@ -796,6 +784,10 @@ async fn hidden_timeout_bundle_is_removed_after_request_finishes_inline() -> Tes
     assert!(
         bundle_transcript_path(&final_text).is_none(),
         "did not expect hidden timeout bundle disclosure on final inline poll, got: {final_text:?}"
+    );
+    assert!(
+        !has_timeout_bundle_dir(temp.path())?,
+        "did not expect a timeout bundle directory when the request finished inline"
     );
 
     Ok(())
@@ -853,6 +845,71 @@ async fn timeout_bundle_stops_before_ctrl_d_restart_output() -> TestResult<()> {
     assert_eq!(
         transcript_after, transcript_before,
         "did not expect ctrl-d restart output to append to prior timeout bundle"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn disclosed_timeout_bundle_keeps_appending_after_busy_follow_up() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let input = format!(
+        "big <- paste(rep('d', {OVER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('BIG_START\\n'); cat(big); cat('\\nBIG_END\\n'); flush.console(); Sys.sleep(1.0); cat('TAIL\\n')"
+    );
+    let first = session.write_stdin_raw_with(&input, Some(0.05)).await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    sleep(test_delay_ms(260, 700)).await;
+    let spilled = session.write_stdin_raw_with("", Some(0.1)).await?;
+    let spilled_text = result_text(&spilled);
+    let transcript_path = match bundle_transcript_path(&spilled_text) {
+        Some(path) => path,
+        None if spilled_text.contains("<<console status: busy") => {
+            eprintln!("write_stdin_behavior spill poll remained busy; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
+        None => {
+            panic!("expected transcript path in oversized timeout poll, got: {spilled_text:?}")
+        }
+    };
+
+    let busy_follow_up = session.write_stdin_raw_with("1+1", Some(0.1)).await?;
+    let busy_text = result_text(&busy_follow_up);
+    if !busy_text.contains("input discarded while worker busy")
+        && !busy_text.contains("<<console status: busy")
+    {
+        eprintln!("write_stdin_behavior busy follow-up completed without a busy marker; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    sleep(test_delay_ms(900, 1800)).await;
+    let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let final_text = result_text(&final_poll);
+    if final_text.contains("<<console status: busy") {
+        eprintln!("write_stdin_behavior final poll remained busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    let transcript = fs::read_to_string(&transcript_path)?;
+
+    session.cancel().await?;
+
+    assert!(
+        transcript.contains("TAIL"),
+        "expected the disclosed timeout bundle to keep receiving later worker output after a busy follow-up, got: {transcript:?}"
+    );
+    assert!(
+        bundle_transcript_path(&final_text).is_none(),
+        "did not expect the settled poll to switch to a different transcript path, got: {final_text:?}"
     );
 
     Ok(())

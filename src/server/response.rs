@@ -34,6 +34,7 @@ const OUTPUT_BUNDLE_OMITTED_NOTICE: &str = "output bundle quota reached; later c
 pub(crate) struct ResponseState {
     output_store: OutputStore,
     active_timeout_bundle: Option<ActiveOutputBundle>,
+    staged_timeout_output: Option<StagedTimeoutOutput>,
 }
 
 type OutputStoreRootFactory = fn() -> std::io::Result<tempfile::TempDir>;
@@ -102,6 +103,11 @@ struct ReplyImage {
     is_new: bool,
 }
 
+#[derive(Clone)]
+struct StagedTimeoutOutput {
+    items: Vec<ReplyItem>,
+}
+
 struct ReplyMaterial {
     inline_items: Vec<ReplyItem>,
     bundle_items: Vec<ReplyItem>,
@@ -114,13 +120,27 @@ struct ReplyMaterial {
     reply_worker_text: String,
     is_error: bool,
     error_code: Option<WorkerErrorCode>,
-    bundle_image_count: usize,
 }
 
 struct FollowUpDetachedPrefix {
     contents: Vec<Content>,
     protected_bundle_id: Option<u64>,
     retained_active_timeout_bundle: Option<ActiveOutputBundle>,
+    retained_staged_timeout_output: Option<StagedTimeoutOutput>,
+}
+
+struct TimeoutReplySegment {
+    contents: Vec<Content>,
+    retained_active_timeout_bundle: Option<ActiveOutputBundle>,
+    retained_staged_timeout_output: Option<StagedTimeoutOutput>,
+}
+
+struct TimeoutReplyView<'a> {
+    bundle_items: &'a [ReplyItem],
+    inline_items: &'a [ReplyItem],
+    worker_text: &'a str,
+    error_code: Option<WorkerErrorCode>,
+    protected_bundle_id: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -135,6 +155,7 @@ impl ResponseState {
         Ok(Self {
             output_store: OutputStore::new()?,
             active_timeout_bundle: None,
+            staged_timeout_output: None,
         })
     }
 
@@ -142,17 +163,40 @@ impl ResponseState {
         if let Some(active) = self.active_timeout_bundle.take() {
             self.finish_bundle(active)?;
         }
+        self.staged_timeout_output = None;
         Ok(())
     }
 
     pub(crate) fn shutdown(&mut self) -> Result<(), WorkerError> {
         self.active_timeout_bundle = None;
+        self.staged_timeout_output = None;
         self.output_store.cleanup_now()
     }
 
     #[cfg(test)]
     pub(crate) fn has_active_timeout_bundle(&self) -> bool {
-        self.active_timeout_bundle.is_some()
+        self.active_timeout_bundle.is_some() || self.staged_timeout_output.is_some()
+    }
+
+    fn materialize_staged_timeout_output(
+        &mut self,
+        staged: &StagedTimeoutOutput,
+        protected_bundle_id: Option<u64>,
+    ) -> Result<ActiveOutputBundle, WorkerError> {
+        let mut bundle = self
+            .output_store
+            .new_bundle_preserving(protected_bundle_id)?;
+        if !staged.items.is_empty()
+            && let Err(err) = bundle.append_items(&mut self.output_store, &staged.items)
+        {
+            if let Err(cleanup_err) = self.finish_bundle(bundle) {
+                eprintln!(
+                    "dropping closed timeout bundle after output-bundle error: {cleanup_err}"
+                );
+            }
+            return Err(err);
+        }
+        Ok(bundle)
     }
 
     /// Converts a worker result into the final MCP reply, including transcript updates and
@@ -194,62 +238,32 @@ impl ResponseState {
     ) -> CallToolResult {
         let material = prepare_reply_material(reply, detached_prefix_item_count);
         let mut active_timeout_bundle = self.active_timeout_bundle.take();
+        let mut staged_timeout_output = self.staged_timeout_output.take();
         if matches!(timeout_bundle_reuse, TimeoutBundleReuse::FollowUpInput) {
             let contents = self.finalize_follow_up_reply(
                 &material,
                 pending_request_after,
                 active_timeout_bundle,
+                staged_timeout_output,
             );
             return finalize_batch(contents, material.is_error);
         }
 
         let reuse_active_timeout_bundle =
             matches!(timeout_bundle_reuse, TimeoutBundleReuse::FullReply);
-        if !reuse_active_timeout_bundle
-            && let Some(active) = active_timeout_bundle.take()
-            && let Err(err) = self.finish_bundle(active)
-        {
-            eprintln!("dropping closed timeout bundle after output-bundle error: {err}");
-        }
-        if material.error_code == Some(WorkerErrorCode::Timeout) && active_timeout_bundle.is_none()
-        {
-            match self.output_store.new_bundle() {
-                Ok(bundle) => active_timeout_bundle = Some(bundle),
-                Err(err) => {
-                    eprintln!("dropping timeout bundle setup after output-bundle error: {err}");
-                }
+        if !reuse_active_timeout_bundle {
+            staged_timeout_output = None;
+            if let Some(active) = active_timeout_bundle.take()
+                && let Err(err) = self.finish_bundle(active)
+            {
+                eprintln!("dropping closed timeout bundle after output-bundle error: {err}");
             }
         }
 
-        let contents = if let Some(mut active) = active_timeout_bundle {
-            match render_active_bundle_contents(
-                &mut self.output_store,
-                &mut active,
-                &material.bundle_items,
-                &material.inline_items,
-                &material.worker_text,
-            ) {
-                Ok(contents) => {
-                    if pending_request_after {
-                        self.active_timeout_bundle = Some(active);
-                    } else if let Err(err) = self.finish_bundle(active) {
-                        eprintln!(
-                            "dropping closed timeout bundle after output-bundle error: {err}"
-                        );
-                    }
-                    contents
-                }
-                Err(err) => {
-                    eprintln!("dropping timeout bundle content after output-bundle error: {err}");
-                    if let Err(err) = self.finish_bundle(active) {
-                        eprintln!(
-                            "dropping closed timeout bundle after output-bundle error: {err}"
-                        );
-                    }
-                    compact_without_output_bundle(&material)
-                }
-            }
-        } else if should_spill_detached_prefix_only(&material) {
+        let contents = if active_timeout_bundle.is_none()
+            && staged_timeout_output.is_none()
+            && should_spill_detached_prefix_only(&material)
+        {
             match self.output_store.new_bundle() {
                 Ok(mut bundle) => {
                     match bundle
@@ -284,67 +298,26 @@ impl ResponseState {
                     compact_without_output_bundle(&material)
                 }
             }
-        } else if material.bundle_image_count > 0
-            && should_use_output_bundle(
-                material.bundle_image_count,
-                material.worker_text.chars().count(),
-            )
-        {
-            match self.output_store.new_bundle() {
-                Ok(mut bundle) => {
-                    match bundle.append_items(&mut self.output_store, &material.bundle_items) {
-                        Ok(append) => compact_output_bundle_items(&append.retained_items, &bundle),
-                        Err(err) => {
-                            eprintln!(
-                                "dropping output-bundled content after output-bundle error: {err}"
-                            );
-                            if let Err(cleanup_err) = self.finish_bundle(bundle) {
-                                eprintln!(
-                                    "dropping closed output bundle after output-bundle error: {cleanup_err}"
-                                );
-                            }
-                            compact_without_output_bundle(&material)
-                        }
-                    }
-                }
-                Err(err) => {
-                    eprintln!("dropping output-bundle setup after output-bundle error: {err}");
-                    compact_without_output_bundle(&material)
-                }
-            }
-        } else if text_should_spill(material.worker_text.chars().count()) {
-            match self.output_store.new_bundle() {
-                Ok(mut bundle) => {
-                    match bundle.append_items(&mut self.output_store, &material.bundle_items) {
-                        Ok(append) => {
-                            let retained_worker_text =
-                                worker_text_from_items(&append.retained_items);
-                            compact_text_bundle_items(
-                                append.retained_items,
-                                &retained_worker_text,
-                                &bundle,
-                            )
-                        }
-                        Err(err) => {
-                            eprintln!(
-                                "dropping output-bundled content after output-bundle error: {err}"
-                            );
-                            if let Err(cleanup_err) = self.finish_bundle(bundle) {
-                                eprintln!(
-                                    "dropping closed output bundle after output-bundle error: {cleanup_err}"
-                                );
-                            }
-                            compact_without_output_bundle(&material)
-                        }
-                    }
-                }
-                Err(err) => {
-                    eprintln!("dropping output-bundle setup after output-bundle error: {err}");
-                    compact_without_output_bundle(&material)
-                }
-            }
         } else {
-            materialize_items(material.inline_items)
+            let TimeoutReplySegment {
+                contents,
+                retained_active_timeout_bundle,
+                retained_staged_timeout_output,
+            } = self.render_timeout_reply_segment(
+                TimeoutReplyView {
+                    bundle_items: &material.bundle_items,
+                    inline_items: &material.inline_items,
+                    worker_text: &material.worker_text,
+                    error_code: material.error_code,
+                    protected_bundle_id: None,
+                },
+                pending_request_after,
+                active_timeout_bundle,
+                staged_timeout_output,
+            );
+            self.active_timeout_bundle = retained_active_timeout_bundle;
+            self.staged_timeout_output = retained_staged_timeout_output;
+            contents
         };
 
         finalize_batch(contents, material.is_error)
@@ -355,66 +328,46 @@ impl ResponseState {
         material: &ReplyMaterial,
         pending_request_after: bool,
         active_timeout_bundle: Option<ActiveOutputBundle>,
+        staged_timeout_output: Option<StagedTimeoutOutput>,
     ) -> Vec<Content> {
         let FollowUpDetachedPrefix {
             mut contents,
             protected_bundle_id,
             mut retained_active_timeout_bundle,
-        } = self.render_follow_up_detached_prefix(material, active_timeout_bundle);
+            mut retained_staged_timeout_output,
+        } = self.render_follow_up_detached_prefix(
+            material,
+            active_timeout_bundle,
+            staged_timeout_output,
+        );
 
-        if material.error_code == Some(WorkerErrorCode::Timeout) {
-            match self.output_store.new_bundle_preserving(protected_bundle_id) {
-                Ok(mut bundle) => {
-                    match render_active_bundle_contents(
-                        &mut self.output_store,
-                        &mut bundle,
-                        &material.reply_bundle_items,
-                        &material.reply_inline_items,
-                        &material.reply_worker_text,
-                    ) {
-                        Ok(reply_contents) => {
-                            contents.extend(reply_contents);
-                            if pending_request_after {
-                                self.active_timeout_bundle = Some(bundle);
-                            } else if let Err(err) = self.finish_bundle(bundle) {
-                                eprintln!(
-                                    "dropping closed timeout bundle after output-bundle error: {err}"
-                                );
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!(
-                                "dropping timeout bundle content after output-bundle error: {err}"
-                            );
-                            if let Err(err) = self.finish_bundle(bundle) {
-                                eprintln!(
-                                    "dropping closed timeout bundle after output-bundle error: {err}"
-                                );
-                            }
-                            contents.extend(compact_reply_without_output_bundle(material));
-                        }
-                    }
-                }
-                Err(err) => {
-                    eprintln!("dropping timeout bundle setup after output-bundle error: {err}");
-                    contents.extend(compact_reply_without_output_bundle(material));
-                }
-            }
-        } else {
-            contents.extend(render_reply_items(
-                &mut self.output_store,
-                &material.reply_bundle_items,
-                &material.reply_inline_items,
-                &material.reply_worker_text,
+        let TimeoutReplySegment {
+            contents: reply_contents,
+            retained_active_timeout_bundle: retained_reply_timeout_bundle,
+            retained_staged_timeout_output: retained_reply_staged_timeout_output,
+        } = self.render_timeout_reply_segment(
+            TimeoutReplyView {
+                bundle_items: &material.reply_bundle_items,
+                inline_items: &material.reply_inline_items,
+                worker_text: &material.reply_worker_text,
+                error_code: material.error_code,
                 protected_bundle_id,
-            ));
-        }
+            },
+            pending_request_after,
+            None,
+            None,
+        );
+        contents.extend(reply_contents);
+        self.active_timeout_bundle = retained_reply_timeout_bundle;
+        self.staged_timeout_output = retained_reply_staged_timeout_output;
 
         if pending_request_after
             && material.error_code != Some(WorkerErrorCode::Timeout)
             && self.active_timeout_bundle.is_none()
+            && self.staged_timeout_output.is_none()
         {
             self.active_timeout_bundle = retained_active_timeout_bundle.take();
+            self.staged_timeout_output = retained_staged_timeout_output.take();
         }
         if let Some(active) = retained_active_timeout_bundle.take()
             && let Err(err) = self.finish_bundle(active)
@@ -429,70 +382,122 @@ impl ResponseState {
         &mut self,
         material: &ReplyMaterial,
         active_timeout_bundle: Option<ActiveOutputBundle>,
+        staged_timeout_output: Option<StagedTimeoutOutput>,
     ) -> FollowUpDetachedPrefix {
-        let Some(mut active) = active_timeout_bundle else {
-            let detached_prefix_image_count = count_images(&material.detached_prefix_inline_items);
-            let use_output_bundle = detached_prefix_image_count > 0
-                && should_use_output_bundle(
-                    detached_prefix_image_count,
-                    material.detached_prefix_worker_text.chars().count(),
-                );
+        if let Some(active) = active_timeout_bundle {
+            return self.render_follow_up_detached_prefix_with_active_bundle(material, active);
+        }
+
+        let detached_prefix_image_count = count_images(&material.detached_prefix_items);
+        let combined_image_count =
+            staged_timeout_output
+                .as_ref()
+                .map_or(detached_prefix_image_count, |staged| {
+                    staged
+                        .image_count()
+                        .saturating_add(detached_prefix_image_count)
+                });
+        let use_output_bundle = combined_image_count > 0
+            && should_use_output_bundle(
+                combined_image_count,
+                material.detached_prefix_worker_text.chars().count(),
+            );
+
+        if let Some(mut staged) = staged_timeout_output {
             if use_output_bundle
                 || text_should_spill(material.detached_prefix_worker_text.chars().count())
             {
-                match self.output_store.new_bundle() {
-                    Ok(mut bundle) => {
-                        match bundle
-                            .append_items(&mut self.output_store, &material.detached_prefix_items)
-                        {
-                            Ok(append) => {
-                                bundle.disclosed = true;
-                                let contents = if use_output_bundle {
-                                    compact_output_bundle_items(&append.retained_items, &bundle)
-                                } else {
-                                    let retained_worker_text =
-                                        worker_text_from_items(&append.retained_items);
-                                    compact_text_bundle_items(
-                                        append.retained_items,
-                                        &retained_worker_text,
-                                        &bundle,
-                                    )
-                                };
-                                return FollowUpDetachedPrefix {
-                                    contents,
-                                    protected_bundle_id: Some(bundle.id),
-                                    retained_active_timeout_bundle: None,
-                                };
-                            }
-                            Err(err) => {
-                                eprintln!(
-                                    "dropping detached idle bundle after output-bundle error: {err}"
-                                );
-                                if let Err(cleanup_err) = self.finish_bundle(bundle) {
-                                    eprintln!(
-                                        "dropping closed output bundle after output-bundle error: {cleanup_err}"
-                                    );
-                                }
-                            }
-                        }
+                match self.materialize_staged_timeout_output(&staged, None) {
+                    Ok(active) => {
+                        return self
+                            .render_follow_up_detached_prefix_with_active_bundle(material, active);
                     }
                     Err(err) => {
                         eprintln!("dropping output-bundle setup after output-bundle error: {err}");
+                        return FollowUpDetachedPrefix {
+                            contents: compact_detached_prefix_without_output_bundle(material),
+                            protected_bundle_id: None,
+                            retained_active_timeout_bundle: None,
+                            retained_staged_timeout_output: None,
+                        };
                     }
                 }
-                return FollowUpDetachedPrefix {
-                    contents: compact_detached_prefix_without_output_bundle(material),
-                    protected_bundle_id: None,
-                    retained_active_timeout_bundle: None,
-                };
             }
+            staged.extend(&material.detached_prefix_items);
             return FollowUpDetachedPrefix {
                 contents: materialize_items(material.detached_prefix_inline_items.clone()),
                 protected_bundle_id: None,
                 retained_active_timeout_bundle: None,
+                retained_staged_timeout_output: staged
+                    .has_retained_worker_output()
+                    .then_some(staged),
             };
-        };
+        }
 
+        if use_output_bundle
+            || text_should_spill(material.detached_prefix_worker_text.chars().count())
+        {
+            match self.output_store.new_bundle() {
+                Ok(mut bundle) => {
+                    match bundle
+                        .append_items(&mut self.output_store, &material.detached_prefix_items)
+                    {
+                        Ok(append) => {
+                            bundle.disclosed = true;
+                            let contents = if use_output_bundle {
+                                compact_output_bundle_items(&append.retained_items, &bundle)
+                            } else {
+                                let retained_worker_text =
+                                    worker_text_from_items(&append.retained_items);
+                                compact_text_bundle_items(
+                                    append.retained_items,
+                                    &retained_worker_text,
+                                    &bundle,
+                                )
+                            };
+                            return FollowUpDetachedPrefix {
+                                contents,
+                                protected_bundle_id: Some(bundle.id),
+                                retained_active_timeout_bundle: None,
+                                retained_staged_timeout_output: None,
+                            };
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "dropping detached idle bundle after output-bundle error: {err}"
+                            );
+                            if let Err(cleanup_err) = self.finish_bundle(bundle) {
+                                eprintln!(
+                                    "dropping closed output bundle after output-bundle error: {cleanup_err}"
+                                );
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    eprintln!("dropping output-bundle setup after output-bundle error: {err}");
+                }
+            }
+            return FollowUpDetachedPrefix {
+                contents: compact_detached_prefix_without_output_bundle(material),
+                protected_bundle_id: None,
+                retained_active_timeout_bundle: None,
+                retained_staged_timeout_output: None,
+            };
+        }
+        FollowUpDetachedPrefix {
+            contents: materialize_items(material.detached_prefix_inline_items.clone()),
+            protected_bundle_id: None,
+            retained_active_timeout_bundle: None,
+            retained_staged_timeout_output: None,
+        }
+    }
+
+    fn render_follow_up_detached_prefix_with_active_bundle(
+        &mut self,
+        material: &ReplyMaterial,
+        mut active: ActiveOutputBundle,
+    ) -> FollowUpDetachedPrefix {
         let contents = if material.detached_prefix_items.is_empty() {
             Vec::new()
         } else {
@@ -506,28 +511,248 @@ impl ResponseState {
                 Ok(contents) => contents,
                 Err(err) => {
                     eprintln!("dropping timeout bundle content after output-bundle error: {err}");
-                    compact_detached_prefix_without_output_bundle(material)
+                    let protected_bundle_id = active.was_disclosed().then_some(active.id);
+                    if let Err(err) = self.finish_bundle(active) {
+                        eprintln!(
+                            "dropping closed timeout bundle after output-bundle error: {err}"
+                        );
+                    }
+                    return FollowUpDetachedPrefix {
+                        contents: compact_detached_prefix_without_output_bundle(material),
+                        protected_bundle_id,
+                        retained_active_timeout_bundle: None,
+                        retained_staged_timeout_output: None,
+                    };
                 }
             }
         };
-        if !active.was_disclosed()
-            && active.has_retained_worker_output()
-            && detached_prefix_is_server_only(material)
-        {
-            return FollowUpDetachedPrefix {
-                contents,
-                protected_bundle_id: None,
-                retained_active_timeout_bundle: Some(active),
-            };
-        }
         let protected_bundle_id = active.was_disclosed().then_some(active.id);
-        if let Err(err) = self.finish_bundle(active) {
-            eprintln!("dropping closed timeout bundle after output-bundle error: {err}");
-        }
         FollowUpDetachedPrefix {
             contents,
             protected_bundle_id,
+            retained_active_timeout_bundle: Some(active),
+            retained_staged_timeout_output: None,
+        }
+    }
+
+    fn render_timeout_reply_segment(
+        &mut self,
+        view: TimeoutReplyView<'_>,
+        pending_request_after: bool,
+        active_timeout_bundle: Option<ActiveOutputBundle>,
+        staged_timeout_output: Option<StagedTimeoutOutput>,
+    ) -> TimeoutReplySegment {
+        let TimeoutReplyView {
+            bundle_items,
+            inline_items,
+            worker_text,
+            error_code,
+            protected_bundle_id,
+        } = view;
+        if let Some(mut active) = active_timeout_bundle {
+            match render_active_bundle_contents(
+                &mut self.output_store,
+                &mut active,
+                bundle_items,
+                inline_items,
+                worker_text,
+            ) {
+                Ok(contents) => {
+                    if pending_request_after {
+                        return TimeoutReplySegment {
+                            contents,
+                            retained_active_timeout_bundle: Some(active),
+                            retained_staged_timeout_output: None,
+                        };
+                    }
+                    if let Err(err) = self.finish_bundle(active) {
+                        eprintln!(
+                            "dropping closed timeout bundle after output-bundle error: {err}"
+                        );
+                    }
+                    return TimeoutReplySegment {
+                        contents,
+                        retained_active_timeout_bundle: None,
+                        retained_staged_timeout_output: None,
+                    };
+                }
+                Err(err) => {
+                    eprintln!("dropping timeout bundle content after output-bundle error: {err}");
+                    if let Err(err) = self.finish_bundle(active) {
+                        eprintln!(
+                            "dropping closed timeout bundle after output-bundle error: {err}"
+                        );
+                    }
+                    return TimeoutReplySegment {
+                        contents: compact_items_without_output_bundle(
+                            bundle_items,
+                            inline_items,
+                            worker_text,
+                        ),
+                        retained_active_timeout_bundle: None,
+                        retained_staged_timeout_output: None,
+                    };
+                }
+            }
+        }
+
+        let current_image_count = count_images(bundle_items);
+        let combined_image_count = staged_timeout_output
+            .as_ref()
+            .map_or(current_image_count, |staged| {
+                staged.image_count().saturating_add(current_image_count)
+            });
+        let use_output_bundle = combined_image_count > 0
+            && should_use_output_bundle(combined_image_count, worker_text.chars().count());
+        let text_spills = text_should_spill(worker_text.chars().count());
+
+        if let Some(mut staged) = staged_timeout_output {
+            if use_output_bundle || text_spills {
+                match self.materialize_staged_timeout_output(&staged, protected_bundle_id) {
+                    Ok(mut active) => {
+                        match render_active_bundle_contents(
+                            &mut self.output_store,
+                            &mut active,
+                            bundle_items,
+                            inline_items,
+                            worker_text,
+                        ) {
+                            Ok(contents) => {
+                                if pending_request_after {
+                                    return TimeoutReplySegment {
+                                        contents,
+                                        retained_active_timeout_bundle: Some(active),
+                                        retained_staged_timeout_output: None,
+                                    };
+                                }
+                                if let Err(err) = self.finish_bundle(active) {
+                                    eprintln!(
+                                        "dropping closed timeout bundle after output-bundle error: {err}"
+                                    );
+                                }
+                                return TimeoutReplySegment {
+                                    contents,
+                                    retained_active_timeout_bundle: None,
+                                    retained_staged_timeout_output: None,
+                                };
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "dropping timeout bundle content after output-bundle error: {err}"
+                                );
+                                if let Err(err) = self.finish_bundle(active) {
+                                    eprintln!(
+                                        "dropping closed timeout bundle after output-bundle error: {err}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("dropping timeout bundle setup after output-bundle error: {err}");
+                    }
+                }
+                return TimeoutReplySegment {
+                    contents: compact_items_without_output_bundle(
+                        bundle_items,
+                        inline_items,
+                        worker_text,
+                    ),
+                    retained_active_timeout_bundle: None,
+                    retained_staged_timeout_output: None,
+                };
+            }
+            let contents = materialize_items(inline_items.to_vec());
+            if pending_request_after {
+                staged.extend(bundle_items);
+                return TimeoutReplySegment {
+                    contents,
+                    retained_active_timeout_bundle: None,
+                    retained_staged_timeout_output: Some(staged),
+                };
+            }
+            return TimeoutReplySegment {
+                contents,
+                retained_active_timeout_bundle: None,
+                retained_staged_timeout_output: None,
+            };
+        }
+
+        if error_code == Some(WorkerErrorCode::Timeout) {
+            if use_output_bundle || text_spills {
+                match self.output_store.new_bundle_preserving(protected_bundle_id) {
+                    Ok(mut bundle) => {
+                        match render_active_bundle_contents(
+                            &mut self.output_store,
+                            &mut bundle,
+                            bundle_items,
+                            inline_items,
+                            worker_text,
+                        ) {
+                            Ok(contents) => {
+                                if pending_request_after {
+                                    return TimeoutReplySegment {
+                                        contents,
+                                        retained_active_timeout_bundle: Some(bundle),
+                                        retained_staged_timeout_output: None,
+                                    };
+                                }
+                                if let Err(err) = self.finish_bundle(bundle) {
+                                    eprintln!(
+                                        "dropping closed timeout bundle after output-bundle error: {err}"
+                                    );
+                                }
+                                return TimeoutReplySegment {
+                                    contents,
+                                    retained_active_timeout_bundle: None,
+                                    retained_staged_timeout_output: None,
+                                };
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "dropping timeout bundle content after output-bundle error: {err}"
+                                );
+                                if let Err(err) = self.finish_bundle(bundle) {
+                                    eprintln!(
+                                        "dropping closed timeout bundle after output-bundle error: {err}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!("dropping timeout bundle setup after output-bundle error: {err}");
+                    }
+                }
+                return TimeoutReplySegment {
+                    contents: compact_items_without_output_bundle(
+                        bundle_items,
+                        inline_items,
+                        worker_text,
+                    ),
+                    retained_active_timeout_bundle: None,
+                    retained_staged_timeout_output: None,
+                };
+            }
+            return TimeoutReplySegment {
+                contents: materialize_items(inline_items.to_vec()),
+                retained_active_timeout_bundle: None,
+                retained_staged_timeout_output: pending_request_after
+                    .then(|| StagedTimeoutOutput::from_items(bundle_items))
+                    .flatten(),
+            };
+        }
+
+        TimeoutReplySegment {
+            contents: render_reply_items(
+                &mut self.output_store,
+                bundle_items,
+                inline_items,
+                worker_text,
+                protected_bundle_id,
+            ),
             retained_active_timeout_bundle: None,
+            retained_staged_timeout_output: None,
         }
     }
 }
@@ -803,10 +1028,6 @@ impl OutputStoreLimits {
 impl ActiveOutputBundle {
     fn was_disclosed(&self) -> bool {
         self.disclosed
-    }
-
-    fn has_retained_worker_output(&self) -> bool {
-        self.transcript_bytes > 0 || self.next_image_number > 0
     }
 
     fn append_items(
@@ -1165,6 +1386,28 @@ impl ResponseState {
     }
 }
 
+impl StagedTimeoutOutput {
+    fn from_items(items: &[ReplyItem]) -> Option<Self> {
+        (!items.is_empty()).then(|| Self {
+            items: items.to_vec(),
+        })
+    }
+
+    fn extend(&mut self, items: &[ReplyItem]) {
+        self.items.extend(items.iter().cloned());
+    }
+
+    fn image_count(&self) -> usize {
+        count_images(&self.items)
+    }
+
+    fn has_retained_worker_output(&self) -> bool {
+        self.items
+            .iter()
+            .any(|item| matches!(item, ReplyItem::WorkerText(_) | ReplyItem::Image(_)))
+    }
+}
+
 fn parse_limit_env<T>(name: &str, default: T) -> Result<T, WorkerError>
 where
     T: std::str::FromStr,
@@ -1271,7 +1514,6 @@ fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize)
     let inline_items = collapse_image_updates(bundle_items.clone());
     let detached_prefix_inline_items = collapse_image_updates(detached_prefix_items.clone());
     let reply_inline_items = collapse_image_updates(reply_bundle_items.clone());
-    let bundle_image_count = count_images(&inline_items);
 
     ReplyMaterial {
         inline_items,
@@ -1285,7 +1527,6 @@ fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize)
         reply_worker_text,
         is_error,
         error_code,
-        bundle_image_count,
     }
 }
 
@@ -1515,51 +1756,35 @@ fn render_active_bundle_contents(
     }
 }
 
-fn compact_without_output_bundle(material: &ReplyMaterial) -> Vec<Content> {
-    if material.bundle_image_count > 0
-        && should_use_output_bundle(
-            material.bundle_image_count,
-            material.worker_text.chars().count(),
-        )
-    {
-        return compact_output_without_bundle_items(&material.inline_items);
+fn compact_items_without_output_bundle(
+    bundle_items: &[ReplyItem],
+    inline_items: &[ReplyItem],
+    worker_text: &str,
+) -> Vec<Content> {
+    let image_count = count_images(bundle_items);
+    if image_count > 0 && should_use_output_bundle(image_count, worker_text.chars().count()) {
+        return compact_output_without_bundle_items(bundle_items);
     }
-    compact_text_without_bundle_items(material.inline_items.clone(), &material.worker_text)
+    if text_should_spill(worker_text.chars().count()) {
+        return compact_text_without_bundle_items(inline_items.to_vec(), worker_text);
+    }
+    materialize_items(inline_items.to_vec())
 }
 
-fn compact_reply_without_output_bundle(material: &ReplyMaterial) -> Vec<Content> {
-    let reply_image_count = count_images(&material.reply_inline_items);
-    if reply_image_count > 0
-        && should_use_output_bundle(
-            reply_image_count,
-            material.reply_worker_text.chars().count(),
-        )
-    {
-        return compact_output_without_bundle_items(&material.reply_inline_items);
-    }
-    compact_text_without_bundle_items(
-        material.reply_inline_items.clone(),
-        &material.reply_worker_text,
+fn compact_without_output_bundle(material: &ReplyMaterial) -> Vec<Content> {
+    compact_items_without_output_bundle(
+        &material.bundle_items,
+        &material.inline_items,
+        &material.worker_text,
     )
 }
 
 fn compact_detached_prefix_without_output_bundle(material: &ReplyMaterial) -> Vec<Content> {
-    let detached_prefix_image_count = count_images(&material.detached_prefix_inline_items);
-    if detached_prefix_image_count > 0
-        && should_use_output_bundle(
-            detached_prefix_image_count,
-            material.detached_prefix_worker_text.chars().count(),
-        )
-    {
-        return compact_output_without_bundle_items(&material.detached_prefix_inline_items);
-    }
-    if text_should_spill(material.detached_prefix_worker_text.chars().count()) {
-        return compact_text_without_bundle_items(
-            material.detached_prefix_inline_items.clone(),
-            &material.detached_prefix_worker_text,
-        );
-    }
-    materialize_items(material.detached_prefix_inline_items.clone())
+    compact_items_without_output_bundle(
+        &material.detached_prefix_items,
+        &material.detached_prefix_inline_items,
+        &material.detached_prefix_worker_text,
+    )
 }
 
 fn render_reply_items(
@@ -1569,7 +1794,7 @@ fn render_reply_items(
     reply_worker_text: &str,
     protected_bundle_id: Option<u64>,
 ) -> Vec<Content> {
-    let reply_image_count = count_images(reply_inline_items);
+    let reply_image_count = count_images(reply_bundle_items);
     if reply_image_count > 0
         && should_use_output_bundle(reply_image_count, reply_worker_text.chars().count())
     {
@@ -1644,7 +1869,7 @@ fn compact_reply_items_with_new_bundle(
 fn should_spill_detached_prefix_only(material: &ReplyMaterial) -> bool {
     should_spill_detached_prefix(material)
         && !should_use_output_bundle(
-            count_images(&material.reply_inline_items),
+            count_images(&material.reply_bundle_items),
             material.reply_worker_text.chars().count(),
         )
 }
@@ -1653,13 +1878,6 @@ fn should_spill_detached_prefix(material: &ReplyMaterial) -> bool {
     !material.detached_prefix_items.is_empty()
         && count_images(&material.detached_prefix_items) == 0
         && text_should_spill(material.detached_prefix_worker_text.chars().count())
-}
-
-fn detached_prefix_is_server_only(material: &ReplyMaterial) -> bool {
-    material
-        .detached_prefix_items
-        .iter()
-        .all(|item| matches!(item, ReplyItem::ServerText(_)))
 }
 
 fn should_use_output_bundle(image_count: usize, worker_text_chars: usize) -> bool {
@@ -2567,6 +2785,88 @@ mod tests {
     }
 
     #[test]
+    fn repeated_image_updates_spill_to_bundle_to_preserve_history() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let update_count = super::IMAGE_OUTPUT_BUNDLE_THRESHOLD;
+        let contents = (0..update_count)
+            .map(|index| WorkerContent::ContentImage {
+                data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
+                mime_type: "image/png".to_string(),
+                id: "plot-1".to_string(),
+                is_new: index == 0,
+            })
+            .collect();
+
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(contents, None)),
+            false,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        let text = result_text(&result);
+        let images = result_images(&result);
+        assert!(
+            text.contains("output bundle images"),
+            "expected repeated image updates to disclose an image bundle, got: {text:?}"
+        );
+        assert_eq!(
+            images.len(),
+            1,
+            "expected repeated updates to one image to keep a single inline anchor"
+        );
+        assert_eq!(
+            images[0],
+            vec![0_u8],
+            "expected the inline anchor to use the first history frame"
+        );
+
+        let bundle_dir = state
+            .output_store
+            .bundles
+            .back()
+            .map(|bundle| bundle.dir.clone())
+            .expect("expected disclosed output bundle metadata");
+        let history_dir = bundle_dir.join("images/history/001");
+        let mut history_files: Vec<_> = fs::read_dir(&history_dir)
+            .unwrap_or_else(|err| panic!("expected history dir to be readable: {err}"))
+            .map(|entry| {
+                entry
+                    .unwrap_or_else(|err| panic!("expected history dir entry: {err}"))
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        history_files.sort();
+
+        assert_eq!(
+            history_files.len(),
+            update_count,
+            "expected every repeated image update to be preserved in bundle history"
+        );
+        assert_eq!(
+            history_files.first().map(String::as_str),
+            Some("001.png"),
+            "expected the first history frame to be preserved"
+        );
+        assert_eq!(
+            history_files.last().map(String::as_str),
+            Some(format!("{update_count:03}.png").as_str()),
+            "expected the final history frame to be preserved"
+        );
+
+        let final_alias = fs::read(bundle_dir.join("images/001.png"))
+            .unwrap_or_else(|err| panic!("expected final image alias to be readable: {err}"));
+        let final_history = fs::read(history_dir.join(format!("{update_count:03}.png")))
+            .unwrap_or_else(|err| panic!("expected final history frame to be readable: {err}"));
+        assert_eq!(
+            final_alias, final_history,
+            "expected the final alias to match the final history frame"
+        );
+    }
+
+    #[test]
     fn timed_out_follow_up_reply_gets_its_own_active_bundle() {
         let mut state = ResponseState::new().expect("response state should initialize");
         let mut bundle = state
@@ -2753,6 +3053,143 @@ mod tests {
     }
 
     #[test]
+    fn hidden_timeout_bundle_survives_worker_follow_up_until_later_spill() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let first = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout("HEAD\n")],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::None,
+            0,
+        );
+        assert!(
+            disclosed_path(&result_text(&first), "transcript.txt").is_none(),
+            "did not expect the initial timed-out reply to disclose a bundle path"
+        );
+        assert!(
+            state.has_active_timeout_bundle(),
+            "expected the timed-out reply to keep hidden timeout state"
+        );
+
+        let second = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout("MID\n"),
+                    WorkerContent::server_stdout("<<console status: busy>>\n"),
+                ],
+                None,
+            )),
+            true,
+            TimeoutBundleReuse::FollowUpInput,
+            1,
+        );
+        let second_text = result_text(&second);
+        assert!(
+            second_text.contains("MID\n"),
+            "expected the small busy follow-up to keep worker output inline, got: {second_text:?}"
+        );
+        assert!(
+            disclosed_path(&second_text, "transcript.txt").is_none(),
+            "did not expect the small busy follow-up to spill yet, got: {second_text:?}"
+        );
+        assert!(
+            state.has_active_timeout_bundle(),
+            "expected hidden timeout state to survive the small worker detached prefix"
+        );
+
+        let detached_prefix = format!(
+            "TAIL_START\n{}\nTAIL_END\n",
+            "z".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200)
+        );
+        let third = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout(detached_prefix),
+                    WorkerContent::worker_stdout("DONE\n"),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FollowUpInput,
+            1,
+        );
+
+        let third_text = result_text(&third);
+        let transcript_path = disclosed_path(&third_text, "transcript.txt").unwrap_or_else(|| {
+            panic!("expected the later spill to disclose a transcript path, got: {third_text:?}")
+        });
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected transcript to be readable: {err}"));
+
+        assert!(
+            transcript.contains("HEAD\nMID\nTAIL_START\n") && transcript.contains("TAIL_END\n"),
+            "expected the later spill to backfill both earlier timeout chunks, got: {transcript:?}"
+        );
+        assert!(
+            !transcript.contains("DONE\n"),
+            "did not expect fresh follow-up output in the detached-prefix transcript: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn disclosed_timeout_bundle_survives_busy_follow_up_until_later_poll() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let mut bundle = state
+            .output_store
+            .new_bundle()
+            .expect("timeout bundle should initialize");
+        bundle
+            .append_worker_text(&mut state.output_store, "HEAD\n")
+            .expect("existing timeout text should append");
+        bundle.disclosed = true;
+        let transcript_path = bundle.paths.transcript.clone();
+        state.active_timeout_bundle = Some(bundle);
+
+        let second = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::server_stdout("<<console status: busy>>\n")],
+                None,
+            )),
+            true,
+            TimeoutBundleReuse::FollowUpInput,
+            0,
+        );
+        let second_text = result_text(&second);
+        assert!(
+            second_text.contains("<<console status: busy>>"),
+            "expected a busy follow-up marker, got: {second_text:?}"
+        );
+        assert!(
+            state.has_active_timeout_bundle(),
+            "expected the disclosed timeout bundle to stay active through the busy follow-up"
+        );
+
+        let third = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout("TAIL\n")],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+        let third_text = result_text(&third);
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected timeout transcript to be readable: {err}"));
+
+        assert!(
+            third_text.contains("TAIL\n"),
+            "expected the later poll to keep its small reply inline, got: {third_text:?}"
+        );
+        assert!(
+            transcript.contains("HEAD\nTAIL\n"),
+            "expected the disclosed timeout bundle to keep appending after the busy follow-up, got: {transcript:?}"
+        );
+    }
+
+    #[test]
     fn follow_up_bundle_does_not_prune_disclosed_timeout_bundle() {
         let mut state = ResponseState::new().expect("response state should initialize");
         let mut bundle = state
@@ -2801,6 +3238,76 @@ mod tests {
         assert!(
             disclosed_path(&text, "transcript.txt").is_none(),
             "did not expect a fresh follow-up bundle path when the active timeout bundle is the only quota slot: {text:?}"
+        );
+    }
+
+    #[test]
+    fn small_timeout_does_not_prune_disclosed_bundle_before_any_new_disclosure() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let mut bundle = state
+            .output_store
+            .new_bundle()
+            .expect("disclosed bundle should initialize");
+        bundle
+            .append_worker_text(&mut state.output_store, "PERSIST\n")
+            .expect("disclosed bundle text should append");
+        bundle.disclosed = true;
+        let transcript_path = bundle.paths.transcript.clone();
+        state.output_store.limits.max_bundle_count = 1;
+
+        let timed_out = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout("HEAD\n")],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::None,
+            0,
+        );
+        let timed_out_text = result_text(&timed_out);
+
+        assert!(
+            timed_out_text.contains("HEAD\n"),
+            "expected the timed-out reply to stay inline, got: {timed_out_text:?}"
+        );
+        assert!(
+            disclosed_path(&timed_out_text, "transcript.txt").is_none(),
+            "did not expect the timed-out reply to disclose a new bundle path, got: {timed_out_text:?}"
+        );
+        let persisted_after_timeout = fs::read_to_string(&transcript_path).unwrap_or_else(|err| {
+            panic!("expected disclosed bundle path to survive timeout: {err}")
+        });
+
+        let completed = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout("DONE\n")],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+        let completed_text = result_text(&completed);
+        let persisted_after_completion =
+            fs::read_to_string(&transcript_path).unwrap_or_else(|err| {
+                panic!("expected disclosed bundle path to survive inline completion: {err}")
+            });
+
+        assert!(
+            completed_text.contains("DONE\n"),
+            "expected the completion poll to stay inline, got: {completed_text:?}"
+        );
+        assert!(
+            disclosed_path(&completed_text, "transcript.txt").is_none(),
+            "did not expect the completion poll to disclose a new bundle path, got: {completed_text:?}"
+        );
+        assert!(
+            persisted_after_timeout.contains("PERSIST\n"),
+            "expected the original disclosed bundle content to remain readable after timeout, got: {persisted_after_timeout:?}"
+        );
+        assert_eq!(
+            persisted_after_completion, persisted_after_timeout,
+            "did not expect the original disclosed bundle to change when the hidden timeout state never spilled"
         );
     }
 

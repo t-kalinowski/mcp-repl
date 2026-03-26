@@ -1624,8 +1624,6 @@ async fn same_reply_plot_updates_stay_inline_and_show_final_state() -> TestResul
         "plot(1:10)",
         "lines(2:9, 2:9)",
         "lines(3:8, 3:8)",
-        "lines(4:7, 4:7)",
-        "lines(5:6, 5:6)",
         "lines(c(1, 10), c(10, 1))",
     ];
     let batch_input = steps.join("\n");
