@@ -141,8 +141,8 @@ impl PendingOutputTape {
             .lock()
             .expect("pending output tape mutex poisoned");
         note_progress(&mut guard);
-        flush_tail(&mut guard, TextStream::Stdout, true);
-        flush_tail(&mut guard, TextStream::Stderr, true);
+        flush_tail(&mut guard, TextStream::Stdout, false);
+        flush_tail(&mut guard, TextStream::Stderr, false);
         let seq = next_seq(&mut guard);
         guard
             .events
@@ -696,6 +696,26 @@ mod tests {
         assert!(
             first.format_contents().contents.is_empty(),
             "incomplete utf-8 prefix should stay buffered across drain boundaries"
+        );
+
+        tape.append_stdout_bytes(&[0xA9, b'\n']);
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::stdout("é\n")]
+        );
+    }
+
+    #[test]
+    fn split_utf8_sequence_is_preserved_across_sideband_events() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_stdout_bytes(&[0xC3]);
+        tape.append_sideband(PendingSidebandKind::RequestEnd);
+        let first = tape.drain_snapshot();
+        assert!(
+            first.format_contents().contents.is_empty(),
+            "incomplete utf-8 prefix should stay buffered across invisible sideband events"
         );
 
         tape.append_stdout_bytes(&[0xA9, b'\n']);
