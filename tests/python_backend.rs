@@ -2,6 +2,7 @@ mod common;
 
 use common::TestResult;
 use rmcp::model::RawContent;
+use std::fs;
 use std::path::PathBuf;
 use tokio::time::{Duration, Instant, sleep};
 
@@ -25,6 +26,13 @@ fn bundle_transcript_path(text: &str) -> Option<PathBuf> {
         .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '[' | '('))
         .map_or(0, |idx| idx.saturating_add(1));
     Some(PathBuf::from(&text[start..end]))
+}
+
+fn visible_reply_text(text: &str) -> TestResult<String> {
+    if let Some(path) = bundle_transcript_path(text) {
+        return Ok(fs::read_to_string(path)?);
+    }
+    Ok(text.to_string())
 }
 
 fn require_python() -> bool {
@@ -314,6 +322,119 @@ print("parent ready")
         "did not expect follow-up output to be bundled with detached idle output: {transcript:?}"
     );
 
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_idle_exit_preserves_detached_tail_before_respawn() -> TestResult<()> {
+    let Some(mut session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let arm = session
+        .write_stdin_raw_with(
+            "import os, sys, threading, time; print('armed'); threading.Thread(target=lambda: (time.sleep(0.2), sys.stdout.write('IDLE_TAIL\\n'), sys.stdout.flush(), os._exit(0)), daemon=True).start()",
+            Some(5.0),
+        )
+        .await?;
+    let arm_text = result_text(&arm);
+    if is_busy_response(&arm_text) {
+        eprintln!(
+            "python_idle_exit_preserves_detached_tail_before_respawn remained busy; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        arm_text.contains("armed"),
+        "expected arming output, got: {arm_text:?}"
+    );
+
+    sleep(Duration::from_millis(500)).await;
+    let reply = session
+        .write_stdin_raw_with("print('AFTER_RESPAWN')", Some(5.0))
+        .await?;
+    let text = result_text(&reply);
+    if is_busy_response(&text) {
+        eprintln!(
+            "python_idle_exit_preserves_detached_tail_before_respawn remained busy after respawn; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+    let visible = visible_reply_text(&text)?;
+
+    session.cancel().await?;
+
+    assert!(
+        visible.contains("IDLE_TAIL"),
+        "expected detached idle output to survive auto-respawn, got: {visible:?}"
+    );
+    assert!(
+        visible.contains("AFTER_RESPAWN"),
+        "expected fresh respawned output, got: {visible:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn python_restart_does_not_leak_old_generation_output() -> TestResult<()> {
+    let Some(mut session) = start_python_session().await? else {
+        return Ok(());
+    };
+
+    let timeout_result = session
+        .write_stdin_raw_with(
+            "import sys, time; big = 'OLD_BLOCK\\n' * 200000; sys.stdout.write(big); sys.stdout.flush(); time.sleep(30)",
+            Some(0.05),
+        )
+        .await?;
+    let timeout_text = result_text(&timeout_result);
+    if !is_busy_response(&timeout_text) {
+        eprintln!(
+            "python_restart_does_not_leak_old_generation_output did not time out as expected; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    let restart = session.write_stdin_raw_with("\u{4}", Some(10.0)).await?;
+    let restart_text = result_text(&restart);
+    if is_busy_response(&restart_text) {
+        eprintln!(
+            "python_restart_does_not_leak_old_generation_output restart remained busy; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        restart_text.contains("new session started"),
+        "expected restart notice, got: {restart_text:?}"
+    );
+
+    let next = session
+        .write_stdin_raw_with("print('NEW_GENERATION_OK')", Some(5.0))
+        .await?;
+    let next_text = result_text(&next);
+    if is_busy_response(&next_text) {
+        eprintln!(
+            "python_restart_does_not_leak_old_generation_output next turn remained busy; skipping"
+        );
+        session.cancel().await?;
+        return Ok(());
+    }
+    let visible = visible_reply_text(&next_text)?;
+
+    session.cancel().await?;
+
+    assert!(
+        visible.contains("NEW_GENERATION_OK"),
+        "expected fresh-generation reply, got: {visible:?}"
+    );
+    assert!(
+        !visible.contains("OLD_BLOCK"),
+        "did not expect old-generation output after restart, got: {visible:?}"
+    );
     Ok(())
 }
 

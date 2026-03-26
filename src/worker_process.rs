@@ -1804,7 +1804,7 @@ impl WorkerManager {
         self.guardrail.busy.store(false, Ordering::Relaxed);
 
         let reply = self.build_session_reset_reply_files("new session started");
-        self.reset_output_state_files();
+        self.reset_output_state_files(true);
         crate::event_log::log("worker_restart_end", serde_json::json!({"status": "ok"}));
         Ok(self.finalize_reply(reply))
     }
@@ -1960,7 +1960,7 @@ impl WorkerManager {
 
         let page_bytes = pager::resolve_page_bytes(None);
         let reply = self.build_session_reset_reply_pager(page_bytes, "new session started");
-        self.reset_output_state_pager(false);
+        self.reset_output_state_pager(true, false);
         crate::event_log::log("worker_restart_end", serde_json::json!({"status": "ok"}));
         Ok(self.finalize_reply(reply))
     }
@@ -1986,7 +1986,11 @@ impl WorkerManager {
 
         if needs_spawn {
             if let Some(process) = self.process.take() {
-                process.cleanup_session_tmpdir();
+                process.finish_exited()?;
+            }
+            match self.oversized_output {
+                OversizedOutputMode::Files => self.reset_output_state_files(false),
+                OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
             }
             self.process = Some(match self.oversized_output {
                 OversizedOutputMode::Files => self.spawn_process_files()?,
@@ -2002,11 +2006,14 @@ impl WorkerManager {
         if let Some(process) = self.process.take() {
             let _ = process.kill();
         }
-        self.guardrail.busy.store(false, Ordering::Relaxed);
         if self.awaiting_initial_sandbox_state_update {
             return Err(WorkerError::Sandbox(
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
+        }
+        match self.oversized_output {
+            OversizedOutputMode::Files => self.reset_output_state_files(true),
+            OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
         }
         self.process = Some(match self.oversized_output {
             OversizedOutputMode::Files => self.spawn_process_files()?,
@@ -2026,12 +2033,12 @@ impl WorkerManager {
         if let Some(process) = self.process.take() {
             let _ = process.kill();
         }
-        self.guardrail.busy.store(false, Ordering::Relaxed);
         if self.awaiting_initial_sandbox_state_update {
             return Err(WorkerError::Sandbox(
                 MISSING_INHERITED_SANDBOX_STATE_MESSAGE.to_string(),
             ));
         }
+        self.reset_output_state_pager(true, preserve_pager);
         self.process = Some(self.spawn_process_with_pager(preserve_pager)?);
         crate::event_log::log(
             "worker_reset_with_pager_end",
@@ -2077,7 +2084,10 @@ impl WorkerManager {
         );
         if !changed {
             if awaiting_before && self.process.is_none() {
-                self.guardrail.busy.store(false, Ordering::Relaxed);
+                match self.oversized_output {
+                    OversizedOutputMode::Files => self.reset_output_state_files(true),
+                    OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
+                }
                 self.process = Some(match self.oversized_output {
                     OversizedOutputMode::Files => self.spawn_process_files()?,
                     OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
@@ -2090,7 +2100,10 @@ impl WorkerManager {
         if let Some(process) = self.process.take() {
             let _ = process.shutdown_graceful(timeout);
         }
-        self.guardrail.busy.store(false, Ordering::Relaxed);
+        match self.oversized_output {
+            OversizedOutputMode::Files => self.reset_output_state_files(true),
+            OversizedOutputMode::Pager => self.reset_output_state_pager(true, false),
+        }
         self.process = Some(match self.oversized_output {
             OversizedOutputMode::Files => self.spawn_process_files()?,
             OversizedOutputMode::Pager => self.spawn_process_with_pager(false)?,
@@ -2098,8 +2111,10 @@ impl WorkerManager {
         Ok(true)
     }
 
-    fn reset_output_state_files(&mut self) {
-        self.pending_output_tape.clear();
+    fn reset_output_state_files(&mut self, clear_pending_output: bool) {
+        if clear_pending_output {
+            self.pending_output_tape.clear();
+        }
         self.pending_request = false;
         self.pending_request_started_at = None;
         self.session_end_seen = false;
@@ -2108,8 +2123,10 @@ impl WorkerManager {
         self.guardrail.busy.store(false, Ordering::Relaxed);
     }
 
-    fn reset_output_state_pager(&mut self, preserve_pager: bool) {
-        self.pending_output_tape.clear();
+    fn reset_output_state_pager(&mut self, clear_pending_output: bool, preserve_pager: bool) {
+        if clear_pending_output {
+            self.pending_output_tape.clear();
+        }
         reset_output_ring();
         reset_last_reply_marker_offset();
         self.output = OutputBuffer::default();
@@ -2186,7 +2203,6 @@ impl WorkerManager {
     }
 
     fn spawn_process_files(&mut self) -> Result<WorkerProcess, WorkerError> {
-        self.reset_output_state_files();
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state)
         });
@@ -2229,7 +2245,6 @@ impl WorkerManager {
         &mut self,
         preserve_pager: bool,
     ) -> Result<WorkerProcess, WorkerError> {
-        self.reset_output_state_pager(preserve_pager);
         crate::event_log::log_lazy("worker_spawn_begin", || {
             worker_context_event_payload(self.backend, &self.sandbox_state)
         });
@@ -3243,6 +3258,8 @@ struct WorkerProcess {
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
     ipc: IpcHandle,
+    stdout_reader: Option<std::thread::JoinHandle<()>>,
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
     expected_exit: bool,
     exit_status: Option<std::process::ExitStatus>,
     #[cfg(target_family = "unix")]
@@ -3269,6 +3286,8 @@ struct SpawnedWorker {
     child: Child,
     stdin_tx: mpsc::Sender<StdinCommand>,
     session_tmpdir: Option<PathBuf>,
+    stdout_reader: Option<std::thread::JoinHandle<()>>,
+    stderr_reader: Option<std::thread::JoinHandle<()>>,
     #[cfg(target_os = "macos")]
     denial_logger: Option<crate::sandbox::DenialLogger>,
 }
@@ -3373,6 +3392,8 @@ impl WorkerProcess {
             child,
             stdin_tx,
             session_tmpdir,
+            stdout_reader,
+            stderr_reader,
             #[cfg(target_os = "macos")]
             denial_logger,
         } = match backend {
@@ -3459,6 +3480,8 @@ impl WorkerProcess {
             stdin_tx,
             session_tmpdir,
             ipc,
+            stdout_reader,
+            stderr_reader,
             expected_exit: false,
             exit_status: None,
             #[cfg(target_family = "unix")]
@@ -3544,13 +3567,13 @@ impl WorkerProcess {
             .take()
             .ok_or_else(|| WorkerError::Protocol("worker stdin unavailable".to_string()))?;
         let stdin_tx = spawn_stdin_writer(stdin);
-        spawn_output_reader(
+        let stdout_reader = spawn_output_reader(
             child.stdout.take(),
             TextStream::Stdout,
             pending_output_tape.clone(),
             output_timeline.clone(),
         );
-        spawn_output_reader(
+        let stderr_reader = spawn_output_reader(
             child.stderr.take(),
             TextStream::Stderr,
             pending_output_tape.clone(),
@@ -3568,6 +3591,8 @@ impl WorkerProcess {
             child,
             stdin_tx,
             session_tmpdir,
+            stdout_reader,
+            stderr_reader,
             #[cfg(target_os = "macos")]
             denial_logger,
         })
@@ -3665,7 +3690,7 @@ impl WorkerProcess {
             let master_reader = master.try_clone()?;
             let stdin_tx = spawn_stdin_writer(master);
             // Python runs under a PTY so stdout/stderr are merged.
-            spawn_output_reader(
+            let stdout_reader = spawn_output_reader(
                 Some(master_reader),
                 TextStream::Stdout,
                 pending_output_tape.clone(),
@@ -3683,6 +3708,8 @@ impl WorkerProcess {
                 child,
                 stdin_tx,
                 session_tmpdir,
+                stdout_reader,
+                stderr_reader: None,
                 #[cfg(target_os = "macos")]
                 denial_logger,
             })
@@ -3902,6 +3929,7 @@ impl WorkerProcess {
             }
         }
 
+        self.quiesce_output_producers()?;
         self.cleanup_session_tmpdir();
         self.report_denials();
         Ok(())
@@ -3914,8 +3942,36 @@ impl WorkerProcess {
             self.kill_process_tree_scan(libc::SIGKILL);
         }
         let _ = self.child.wait();
+        self.quiesce_output_producers()?;
         self.cleanup_session_tmpdir();
         self.report_denials();
+        Ok(())
+    }
+
+    fn finish_exited(mut self) -> Result<(), WorkerError> {
+        if self.exit_status.is_none() {
+            self.exit_status = Some(self.child.wait()?);
+        }
+        self.quiesce_output_producers()?;
+        self.cleanup_session_tmpdir();
+        self.report_denials();
+        Ok(())
+    }
+
+    fn quiesce_output_producers(&mut self) -> Result<(), WorkerError> {
+        if let Some(handle) = self.stdout_reader.take() {
+            handle.join().map_err(|_| {
+                WorkerError::Protocol("worker stdout reader thread panicked".to_string())
+            })?;
+        }
+        if let Some(handle) = self.stderr_reader.take() {
+            handle.join().map_err(|_| {
+                WorkerError::Protocol("worker stderr reader thread panicked".to_string())
+            })?;
+        }
+        if let Some(ipc) = self.ipc.get() {
+            ipc.join_reader_thread().map_err(WorkerError::Io)?;
+        }
         Ok(())
     }
 
@@ -4195,13 +4251,12 @@ fn spawn_output_reader<R>(
     output_stream: TextStream,
     pending_output_tape: PendingOutputTape,
     output_timeline: OutputTimeline,
-) where
+) -> Option<std::thread::JoinHandle<()>>
+where
     R: Read + Send + 'static,
 {
-    let Some(mut stream) = stream else {
-        return;
-    };
-    thread::spawn(move || {
+    let mut stream = stream?;
+    Some(thread::spawn(move || {
         let mut buffer = [0u8; 8192];
         loop {
             match stream.read(&mut buffer) {
@@ -4222,7 +4277,7 @@ fn spawn_output_reader<R>(
                 Err(_) => break,
             }
         }
-    });
+    }))
 }
 
 fn spawn_stdin_writer<W>(stdin: W) -> mpsc::Sender<StdinCommand>

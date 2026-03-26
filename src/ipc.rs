@@ -146,6 +146,7 @@ pub struct ServerIpcConnection {
     sender: mpsc::Sender<ServerToWorkerIpcMessage>,
     inbox: Arc<Mutex<ServerIpcInbox>>,
     cvar: Arc<Condvar>,
+    reader_thread: Arc<Mutex<Option<thread::JoinHandle<()>>>>,
 }
 
 #[derive(Clone)]
@@ -181,6 +182,7 @@ impl ServerIpcConnection {
         let (tx, rx) = mpsc::channel();
         let inbox = Arc::new(Mutex::new(ServerIpcInbox::default()));
         let cvar = Arc::new(Condvar::new());
+        let reader_thread = Arc::new(Mutex::new(None));
 
         let reader_inbox = inbox.clone();
         let reader_cvar = cvar.clone();
@@ -190,7 +192,7 @@ impl ServerIpcConnection {
         let request_end_handler = handlers.on_request_end.clone();
         let session_end_handler = handlers.on_session_end.clone();
         let IpcTransport { reader, writer } = transport;
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             let mut reader = BufReader::new(reader);
             let mut line = String::new();
             loop {
@@ -311,6 +313,7 @@ impl ServerIpcConnection {
                 }
             }
         });
+        *reader_thread.lock().unwrap() = Some(handle);
 
         spawn_writer(rx, writer);
 
@@ -318,6 +321,7 @@ impl ServerIpcConnection {
             sender: tx,
             inbox,
             cvar,
+            reader_thread,
         })
     }
 
@@ -326,6 +330,17 @@ impl ServerIpcConnection {
         message: ServerToWorkerIpcMessage,
     ) -> Result<(), mpsc::SendError<ServerToWorkerIpcMessage>> {
         self.sender.send(message)
+    }
+
+    pub fn join_reader_thread(&self) -> io::Result<()> {
+        let handle = self.reader_thread.lock().unwrap().take();
+        let Some(handle) = handle else {
+            return Ok(());
+        };
+        handle
+            .join()
+            .map_err(|_| io::Error::other("ipc reader thread panicked"))?;
+        Ok(())
     }
 
     pub fn clear_prompt_history(&self) {
