@@ -107,6 +107,7 @@ struct ReplyMaterial {
     bundle_items: Vec<ReplyItem>,
     worker_text: String,
     detached_prefix_items: Vec<ReplyItem>,
+    detached_prefix_inline_items: Vec<ReplyItem>,
     detached_prefix_worker_text: String,
     reply_inline_items: Vec<ReplyItem>,
     reply_bundle_items: Vec<ReplyItem>,
@@ -430,7 +431,15 @@ impl ResponseState {
         active_timeout_bundle: Option<ActiveOutputBundle>,
     ) -> FollowUpDetachedPrefix {
         let Some(mut active) = active_timeout_bundle else {
-            if should_spill_detached_prefix(material) {
+            let detached_prefix_image_count = count_images(&material.detached_prefix_inline_items);
+            let use_output_bundle = detached_prefix_image_count > 0
+                && should_use_output_bundle(
+                    detached_prefix_image_count,
+                    material.detached_prefix_worker_text.chars().count(),
+                );
+            if use_output_bundle
+                || text_should_spill(material.detached_prefix_worker_text.chars().count())
+            {
                 match self.output_store.new_bundle() {
                     Ok(mut bundle) => {
                         match bundle
@@ -438,13 +447,17 @@ impl ResponseState {
                         {
                             Ok(append) => {
                                 bundle.disclosed = true;
-                                let retained_worker_text =
-                                    worker_text_from_items(&append.retained_items);
-                                let contents = compact_text_bundle_items(
-                                    append.retained_items,
-                                    &retained_worker_text,
-                                    &bundle,
-                                );
+                                let contents = if use_output_bundle {
+                                    compact_output_bundle_items(&append.retained_items, &bundle)
+                                } else {
+                                    let retained_worker_text =
+                                        worker_text_from_items(&append.retained_items);
+                                    compact_text_bundle_items(
+                                        append.retained_items,
+                                        &retained_worker_text,
+                                        &bundle,
+                                    )
+                                };
                                 return FollowUpDetachedPrefix {
                                     contents,
                                     protected_bundle_id: Some(bundle.id),
@@ -467,9 +480,14 @@ impl ResponseState {
                         eprintln!("dropping output-bundle setup after output-bundle error: {err}");
                     }
                 }
+                return FollowUpDetachedPrefix {
+                    contents: compact_detached_prefix_without_output_bundle(material),
+                    protected_bundle_id: None,
+                    retained_active_timeout_bundle: None,
+                };
             }
             return FollowUpDetachedPrefix {
-                contents: materialize_items(material.detached_prefix_items.clone()),
+                contents: materialize_items(material.detached_prefix_inline_items.clone()),
                 protected_bundle_id: None,
                 retained_active_timeout_bundle: None,
             };
@@ -482,13 +500,13 @@ impl ResponseState {
                 &mut self.output_store,
                 &mut active,
                 &material.detached_prefix_items,
-                &material.detached_prefix_items,
+                &material.detached_prefix_inline_items,
                 &material.detached_prefix_worker_text,
             ) {
                 Ok(contents) => contents,
                 Err(err) => {
                     eprintln!("dropping timeout bundle content after output-bundle error: {err}");
-                    materialize_items(material.detached_prefix_items.clone())
+                    compact_detached_prefix_without_output_bundle(material)
                 }
             }
         };
@@ -1251,6 +1269,7 @@ fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize)
     }
 
     let inline_items = collapse_image_updates(bundle_items.clone());
+    let detached_prefix_inline_items = collapse_image_updates(detached_prefix_items.clone());
     let reply_inline_items = collapse_image_updates(reply_bundle_items.clone());
     let bundle_image_count = count_images(&inline_items);
 
@@ -1259,6 +1278,7 @@ fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize)
         bundle_items,
         worker_text,
         detached_prefix_items,
+        detached_prefix_inline_items,
         detached_prefix_worker_text,
         reply_inline_items,
         reply_bundle_items,
@@ -1521,6 +1541,25 @@ fn compact_reply_without_output_bundle(material: &ReplyMaterial) -> Vec<Content>
         material.reply_inline_items.clone(),
         &material.reply_worker_text,
     )
+}
+
+fn compact_detached_prefix_without_output_bundle(material: &ReplyMaterial) -> Vec<Content> {
+    let detached_prefix_image_count = count_images(&material.detached_prefix_inline_items);
+    if detached_prefix_image_count > 0
+        && should_use_output_bundle(
+            detached_prefix_image_count,
+            material.detached_prefix_worker_text.chars().count(),
+        )
+    {
+        return compact_output_without_bundle_items(&material.detached_prefix_inline_items);
+    }
+    if text_should_spill(material.detached_prefix_worker_text.chars().count()) {
+        return compact_text_without_bundle_items(
+            material.detached_prefix_inline_items.clone(),
+            &material.detached_prefix_worker_text,
+        );
+    }
+    materialize_items(material.detached_prefix_inline_items.clone())
 }
 
 fn render_reply_items(
@@ -2424,6 +2463,110 @@ mod tests {
     }
 
     #[test]
+    fn detached_prefix_image_updates_collapse_on_follow_up_input() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::ContentImage {
+                        data: base64::engine::general_purpose::STANDARD.encode([0_u8]),
+                        mime_type: "image/png".to_string(),
+                        id: "plot-1".to_string(),
+                        is_new: true,
+                    },
+                    WorkerContent::ContentImage {
+                        data: base64::engine::general_purpose::STANDARD.encode([1_u8]),
+                        mime_type: "image/png".to_string(),
+                        id: "plot-1".to_string(),
+                        is_new: false,
+                    },
+                    WorkerContent::ContentImage {
+                        data: base64::engine::general_purpose::STANDARD.encode([2_u8]),
+                        mime_type: "image/png".to_string(),
+                        id: "plot-1".to_string(),
+                        is_new: false,
+                    },
+                    WorkerContent::worker_stdout("FOLLOW_UP_OK\n"),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FollowUpInput,
+            3,
+        );
+
+        let text = result_text(&result);
+        let images = result_images(&result);
+
+        assert!(
+            text.contains("FOLLOW_UP_OK"),
+            "expected follow-up reply inline, got: {text:?}"
+        );
+        assert_eq!(
+            images.len(),
+            1,
+            "expected collapsed detached-prefix image updates to keep one inline image"
+        );
+        assert_eq!(
+            images[0],
+            vec![2_u8],
+            "expected the final detached-prefix image update to remain inline"
+        );
+        assert!(
+            !text.contains("output bundle images"),
+            "did not expect a collapsed detached-prefix image update sequence to disclose a bundle, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn image_heavy_detached_prefix_spills_on_follow_up_input() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let mut contents: Vec<_> = (0..super::IMAGE_OUTPUT_BUNDLE_THRESHOLD)
+            .map(|index| WorkerContent::ContentImage {
+                data: base64::engine::general_purpose::STANDARD.encode([index as u8]),
+                mime_type: "image/png".to_string(),
+                id: format!("plot-{index}"),
+                is_new: true,
+            })
+            .collect();
+        contents.push(WorkerContent::worker_stdout("FOLLOW_UP_OK\n"));
+
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(contents, None)),
+            false,
+            TimeoutBundleReuse::FollowUpInput,
+            super::IMAGE_OUTPUT_BUNDLE_THRESHOLD,
+        );
+
+        let text = result_text(&result);
+        let images = result_images(&result);
+
+        assert!(
+            text.contains("FOLLOW_UP_OK"),
+            "expected follow-up reply inline, got: {text:?}"
+        );
+        assert!(
+            text.contains("output bundle images"),
+            "expected detached-prefix image burst to disclose an image bundle, got: {text:?}"
+        );
+        assert_eq!(
+            images.len(),
+            2,
+            "expected bundled detached-prefix image burst to keep only anchor images inline"
+        );
+        assert_eq!(
+            images[0],
+            vec![0_u8],
+            "expected the first detached-prefix image to remain as the first inline anchor"
+        );
+        assert_eq!(
+            images[1],
+            vec![(super::IMAGE_OUTPUT_BUNDLE_THRESHOLD - 1) as u8],
+            "expected the last detached-prefix image to remain as the last inline anchor"
+        );
+    }
+
+    #[test]
     fn timed_out_follow_up_reply_gets_its_own_active_bundle() {
         let mut state = ResponseState::new().expect("response state should initialize");
         let mut bundle = state
@@ -2810,6 +2953,52 @@ mod tests {
         assert!(
             state.output_store.bundles.is_empty(),
             "expected failed text bundle append to remove the undisclosed bundle"
+        );
+    }
+
+    #[test]
+    fn detached_prefix_text_spill_append_failure_returns_pathless_truncated_reply() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        state.output_store.create_root = output_store_root_with_text_conflict;
+
+        let detached_prefix = format!(
+            "HEAD\n{}\nMIDDLE\n{}\nTAIL\n",
+            "a".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200),
+            "b".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200)
+        );
+        let result = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout(detached_prefix),
+                    WorkerContent::worker_stdout("FOLLOW_UP_OK\n"),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FollowUpInput,
+            1,
+        );
+
+        let text = result_text(&result);
+        assert!(
+            text.contains("output bundle unavailable"),
+            "expected truncated detached-prefix fallback when bundle append fails, got: {text:?}"
+        );
+        assert!(
+            !text.contains("/transcript.txt") && !text.contains("/events.log"),
+            "did not expect bundle path in detached-prefix fallback reply, got: {text:?}"
+        );
+        assert!(
+            text.contains("HEAD\n") && text.contains("TAIL\n"),
+            "expected truncated detached-prefix preview in fallback reply, got: {text:?}"
+        );
+        assert!(
+            !text.contains("MIDDLE"),
+            "did not expect the full detached-prefix transcript inline after append failure, got: {text:?}"
+        );
+        assert!(
+            text.contains("FOLLOW_UP_OK"),
+            "expected follow-up reply inline after detached-prefix append failure, got: {text:?}"
         );
     }
 
