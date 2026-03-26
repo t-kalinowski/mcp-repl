@@ -116,6 +116,12 @@ struct ReplyMaterial {
     bundle_image_count: usize,
 }
 
+struct FollowUpDetachedPrefix {
+    contents: Vec<Content>,
+    protected_bundle_id: Option<u64>,
+    retained_active_timeout_bundle: Option<ActiveOutputBundle>,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum TimeoutBundleReuse {
     None,
@@ -349,8 +355,11 @@ impl ResponseState {
         pending_request_after: bool,
         active_timeout_bundle: Option<ActiveOutputBundle>,
     ) -> Vec<Content> {
-        let (mut contents, protected_bundle_id) =
-            self.render_follow_up_detached_prefix(material, active_timeout_bundle);
+        let FollowUpDetachedPrefix {
+            mut contents,
+            protected_bundle_id,
+            mut retained_active_timeout_bundle,
+        } = self.render_follow_up_detached_prefix(material, active_timeout_bundle);
 
         if material.error_code == Some(WorkerErrorCode::Timeout) {
             match self.output_store.new_bundle_preserving(protected_bundle_id) {
@@ -400,6 +409,18 @@ impl ResponseState {
             ));
         }
 
+        if pending_request_after
+            && material.error_code != Some(WorkerErrorCode::Timeout)
+            && self.active_timeout_bundle.is_none()
+        {
+            self.active_timeout_bundle = retained_active_timeout_bundle.take();
+        }
+        if let Some(active) = retained_active_timeout_bundle.take()
+            && let Err(err) = self.finish_bundle(active)
+        {
+            eprintln!("dropping closed timeout bundle after output-bundle error: {err}");
+        }
+
         contents
     }
 
@@ -407,7 +428,7 @@ impl ResponseState {
         &mut self,
         material: &ReplyMaterial,
         active_timeout_bundle: Option<ActiveOutputBundle>,
-    ) -> (Vec<Content>, Option<u64>) {
+    ) -> FollowUpDetachedPrefix {
         let Some(mut active) = active_timeout_bundle else {
             if should_spill_detached_prefix(material) {
                 match self.output_store.new_bundle() {
@@ -424,7 +445,11 @@ impl ResponseState {
                                     &retained_worker_text,
                                     &bundle,
                                 );
-                                return (contents, Some(bundle.id));
+                                return FollowUpDetachedPrefix {
+                                    contents,
+                                    protected_bundle_id: Some(bundle.id),
+                                    retained_active_timeout_bundle: None,
+                                };
                             }
                             Err(err) => {
                                 eprintln!(
@@ -443,10 +468,11 @@ impl ResponseState {
                     }
                 }
             }
-            return (
-                materialize_items(material.detached_prefix_items.clone()),
-                None,
-            );
+            return FollowUpDetachedPrefix {
+                contents: materialize_items(material.detached_prefix_items.clone()),
+                protected_bundle_id: None,
+                retained_active_timeout_bundle: None,
+            };
         };
 
         let contents = if material.detached_prefix_items.is_empty() {
@@ -466,11 +492,25 @@ impl ResponseState {
                 }
             }
         };
+        if !active.was_disclosed()
+            && active.has_retained_worker_output()
+            && detached_prefix_is_server_only(material)
+        {
+            return FollowUpDetachedPrefix {
+                contents,
+                protected_bundle_id: None,
+                retained_active_timeout_bundle: Some(active),
+            };
+        }
         let protected_bundle_id = active.was_disclosed().then_some(active.id);
         if let Err(err) = self.finish_bundle(active) {
             eprintln!("dropping closed timeout bundle after output-bundle error: {err}");
         }
-        (contents, protected_bundle_id)
+        FollowUpDetachedPrefix {
+            contents,
+            protected_bundle_id,
+            retained_active_timeout_bundle: None,
+        }
     }
 }
 
@@ -745,6 +785,10 @@ impl OutputStoreLimits {
 impl ActiveOutputBundle {
     fn was_disclosed(&self) -> bool {
         self.disclosed
+    }
+
+    fn has_retained_worker_output(&self) -> bool {
+        self.transcript_bytes > 0 || self.next_image_number > 0
     }
 
     fn append_items(
@@ -1570,6 +1614,13 @@ fn should_spill_detached_prefix(material: &ReplyMaterial) -> bool {
     !material.detached_prefix_items.is_empty()
         && count_images(&material.detached_prefix_items) == 0
         && text_should_spill(material.detached_prefix_worker_text.chars().count())
+}
+
+fn detached_prefix_is_server_only(material: &ReplyMaterial) -> bool {
+    material
+        .detached_prefix_items
+        .iter()
+        .all(|item| matches!(item, ReplyItem::ServerText(_)))
 }
 
 fn should_use_output_bundle(image_count: usize, worker_text_chars: usize) -> bool {
@@ -2478,6 +2529,83 @@ mod tests {
         assert!(
             !transcript.contains("FOLLOW_UP_TIMEOUT"),
             "did not expect fresh follow-up output in detached-prefix transcript: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn hidden_timeout_bundle_survives_server_only_follow_up_until_later_spill() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let first = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout("HEAD\n")],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::None,
+            0,
+        );
+        assert!(
+            disclosed_path(&result_text(&first), "transcript.txt").is_none(),
+            "did not expect the initial timed-out reply to disclose a bundle path"
+        );
+        assert!(
+            state.has_active_timeout_bundle(),
+            "expected the timed-out reply to keep an active timeout bundle"
+        );
+
+        let second = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::server_stdout("<<console status: busy>>\n"),
+                    WorkerContent::worker_stdout("FOLLOW_UP_INLINE\n"),
+                ],
+                None,
+            )),
+            true,
+            TimeoutBundleReuse::FollowUpInput,
+            1,
+        );
+        let second_text = result_text(&second);
+        assert!(
+            second_text.contains("FOLLOW_UP_INLINE"),
+            "expected the follow-up reply to stay inline, got: {second_text:?}"
+        );
+        assert!(
+            state.has_active_timeout_bundle(),
+            "expected a server-only detached prefix to preserve the hidden timeout bundle"
+        );
+
+        let detached_prefix = format!(
+            "TAIL_START\n{}\nTAIL_END\n",
+            "z".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200)
+        );
+        let third = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![
+                    WorkerContent::worker_stdout(detached_prefix),
+                    WorkerContent::worker_stdout("DONE\n"),
+                ],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FollowUpInput,
+            1,
+        );
+
+        let third_text = result_text(&third);
+        let transcript_path = disclosed_path(&third_text, "transcript.txt").unwrap_or_else(|| {
+            panic!("expected the later follow-up spill to disclose a transcript path, got: {third_text:?}")
+        });
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected transcript to be readable: {err}"));
+
+        assert!(
+            transcript.contains("HEAD\nTAIL_START\n") && transcript.contains("TAIL_END\n"),
+            "expected the preserved timeout bundle to keep the earlier timed-out bytes, got: {transcript:?}"
+        );
+        assert!(
+            !transcript.contains("DONE\n"),
+            "did not expect fresh follow-up output in the detached-prefix transcript: {transcript:?}"
         );
     }
 

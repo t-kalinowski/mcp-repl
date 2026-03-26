@@ -64,6 +64,61 @@ struct GuardrailShared {
     busy: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+struct LiveOutputCapture {
+    pending_output_tape: Option<PendingOutputTape>,
+    output_timeline: OutputTimeline,
+}
+
+impl LiveOutputCapture {
+    fn new(
+        oversized_output: OversizedOutputMode,
+        pending_output_tape: PendingOutputTape,
+        output_timeline: OutputTimeline,
+    ) -> Self {
+        Self {
+            pending_output_tape: matches!(oversized_output, OversizedOutputMode::Files)
+                .then_some(pending_output_tape),
+            output_timeline,
+        }
+    }
+
+    fn append_text(&self, bytes: &[u8], stream: TextStream) {
+        match stream {
+            TextStream::Stdout => {
+                self.output_timeline.append_text(bytes, false);
+                if let Some(tape) = &self.pending_output_tape {
+                    tape.append_stdout_bytes(bytes);
+                }
+            }
+            TextStream::Stderr => {
+                self.output_timeline.append_text(bytes, true);
+                if let Some(tape) = &self.pending_output_tape {
+                    tape.append_stderr_bytes(bytes);
+                }
+            }
+        }
+    }
+
+    fn append_image(&self, image: IpcPlotImage) {
+        self.output_timeline.append_image(
+            image.id.clone(),
+            image.mime_type.clone(),
+            image.data.clone(),
+            image.is_new,
+        );
+        if let Some(tape) = &self.pending_output_tape {
+            tape.append_image(image.id, image.mime_type, image.data, image.is_new);
+        }
+    }
+
+    fn append_sideband(&self, kind: PendingSidebandKind) {
+        if let Some(tape) = &self.pending_output_tape {
+            tape.append_sideband(kind);
+        }
+    }
+}
+
 #[cfg(target_family = "unix")]
 const WORKER_MEM_GUARDRAIL_RATIO: f64 = 0.75;
 #[cfg(target_family = "unix")]
@@ -2210,6 +2265,7 @@ impl WorkerManager {
             self.backend,
             &self.exe_path,
             &self.sandbox_state,
+            self.oversized_output,
             self.pending_output_tape.clone(),
             self.output_timeline.clone(),
             self.guardrail.clone(),
@@ -2252,6 +2308,7 @@ impl WorkerManager {
             self.backend,
             &self.exe_path,
             &self.sandbox_state,
+            self.oversized_output,
             self.pending_output_tape.clone(),
             self.output_timeline.clone(),
             self.guardrail.clone(),
@@ -3380,6 +3437,7 @@ impl WorkerProcess {
         backend: Backend,
         exe_path: &Path,
         sandbox_state: &SandboxState,
+        oversized_output: OversizedOutputMode,
         pending_output_tape: PendingOutputTape,
         output_timeline: OutputTimeline,
         guardrail: GuardrailShared,
@@ -3388,6 +3446,11 @@ impl WorkerProcess {
         let _ = &guardrail;
 
         let mut ipc_server = IpcServer::bind().map_err(WorkerError::Io)?;
+        let live_output = LiveOutputCapture::new(
+            oversized_output,
+            pending_output_tape.clone(),
+            output_timeline.clone(),
+        );
         let SpawnedWorker {
             child,
             stdin_tx,
@@ -3400,16 +3463,12 @@ impl WorkerProcess {
             Backend::R => Self::spawn_r_worker(
                 exe_path,
                 sandbox_state,
-                pending_output_tape.clone(),
-                output_timeline.clone(),
+                live_output.clone(),
                 &mut ipc_server,
             )?,
-            Backend::Python => Self::spawn_python_worker(
-                sandbox_state,
-                pending_output_tape.clone(),
-                output_timeline.clone(),
-                &mut ipc_server,
-            )?,
+            Backend::Python => {
+                Self::spawn_python_worker(sandbox_state, live_output.clone(), &mut ipc_server)?
+            }
         };
         #[allow(unused_mut)]
         let mut child = child;
@@ -3417,41 +3476,34 @@ impl WorkerProcess {
         let ipc = IpcHandle::new();
         #[cfg(any(target_family = "unix", target_family = "windows"))]
         {
-            let image_tape = pending_output_tape.clone();
-            let image_timeline = output_timeline.clone();
-            let sideband_tape = pending_output_tape.clone();
+            let image_capture = live_output.clone();
+            let sideband_capture = live_output.clone();
             let handlers = IpcHandlers {
                 on_plot_image: Some(Arc::new(move |image: IpcPlotImage| {
-                    image_timeline.append_image(
-                        image.id.clone(),
-                        image.mime_type.clone(),
-                        image.data.clone(),
-                        image.is_new,
-                    );
-                    image_tape.append_image(image.id, image.mime_type, image.data, image.is_new);
+                    image_capture.append_image(image);
                 })),
                 on_readline_start: Some(Arc::new(move |prompt: String| {
-                    sideband_tape.append_sideband(PendingSidebandKind::ReadlineStart { prompt });
+                    sideband_capture.append_sideband(PendingSidebandKind::ReadlineStart { prompt });
                 })),
                 on_readline_result: {
-                    let sideband_tape = pending_output_tape.clone();
+                    let sideband_capture = live_output.clone();
                     Some(Arc::new(move |event: IpcEchoEvent| {
-                        sideband_tape.append_sideband(PendingSidebandKind::ReadlineResult {
+                        sideband_capture.append_sideband(PendingSidebandKind::ReadlineResult {
                             prompt: event.prompt,
                             line: event.line,
                         });
                     }))
                 },
                 on_request_end: {
-                    let sideband_tape = pending_output_tape.clone();
+                    let sideband_capture = live_output.clone();
                     Some(Arc::new(move || {
-                        sideband_tape.append_sideband(PendingSidebandKind::RequestEnd);
+                        sideband_capture.append_sideband(PendingSidebandKind::RequestEnd);
                     }))
                 },
                 on_session_end: {
-                    let sideband_tape = pending_output_tape.clone();
+                    let sideband_capture = live_output.clone();
                     Some(Arc::new(move || {
-                        sideband_tape.append_sideband(PendingSidebandKind::SessionEnd);
+                        sideband_capture.append_sideband(PendingSidebandKind::SessionEnd);
                     }))
                 },
             };
@@ -3498,8 +3550,7 @@ impl WorkerProcess {
     fn spawn_r_worker(
         exe_path: &Path,
         sandbox_state: &SandboxState,
-        pending_output_tape: PendingOutputTape,
-        output_timeline: OutputTimeline,
+        live_output: LiveOutputCapture,
         ipc_server: &mut IpcServer,
     ) -> Result<SpawnedWorker, WorkerError> {
         let prepared =
@@ -3567,18 +3618,10 @@ impl WorkerProcess {
             .take()
             .ok_or_else(|| WorkerError::Protocol("worker stdin unavailable".to_string()))?;
         let stdin_tx = spawn_stdin_writer(stdin);
-        let stdout_reader = spawn_output_reader(
-            child.stdout.take(),
-            TextStream::Stdout,
-            pending_output_tape.clone(),
-            output_timeline.clone(),
-        );
-        let stderr_reader = spawn_output_reader(
-            child.stderr.take(),
-            TextStream::Stderr,
-            pending_output_tape.clone(),
-            output_timeline.clone(),
-        );
+        let stdout_reader =
+            spawn_output_reader(child.stdout.take(), TextStream::Stdout, live_output.clone());
+        let stderr_reader =
+            spawn_output_reader(child.stderr.take(), TextStream::Stderr, live_output.clone());
 
         #[cfg(target_os = "macos")]
         let mut denial_logger = prepared.denial_logger;
@@ -3611,15 +3654,13 @@ impl WorkerProcess {
 
     fn spawn_python_worker(
         sandbox_state: &SandboxState,
-        pending_output_tape: PendingOutputTape,
-        output_timeline: OutputTimeline,
+        live_output: LiveOutputCapture,
         ipc_server: &mut IpcServer,
     ) -> Result<SpawnedWorker, WorkerError> {
         #[cfg(not(target_family = "unix"))]
         {
             let _ = sandbox_state;
-            let _ = pending_output_tape;
-            let _ = output_timeline;
+            let _ = live_output;
             let _ = ipc_server;
             Err(WorkerError::Protocol(
                 "python backend requires a unix-style pty".to_string(),
@@ -3690,12 +3731,8 @@ impl WorkerProcess {
             let master_reader = master.try_clone()?;
             let stdin_tx = spawn_stdin_writer(master);
             // Python runs under a PTY so stdout/stderr are merged.
-            let stdout_reader = spawn_output_reader(
-                Some(master_reader),
-                TextStream::Stdout,
-                pending_output_tape.clone(),
-                output_timeline.clone(),
-            );
+            let stdout_reader =
+                spawn_output_reader(Some(master_reader), TextStream::Stdout, live_output.clone());
 
             #[cfg(target_os = "macos")]
             let mut denial_logger = prepared.denial_logger;
@@ -4249,8 +4286,7 @@ fn open_pty_pair() -> Result<(File, File), WorkerError> {
 fn spawn_output_reader<R>(
     stream: Option<R>,
     output_stream: TextStream,
-    pending_output_tape: PendingOutputTape,
-    output_timeline: OutputTimeline,
+    live_output: LiveOutputCapture,
 ) -> Option<std::thread::JoinHandle<()>>
 where
     R: Read + Send + 'static,
@@ -4263,16 +4299,7 @@ where
                 Ok(0) => {
                     break;
                 }
-                Ok(n) => match output_stream {
-                    TextStream::Stdout => {
-                        output_timeline.append_text(&buffer[..n], false);
-                        pending_output_tape.append_stdout_bytes(&buffer[..n]);
-                    }
-                    TextStream::Stderr => {
-                        output_timeline.append_text(&buffer[..n], true);
-                        pending_output_tape.append_stderr_bytes(&buffer[..n]);
-                    }
-                },
+                Ok(n) => live_output.append_text(&buffer[..n], output_stream),
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => break,
             }
@@ -4399,6 +4426,9 @@ fn worker_error_code(err: &WorkerError) -> Option<WorkerErrorCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::output_capture::{
+        OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, ensure_output_ring, reset_output_ring,
+    };
     use crate::sandbox::SandboxPolicy;
     use std::sync::{Mutex, OnceLock};
 
@@ -4583,6 +4613,38 @@ mod tests {
             "detached-prefix metadata must survive reset until server-side finalization"
         );
         let WorkerReply::Output { .. } = reply;
+    }
+
+    #[test]
+    fn pager_output_capture_skips_pending_output_tape() {
+        let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        let output = OutputBuffer::default();
+        output.start_capture();
+
+        let tape = PendingOutputTape::new();
+        let capture = LiveOutputCapture::new(
+            OversizedOutputMode::Pager,
+            tape.clone(),
+            OutputTimeline::new(output_ring),
+        );
+        capture.append_text(b"pager output\n", TextStream::Stdout);
+        capture.append_image(IpcPlotImage {
+            id: "img-1".to_string(),
+            data: "AA==".to_string(),
+            mime_type: "image/png".to_string(),
+            is_new: true,
+        });
+        capture.append_sideband(PendingSidebandKind::RequestEnd);
+
+        assert!(
+            tape.drain_final_snapshot().events.is_empty(),
+            "pager mode should not mirror text, images, or sideband events into the pending tape"
+        );
+        assert!(
+            output.end_offset().unwrap_or(0) > 0,
+            "pager mode should still append text to the output timeline"
+        );
     }
 
     #[test]

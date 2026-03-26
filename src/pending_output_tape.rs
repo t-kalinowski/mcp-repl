@@ -99,8 +99,8 @@ impl PendingOutputTape {
             .lock()
             .expect("pending output tape mutex poisoned");
         note_progress(&mut guard);
-        flush_tail(&mut guard, TextStream::Stdout, false);
-        flush_tail(&mut guard, TextStream::Stderr, false);
+        flush_tail(&mut guard, TextStream::Stdout, true);
+        flush_tail(&mut guard, TextStream::Stderr, true);
         let needs_separator = last_text_fragment_bytes(&guard.events)
             .is_some_and(|last| !last.ends_with(b"\n"))
             && !bytes.starts_with(b"\n");
@@ -758,6 +758,34 @@ mod tests {
         assert_eq!(
             snapshot.format_contents().contents,
             vec![WorkerContent::stdout("\\xC3")]
+        );
+    }
+
+    #[test]
+    fn status_line_flushes_incomplete_utf8_tail_before_notice() {
+        let tape = PendingOutputTape::new();
+        tape.append_stdout_bytes(&[0xC3]);
+        tape.append_stdout_status_line(b"[repl] session ended\n");
+
+        let snapshot = tape.drain_final_snapshot();
+        assert_eq!(
+            snapshot.events,
+            vec![
+                PendingOutputEvent::TextFragment {
+                    seq: 0,
+                    stream: TextStream::Stdout,
+                    origin: ContentOrigin::Worker,
+                    bytes: vec![0xC3],
+                    terminated: false,
+                },
+                PendingOutputEvent::TextFragment {
+                    seq: 1,
+                    stream: TextStream::Stdout,
+                    origin: ContentOrigin::Server,
+                    bytes: b"\n[repl] session ended\n".to_vec(),
+                    terminated: true,
+                },
+            ]
         );
     }
 
