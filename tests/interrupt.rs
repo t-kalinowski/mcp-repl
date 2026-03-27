@@ -161,6 +161,11 @@ async fn write_stdin_ctrl_d_prefix_restarts_then_runs_remaining_input() -> TestR
         .write_stdin_raw_with("\u{4}print(exists(\"x\"))", Some(10.0))
         .await?;
     let mut text = result_text(&first);
+    if backend_unavailable(&text) {
+        eprintln!("interrupt test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if text.contains("FALSE") {
@@ -179,6 +184,11 @@ async fn write_stdin_ctrl_d_prefix_restarts_then_runs_remaining_input() -> TestR
             .write_stdin_raw_with("print(exists(\"x\"))", Some(5.0))
             .await?;
         text = result_text(&result);
+        if backend_unavailable(&text) {
+            eprintln!("interrupt test backend unavailable in this environment; skipping");
+            session.cancel().await?;
+            return Ok(());
+        }
         if is_restart_transient_output(&text) {
             continue;
         }

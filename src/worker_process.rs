@@ -1772,8 +1772,9 @@ impl WorkerManager {
     fn maybe_reset_after_session_end(&mut self) {
         if self.session_end_seen {
             let _ = match self.oversized_output {
-                OversizedOutputMode::Files => self.reset(),
-                OversizedOutputMode::Pager => self.reset_with_pager(self.pager.is_active()),
+                OversizedOutputMode::Files => self.reset_preserving_detached_prefix_item_count(),
+                OversizedOutputMode::Pager => self
+                    .reset_with_pager_preserving_detached_prefix_item_count(self.pager.is_active()),
             };
             self.session_end_seen = false;
         }
@@ -4944,6 +4945,30 @@ mod tests {
             "detached-prefix metadata must survive reset until server-side finalization"
         );
         let WorkerReply::Output { .. } = reply;
+    }
+
+    #[test]
+    fn session_end_reset_preserves_detached_prefix_count() {
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        manager.last_detached_prefix_item_count = 2;
+        manager.session_end_seen = true;
+
+        manager.maybe_reset_after_session_end();
+
+        if let Some(process) = manager.process.take() {
+            let _ = process.kill();
+        }
+
+        assert_eq!(
+            manager.detached_prefix_item_count(),
+            2,
+            "session-end cleanup must preserve detached-prefix metadata until server finalization"
+        );
     }
 
     #[test]

@@ -155,6 +155,13 @@ fn backend_unavailable(text: &str) -> bool {
         || text.contains("worker io error: Broken pipe")
 }
 
+#[cfg(windows)]
+fn initial_plot_command_completed(text: &str) -> bool {
+    text.contains("plots_done")
+        || text.contains("<<repl status: busy")
+        || text.contains("--More-- (")
+}
+
 #[cfg(not(windows))]
 fn normalize_pager_footer_page_counts(text: &str) -> String {
     let marker = "--More-- (";
@@ -256,7 +263,7 @@ async fn windows_restart_interrupt_plot_smoke() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    if !text.contains("plots_done") && !text.contains("<<repl status: busy") {
+    if !initial_plot_command_completed(&text) {
         return Err(format!("expected plot command output marker, got: {text:?}").into());
     }
 
