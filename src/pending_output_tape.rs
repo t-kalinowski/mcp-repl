@@ -16,6 +16,7 @@ struct PendingOutputTapeInner {
     events: VecDeque<PendingOutputEvent>,
     stdout_tail: PendingTextTail,
     stderr_tail: PendingTextTail,
+    pending_echo_prefix: String,
     last_rendered_text: Option<RenderedTextState>,
 }
 
@@ -58,6 +59,7 @@ pub(crate) enum PendingSidebandKind {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PendingOutputSnapshot {
     pub events: Vec<PendingOutputEvent>,
+    leading_echo_prefix: Option<String>,
     prior_rendered_text: Option<RenderedTextState>,
 }
 
@@ -196,9 +198,22 @@ impl PendingOutputTape {
         flush_tail(&mut guard, TextStream::Stderr, flush_incomplete);
         let prior_rendered_text = guard.last_rendered_text;
         let events: Vec<_> = guard.events.drain(..).collect();
+        append_readline_results_to_echo_prefix(&mut guard.pending_echo_prefix, &events);
+        let leading_echo_prefix =
+            (!guard.pending_echo_prefix.is_empty()).then(|| guard.pending_echo_prefix.clone());
+        if let Some(echo_prefix) = leading_echo_prefix.as_deref() {
+            let (matched_bytes, keep_remaining_suffix) =
+                leading_echo_match_progress(&events, echo_prefix);
+            if keep_remaining_suffix {
+                guard.pending_echo_prefix = echo_prefix[matched_bytes..].to_string();
+            } else {
+                guard.pending_echo_prefix.clear();
+            }
+        }
         guard.last_rendered_text = rendered_text_state_after(events.iter(), prior_rendered_text);
         PendingOutputSnapshot {
             events,
+            leading_echo_prefix,
             prior_rendered_text,
         }
     }
@@ -280,46 +295,85 @@ impl PendingOutputSnapshot {
                 PendingOutputEvent::Sideband { .. } => {}
             }
         }
-        maybe_trim_leading_echo_prefix(&self.events, &mut formatted.contents);
+        maybe_trim_leading_echo_prefix(
+            self.leading_echo_prefix.as_deref(),
+            &mut formatted.contents,
+        );
         formatted
     }
 }
 
-fn maybe_trim_leading_echo_prefix(
-    events: &[PendingOutputEvent],
-    contents: &mut Vec<WorkerContent>,
-) {
-    let echo_events = collect_all_readline_results(events);
-    let Some(echo_prefix) = echo_transcript_from_events(&echo_events) else {
+fn maybe_trim_leading_echo_prefix(echo_prefix: Option<&str>, contents: &mut Vec<WorkerContent>) {
+    let Some(echo_prefix) = echo_prefix else {
         return;
     };
-    trim_matching_echo_prefix_from_contents(contents, &echo_prefix);
+    trim_matching_echo_prefix_from_contents(contents, echo_prefix);
 }
 
-fn collect_all_readline_results(events: &[PendingOutputEvent]) -> Vec<(String, String)> {
-    let mut out = Vec::new();
+fn append_readline_results_to_echo_prefix(echo_prefix: &mut String, events: &[PendingOutputEvent]) {
     for event in events {
         if let PendingOutputEvent::Sideband {
             kind: PendingSidebandKind::ReadlineResult { prompt, line },
             ..
         } = event
         {
-            out.push((prompt.clone(), line.clone()));
+            echo_prefix.push_str(prompt);
+            echo_prefix.push_str(line);
         }
     }
-    out
 }
 
-fn echo_transcript_from_events(events: &[(String, String)]) -> Option<String> {
-    if events.is_empty() {
-        return None;
+fn leading_echo_match_progress(events: &[PendingOutputEvent], echo_prefix: &str) -> (usize, bool) {
+    if echo_prefix.is_empty() {
+        return (0, false);
     }
-    let mut transcript = String::new();
-    for (prompt, line) in events {
-        transcript.push_str(prompt);
-        transcript.push_str(line);
+
+    let mut remaining = echo_prefix;
+    let mut matched_bytes = 0usize;
+    let mut saw_visible_content = false;
+
+    for event in events {
+        let PendingOutputEvent::TextFragment {
+            stream,
+            origin,
+            bytes,
+            ..
+        } = event
+        else {
+            if matches!(event, PendingOutputEvent::Sideband { .. }) {
+                continue;
+            }
+            return (matched_bytes, false);
+        };
+
+        if !matches!(stream, TextStream::Stdout) || !matches!(origin, ContentOrigin::Worker) {
+            return (matched_bytes, false);
+        }
+
+        let rendered = render_bytes(bytes);
+        if rendered.is_empty() {
+            continue;
+        }
+
+        saw_visible_content = true;
+        if remaining.is_empty() {
+            return (matched_bytes, false);
+        }
+
+        let common = common_prefix_len(remaining, &rendered);
+        matched_bytes = matched_bytes.saturating_add(common);
+        remaining = &remaining[common..];
+
+        if common < rendered.len() {
+            return (matched_bytes, false);
+        }
     }
-    Some(transcript)
+
+    if !saw_visible_content {
+        return (matched_bytes, true);
+    }
+
+    (matched_bytes, !remaining.is_empty())
 }
 
 fn trim_matching_echo_prefix_from_contents(contents: &mut Vec<WorkerContent>, echo_prefix: &str) {
@@ -830,6 +884,68 @@ mod tests {
         assert_eq!(
             second.format_contents().contents,
             vec![WorkerContent::stdout("é\n")]
+        );
+    }
+
+    #[test]
+    fn readline_result_prefix_carries_across_snapshot_drains_until_echo_arrives() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "1+\n".to_string(),
+        });
+        let first = tape.drain_snapshot();
+        assert!(
+            first.format_contents().contents.is_empty(),
+            "sideband-only snapshot should not render visible content"
+        );
+
+        tape.append_stdout_bytes(b"> 1");
+        let second = tape.drain_snapshot();
+        assert!(
+            second.format_contents().contents.is_empty(),
+            "partial echoed prefix should stay hidden until the remainder arrives"
+        );
+
+        tape.append_stdout_bytes(b"+\n[1] 2\n");
+        let third = tape.drain_snapshot();
+        assert_eq!(
+            third.format_contents().contents,
+            vec![WorkerContent::stdout("[1] 2\n")]
+        );
+    }
+
+    #[test]
+    fn interleaved_output_drops_unmatched_echo_suffix_from_later_drains() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "x <- 1\n".to_string(),
+        });
+        tape.append_sideband(PendingSidebandKind::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "y <- 2\n".to_string(),
+        });
+        let first = tape.drain_snapshot();
+        assert!(
+            first.format_contents().contents.is_empty(),
+            "sideband-only snapshot should not render visible content"
+        );
+
+        tape.append_stdout_bytes(b"> x <- 1\nok\n");
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::stdout("ok\n")]
+        );
+
+        tape.append_stdout_bytes(b"> y <- 2\n");
+        let third = tape.drain_snapshot();
+        assert_eq!(
+            third.format_contents().contents,
+            vec![WorkerContent::stdout("> y <- 2\n")]
         );
     }
 
