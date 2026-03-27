@@ -87,6 +87,12 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 cargo install --git https://github.com/t-kalinowski/mcp-repl --locked
 ```
 
+To install a specific version, pin the tag:
+
+```sh
+cargo install --git https://github.com/t-kalinowski/mcp-repl --tag v0.1.0 --locked
+```
+
 This installs `mcp-repl` into Cargo’s bin directory (typically `~/.cargo/bin`). Ensure that directory is on your `PATH`.
 
 ### 2) Wire into your MCP client
