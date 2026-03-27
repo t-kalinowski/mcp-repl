@@ -18,7 +18,9 @@ pub(crate) mod response;
 mod tests;
 mod timeouts;
 
-use self::response::{ResponseState, TimeoutBundleReuse, timeout_bundle_reuse_for_input};
+use self::response::{
+    ResponseState, TimeoutBundleReuse, strip_text_stream_meta, timeout_bundle_reuse_for_input,
+};
 use self::timeouts::{
     SANDBOX_UPDATE_TIMEOUT, apply_safety_margin, apply_tool_call_margin, parse_timeout,
 };
@@ -110,12 +112,14 @@ impl SharedServer {
                     .worker
                     .write_stdin(input, worker_timeout, server_timeout, None, false);
             let detached_prefix_item_count = state.worker.detached_prefix_item_count();
-            state.response.finalize_worker_result(
+            let mut result = state.response.finalize_worker_result(
                 result,
                 state.worker.pending_request(),
                 timeout_bundle_reuse,
                 detached_prefix_item_count,
-            )
+            );
+            strip_text_stream_meta(&mut result);
+            result
         })
         .await
     }
@@ -394,12 +398,14 @@ macro_rules! define_backend_tool_server {
                     .shared
                     .run_state(move |state| {
                         let result = state.worker.restart(worker_timeout);
-                        state.response.finalize_worker_result(
+                        let mut result = state.response.finalize_worker_result(
                             result,
                             state.worker.pending_request(),
                             TimeoutBundleReuse::None,
                             0,
-                        )
+                        );
+                        strip_text_stream_meta(&mut result);
+                        result
                     })
                     .await?;
                 Ok(result)

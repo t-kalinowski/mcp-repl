@@ -9,7 +9,9 @@ use rmcp::model::{CallToolResult, RawContent};
 use crate::backend::Backend;
 use crate::oversized_output::OversizedOutputMode;
 use crate::sandbox_cli::SandboxCliPlan;
-use crate::server::response::{ResponseState, TimeoutBundleReuse, timeout_bundle_reuse_for_input};
+use crate::server::response::{
+    ResponseState, TimeoutBundleReuse, text_stream_from_content, timeout_bundle_reuse_for_input,
+};
 use crate::worker_process::{WorkerError, WorkerManager};
 use crate::worker_protocol::{TextStream, WorkerContent, WorkerErrorCode, WorkerReply};
 
@@ -347,8 +349,12 @@ fn render_finalized_reply(
     }
 
     for content in reply.content {
+        let stream = text_stream_from_content(&content).unwrap_or(TextStream::Stdout);
         match content.raw {
-            RawContent::Text(text) => stdout.write_all(text.text.as_bytes())?,
+            RawContent::Text(text) => match stream {
+                TextStream::Stdout => stdout.write_all(text.text.as_bytes())?,
+                TextStream::Stderr => stderr.write_all(text.text.as_bytes())?,
+            },
             RawContent::Image(image) => {
                 if image_support && write_kitty_image(stdout, &image.data, &image.mime_type)? {
                     // image rendered
@@ -437,6 +443,8 @@ fn write_kitty_image(stdout: &mut impl Write, data: &str, mime_type: &str) -> io
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::response::{ResponseState, TimeoutBundleReuse};
+    use crate::worker_protocol::{WorkerContent, WorkerReply};
 
     #[test]
     fn detect_image_support_uses_mcp_repl_env() {
@@ -454,5 +462,49 @@ mod tests {
             },
         }
         assert!(enabled, "expected MCP_REPL_IMAGES=1 to enable images");
+    }
+
+    #[test]
+    fn finalized_reply_preserves_stderr_routing() {
+        let mut response = ResponseState::new().expect("response state should initialize");
+        let reply = response.finalize_worker_result(
+            Ok(WorkerReply::Output {
+                contents: vec![
+                    WorkerContent::worker_stdout("stdout line\n"),
+                    WorkerContent::worker_stderr("stderr: boom\n"),
+                ],
+                is_error: true,
+                error_code: None,
+                prompt: None,
+                prompt_variants: None,
+            }),
+            false,
+            TimeoutBundleReuse::None,
+            0,
+        );
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        render_finalized_reply(reply, Some(None), &mut stdout, &mut stderr, false)
+            .expect("finalized reply should render");
+
+        let stdout = String::from_utf8(stdout).expect("stdout should be valid UTF-8");
+        let stderr = String::from_utf8(stderr).expect("stderr should be valid UTF-8");
+        assert!(
+            stdout.contains("stdout line\n"),
+            "expected stdout text on stdout, got: {stdout:?}"
+        );
+        assert!(
+            !stdout.contains("stderr: boom\n"),
+            "stderr chunk leaked to stdout: {stdout:?}"
+        );
+        assert!(
+            stderr.contains("[repl] error\n"),
+            "expected error banner on stderr, got: {stderr:?}"
+        );
+        assert!(
+            stderr.contains("stderr: boom\n"),
+            "expected stderr chunk on stderr, got: {stderr:?}"
+        );
     }
 }

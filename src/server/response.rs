@@ -5,11 +5,16 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use rmcp::model::{AnnotateAble, CallToolResult, Content, RawContent, RawImageContent};
+use rmcp::model::{
+    AnnotateAble, CallToolResult, Content, Meta, RawContent, RawImageContent, RawTextContent,
+};
+use serde_json::Value;
 use tempfile::Builder;
 
 use crate::worker_process::WorkerError;
-use crate::worker_protocol::{ContentOrigin, WorkerContent, WorkerErrorCode, WorkerReply};
+use crate::worker_protocol::{
+    ContentOrigin, TextStream, WorkerContent, WorkerErrorCode, WorkerReply,
+};
 
 const INLINE_TEXT_BUDGET: usize = 3500;
 const INLINE_TEXT_HARD_SPILL_THRESHOLD_NUMERATOR: usize = 5;
@@ -30,6 +35,7 @@ const OUTPUT_BUNDLE_MAX_BYTES_ENV: &str = "MCP_REPL_OUTPUT_BUNDLE_MAX_BYTES";
 const OUTPUT_BUNDLE_MAX_TOTAL_BYTES_ENV: &str = "MCP_REPL_OUTPUT_BUNDLE_MAX_TOTAL_BYTES";
 const OUTPUT_BUNDLE_HEADER: &[u8] = b"v1\ntext transcript.txt\nimages images/\n";
 const OUTPUT_BUNDLE_OMITTED_NOTICE: &str = "output bundle quota reached; later content omitted";
+const TEXT_STREAM_META_KEY: &str = "mcpReplTextStream";
 
 pub(crate) struct ResponseState {
     output_store: OutputStore,
@@ -91,9 +97,25 @@ struct OutputStoreLimits {
 
 #[derive(Clone)]
 enum ReplyItem {
-    WorkerText(String),
-    ServerText(String),
+    WorkerText { text: String, stream: TextStream },
+    ServerText { text: String, stream: TextStream },
     Image(ReplyImage),
+}
+
+impl ReplyItem {
+    fn worker_text(text: impl Into<String>, stream: TextStream) -> Self {
+        Self::WorkerText {
+            text: text.into(),
+            stream,
+        }
+    }
+
+    fn server_text(text: impl Into<String>, stream: TextStream) -> Self {
+        Self::ServerText {
+            text: text.into(),
+            stream,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1121,19 +1143,19 @@ impl ActiveOutputBundle {
 
         for item in items {
             if self.omitted_tail {
-                if let ReplyItem::ServerText(text) = item {
-                    retained_items.push(ReplyItem::ServerText(text.clone()));
+                if let ReplyItem::ServerText { text, stream } = item {
+                    retained_items.push(ReplyItem::server_text(text.clone(), *stream));
                 }
                 continue;
             }
 
             match item {
-                ReplyItem::WorkerText(text) => {
-                    let append = self.append_worker_text(store, text)?;
+                ReplyItem::WorkerText { text, stream } => {
+                    let append = self.append_worker_text(store, text, *stream)?;
                     if let Some(retained_item) = append {
                         let partial_worker_text = matches!(
                             &retained_item,
-                            ReplyItem::WorkerText(retained) if retained.len() < text.len()
+                            ReplyItem::WorkerText { text: retained, .. } if retained.len() < text.len()
                         );
                         retained_items.push(retained_item);
                         if partial_worker_text {
@@ -1145,14 +1167,16 @@ impl ActiveOutputBundle {
                         self.apply_omission(store)?;
                     }
                 }
-                ReplyItem::ServerText(text) => match self.append_server_text(store, text)? {
-                    Some(retained_item) => retained_items.push(retained_item),
-                    None => {
-                        omitted_this_reply = true;
-                        self.apply_omission(store)?;
-                        retained_items.push(ReplyItem::ServerText(text.clone()));
+                ReplyItem::ServerText { text, stream } => {
+                    match self.append_server_text(store, text, *stream)? {
+                        Some(retained_item) => retained_items.push(retained_item),
+                        None => {
+                            omitted_this_reply = true;
+                            self.apply_omission(store)?;
+                            retained_items.push(ReplyItem::server_text(text.clone(), *stream));
+                        }
                     }
-                },
+                }
                 ReplyItem::Image(image) => {
                     if let Some(retained_item) = self.append_image(store, image)? {
                         retained_items.push(retained_item);
@@ -1174,6 +1198,7 @@ impl ActiveOutputBundle {
         &mut self,
         store: &mut OutputStore,
         text: &str,
+        stream: TextStream,
     ) -> Result<Option<ReplyItem>, WorkerError> {
         if text.is_empty() {
             return Ok(None);
@@ -1227,7 +1252,7 @@ impl ActiveOutputBundle {
                 self.transcript_bytes = self.transcript_bytes.saturating_add(retained.len());
                 self.transcript_lines = next_line_count;
                 self.transcript_has_partial_line = next_has_partial_line;
-                return Ok(Some(ReplyItem::WorkerText(retained.to_string())));
+                return Ok(Some(ReplyItem::worker_text(retained.to_string(), stream)));
             }
             let allowed_text_bytes = granted.saturating_sub(row.len().saturating_add(reserve));
             let next = truncate_utf8_prefix(retained, allowed_text_bytes);
@@ -1242,9 +1267,10 @@ impl ActiveOutputBundle {
         &mut self,
         store: &mut OutputStore,
         text: &str,
+        stream: TextStream,
     ) -> Result<Option<ReplyItem>, WorkerError> {
         let _ = store;
-        Ok(Some(ReplyItem::ServerText(text.to_string())))
+        Ok(Some(ReplyItem::server_text(text.to_string(), stream)))
     }
 
     fn append_events_log_text<'a>(
@@ -1482,7 +1508,7 @@ impl StagedTimeoutOutput {
         self.items
             .iter()
             .map(|item| match item {
-                ReplyItem::WorkerText(text) => text.chars().count(),
+                ReplyItem::WorkerText { text, .. } => text.chars().count(),
                 _ => 0,
             })
             .sum()
@@ -1491,13 +1517,13 @@ impl StagedTimeoutOutput {
     fn has_retained_worker_output(&self) -> bool {
         self.items
             .iter()
-            .any(|item| matches!(item, ReplyItem::WorkerText(_) | ReplyItem::Image(_)))
+            .any(|item| matches!(item, ReplyItem::WorkerText { .. } | ReplyItem::Image(_)))
     }
 
     fn retained_items(items: &[ReplyItem]) -> Vec<ReplyItem> {
         items
             .iter()
-            .filter(|item| matches!(item, ReplyItem::WorkerText(_) | ReplyItem::Image(_)))
+            .filter(|item| matches!(item, ReplyItem::WorkerText { .. } | ReplyItem::Image(_)))
             .cloned()
             .collect()
     }
@@ -1557,7 +1583,11 @@ fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize)
     for (index, content) in contents.into_iter().enumerate() {
         let is_detached_prefix = index < detached_prefix_item_count;
         match content {
-            WorkerContent::ContentText { text, origin, .. } => {
+            WorkerContent::ContentText {
+                text,
+                origin,
+                stream,
+            } => {
                 let text = if matches!(origin, ContentOrigin::Worker) {
                     normalize_error_prompt(text, is_error)
                 } else {
@@ -1574,9 +1604,9 @@ fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize)
                         } else {
                             reply_worker_text.push_str(&text);
                         }
-                        ReplyItem::WorkerText(text)
+                        ReplyItem::worker_text(text, stream)
                     }
-                    ContentOrigin::Server => ReplyItem::ServerText(text),
+                    ContentOrigin::Server => ReplyItem::server_text(text, stream),
                 };
                 if is_detached_prefix {
                     detached_prefix_items.push(item.clone());
@@ -1631,11 +1661,28 @@ pub(crate) fn finalize_batch(mut contents: Vec<Content>, is_error: bool) -> Call
     CallToolResult::success(contents)
 }
 
+pub(crate) fn strip_text_stream_meta(result: &mut CallToolResult) {
+    for item in &mut result.content {
+        let RawContent::Text(text) = &mut item.raw else {
+            continue;
+        };
+        let Some(meta) = &mut text.meta else {
+            continue;
+        };
+        meta.remove(TEXT_STREAM_META_KEY);
+        if meta.is_empty() {
+            text.meta = None;
+        }
+    }
+}
+
 fn materialize_items(items: Vec<ReplyItem>) -> Vec<Content> {
     items
         .into_iter()
         .map(|item| match item {
-            ReplyItem::WorkerText(text) | ReplyItem::ServerText(text) => Content::text(text),
+            ReplyItem::WorkerText { text, stream } | ReplyItem::ServerText { text, stream } => {
+                content_text(text, stream)
+            }
             ReplyItem::Image(image) => image_to_content(&image),
         })
         .collect()
@@ -1643,6 +1690,41 @@ fn materialize_items(items: Vec<ReplyItem>) -> Vec<Content> {
 
 fn image_to_content(image: &ReplyImage) -> Content {
     content_image(image.data.clone(), image.mime_type.clone())
+}
+
+pub(crate) fn text_stream_from_content(content: &Content) -> Option<TextStream> {
+    let RawContent::Text(text) = &content.raw else {
+        return None;
+    };
+    text.meta.as_ref().and_then(text_stream_from_meta)
+}
+
+fn content_text(text: String, stream: TextStream) -> Content {
+    RawContent::Text(RawTextContent {
+        text,
+        meta: text_stream_meta(stream),
+    })
+    .no_annotation()
+}
+
+fn text_stream_meta(stream: TextStream) -> Option<Meta> {
+    if !matches!(stream, TextStream::Stderr) {
+        return None;
+    }
+    let mut meta = Meta::new();
+    meta.insert(
+        TEXT_STREAM_META_KEY.to_string(),
+        Value::String("stderr".to_string()),
+    );
+    Some(meta)
+}
+
+fn text_stream_from_meta(meta: &Meta) -> Option<TextStream> {
+    match meta.get(TEXT_STREAM_META_KEY).and_then(Value::as_str) {
+        Some("stderr") => Some(TextStream::Stderr),
+        Some("stdout") => Some(TextStream::Stdout),
+        _ => None,
+    }
 }
 
 fn count_images(items: &[ReplyItem]) -> usize {
@@ -1655,7 +1737,7 @@ fn count_images(items: &[ReplyItem]) -> usize {
 fn worker_text_from_items(items: &[ReplyItem]) -> String {
     let mut out = String::new();
     for item in items {
-        if let ReplyItem::WorkerText(text) = item {
+        if let ReplyItem::WorkerText { text, .. } = item {
             out.push_str(text);
         }
     }
@@ -1676,13 +1758,13 @@ fn compact_text_bundle_items(
     let mut worker_inserted = false;
     for item in items {
         match item {
-            ReplyItem::WorkerText(_) => {
+            ReplyItem::WorkerText { .. } => {
                 if !worker_inserted {
                     out.push(Content::text(preview.clone()));
                     worker_inserted = true;
                 }
             }
-            ReplyItem::ServerText(text) => out.push(Content::text(text)),
+            ReplyItem::ServerText { text, stream } => out.push(content_text(text, stream)),
             ReplyItem::Image(image) => out.push(image_to_content(&image)),
         }
     }
@@ -1698,13 +1780,13 @@ fn compact_text_without_bundle_items(items: Vec<ReplyItem>, worker_text: &str) -
     let mut worker_inserted = false;
     for item in items {
         match item {
-            ReplyItem::WorkerText(_) => {
+            ReplyItem::WorkerText { .. } => {
                 if !worker_inserted {
                     out.push(Content::text(preview.clone()));
                     worker_inserted = true;
                 }
             }
-            ReplyItem::ServerText(text) => out.push(Content::text(text)),
+            ReplyItem::ServerText { text, stream } => out.push(content_text(text, stream)),
             ReplyItem::Image(image) => out.push(image_to_content(&image)),
         }
     }
@@ -2125,7 +2207,7 @@ fn collect_prefix_text_after(items: &[ReplyItem], index: Option<usize>, budget: 
 
 fn item_text(item: &ReplyItem) -> Option<&str> {
     match item {
-        ReplyItem::WorkerText(text) | ReplyItem::ServerText(text) => Some(text),
+        ReplyItem::WorkerText { text, .. } | ReplyItem::ServerText { text, .. } => Some(text),
         ReplyItem::Image(_) => None,
     }
 }
@@ -2455,7 +2537,7 @@ mod tests {
         compact_output_bundle_items, normalize_error_prompt,
     };
     use crate::worker_process::WorkerError;
-    use crate::worker_protocol::{WorkerContent, WorkerErrorCode, WorkerReply};
+    use crate::worker_protocol::{TextStream, WorkerContent, WorkerErrorCode, WorkerReply};
 
     fn result_text(result: &rmcp::model::CallToolResult) -> String {
         result
@@ -2540,9 +2622,9 @@ mod tests {
         let mut bundle = store.new_bundle().expect("bundle should initialize");
 
         let first = bundle
-            .append_worker_text(&mut store, "a")
+            .append_worker_text(&mut store, "a", TextStream::Stdout)
             .expect("first worker text should append");
-        assert!(matches!(first, Some(ReplyItem::WorkerText(text)) if text == "a"));
+        assert!(matches!(first, Some(ReplyItem::WorkerText { text, .. }) if text == "a"));
 
         let image = ReplyImage {
             data: base64::engine::general_purpose::STANDARD.encode([0_u8]),
@@ -2555,9 +2637,9 @@ mod tests {
         assert!(matches!(retained_image, Some(ReplyItem::Image(_))));
 
         let second = bundle
-            .append_worker_text(&mut store, "b\n")
+            .append_worker_text(&mut store, "b\n", TextStream::Stdout)
             .expect("second worker text should append");
-        assert!(matches!(second, Some(ReplyItem::WorkerText(text)) if text == "b\n"));
+        assert!(matches!(second, Some(ReplyItem::WorkerText { text, .. }) if text == "b\n"));
 
         let transcript = std::fs::read_to_string(&bundle.paths.transcript)
             .expect("transcript should be readable");
@@ -2715,7 +2797,7 @@ mod tests {
             "x".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200)
         );
         bundle
-            .append_worker_text(&mut state.output_store, "HEAD\n")
+            .append_worker_text(&mut state.output_store, "HEAD\n", TextStream::Stdout)
             .expect("existing timeout text should append");
         let transcript_path = bundle.paths.transcript.clone();
         state.active_timeout_bundle = Some(bundle);
@@ -2766,7 +2848,7 @@ mod tests {
             .new_bundle()
             .expect("timeout bundle should initialize");
         bundle
-            .append_worker_text(&mut state.output_store, "HEAD\n")
+            .append_worker_text(&mut state.output_store, "HEAD\n", TextStream::Stdout)
             .expect("existing timeout text should append");
         bundle.disclosed = true;
         let timeout_transcript_path = bundle.paths.transcript.clone();
@@ -3076,7 +3158,7 @@ mod tests {
             .new_bundle()
             .expect("timeout bundle should initialize");
         bundle
-            .append_worker_text(&mut state.output_store, "HEAD\n")
+            .append_worker_text(&mut state.output_store, "HEAD\n", TextStream::Stdout)
             .expect("existing timeout text should append");
         bundle.disclosed = true;
         let timeout_transcript_path = bundle.paths.transcript.clone();
@@ -3482,7 +3564,7 @@ mod tests {
         assert_eq!(staged.items.len(), 1);
         assert!(matches!(
             staged.items.first(),
-            Some(ReplyItem::WorkerText(text)) if text == "HEAD\n"
+            Some(ReplyItem::WorkerText { text, .. }) if text == "HEAD\n"
         ));
 
         let second = state.finalize_worker_result(
@@ -3511,7 +3593,7 @@ mod tests {
         );
         assert!(matches!(
             staged.items.first(),
-            Some(ReplyItem::WorkerText(text)) if text == "HEAD\n"
+            Some(ReplyItem::WorkerText { text, .. }) if text == "HEAD\n"
         ));
     }
 
@@ -3523,7 +3605,7 @@ mod tests {
             .new_bundle()
             .expect("timeout bundle should initialize");
         bundle
-            .append_worker_text(&mut state.output_store, "HEAD\n")
+            .append_worker_text(&mut state.output_store, "HEAD\n", TextStream::Stdout)
             .expect("existing timeout text should append");
         bundle.disclosed = true;
         let transcript_path = bundle.paths.transcript.clone();
@@ -3579,7 +3661,7 @@ mod tests {
             .new_bundle()
             .expect("timeout bundle should initialize");
         bundle
-            .append_worker_text(&mut state.output_store, "HEAD\n")
+            .append_worker_text(&mut state.output_store, "HEAD\n", TextStream::Stdout)
             .expect("existing timeout text should append");
         bundle.disclosed = true;
         let transcript_path = bundle.paths.transcript.clone();
@@ -3635,7 +3717,7 @@ mod tests {
             .new_bundle()
             .expect("timeout bundle should initialize");
         bundle
-            .append_worker_text(&mut state.output_store, "HEAD\n")
+            .append_worker_text(&mut state.output_store, "HEAD\n", TextStream::Stdout)
             .expect("existing timeout text should append");
         bundle.disclosed = true;
         let timeout_transcript_path = bundle.paths.transcript.clone();
@@ -3687,7 +3769,7 @@ mod tests {
             .new_bundle()
             .expect("disclosed bundle should initialize");
         bundle
-            .append_worker_text(&mut state.output_store, "PERSIST\n")
+            .append_worker_text(&mut state.output_store, "PERSIST\n", TextStream::Stdout)
             .expect("disclosed bundle text should append");
         bundle.disclosed = true;
         let transcript_path = bundle.paths.transcript.clone();
@@ -4124,7 +4206,7 @@ mod tests {
         let mut store = OutputStore::new().expect("output store should initialize");
         let mut bundle = store.new_bundle().expect("bundle should initialize");
         bundle
-            .append_worker_text(&mut store, "quota")
+            .append_worker_text(&mut store, "quota", TextStream::Stdout)
             .expect("worker text should append");
         let bundle_id = bundle.id;
         let bundle_dir = bundle.paths.dir.clone();
@@ -4192,9 +4274,9 @@ mod tests {
         let mut bundle = store.new_bundle().expect("bundle should initialize");
 
         let worker_text = bundle
-            .append_worker_text(&mut store, "a")
+            .append_worker_text(&mut store, "a", TextStream::Stdout)
             .expect("worker text should append");
-        assert!(matches!(worker_text, Some(ReplyItem::WorkerText(text)) if text == "a"));
+        assert!(matches!(worker_text, Some(ReplyItem::WorkerText { text, .. }) if text == "a"));
 
         let image = ReplyImage {
             data: base64::engine::general_purpose::STANDARD.encode([0_u8]),
@@ -4279,6 +4361,31 @@ mod tests {
         assert!(
             text.contains(images_dir.to_string_lossy().as_ref()),
             "expected omission notice to disclose bundle path, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn strip_text_stream_meta_removes_internal_marker() {
+        let mut result = super::finalize_batch(
+            vec![super::content_text(
+                "stderr: boom\n".to_string(),
+                TextStream::Stderr,
+            )],
+            false,
+        );
+
+        assert_eq!(
+            super::text_stream_from_content(&result.content[0]),
+            Some(TextStream::Stderr)
+        );
+
+        super::strip_text_stream_meta(&mut result);
+
+        assert_eq!(super::text_stream_from_content(&result.content[0]), None);
+        let value = serde_json::to_value(&result).expect("result should serialize");
+        assert!(
+            !value.to_string().contains(super::TEXT_STREAM_META_KEY),
+            "did not expect stripped result to expose internal stream metadata: {value}"
         );
     }
 }

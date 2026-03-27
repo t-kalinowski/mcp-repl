@@ -164,6 +164,7 @@ fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) {
     ipc.clear_readline_tracking();
     ipc.clear_prompt_history();
     ipc.clear_echo_events();
+    ipc.set_expected_readline_lines(_text);
 }
 
 const REQUEST_END_FALLBACK_WAIT: Duration = Duration::from_millis(20);
@@ -4926,6 +4927,72 @@ mod tests {
             "expected protocol warning, got: {:?}",
             completion.protocol_warnings
         );
+    }
+
+    #[test]
+    fn late_echo_after_next_input_start_does_not_pollute_next_completion() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+
+        driver_on_input_start("first()", &server);
+        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+        let first = driver_wait_for_completion(Duration::from_millis(200), server.clone())
+            .expect("expected first completion");
+        assert!(first.echo_events.is_empty());
+
+        driver_on_input_start("second()", &server);
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "first()\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "> ".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "second()\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+
+        let second = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected second completion");
+
+        assert!(
+            second.protocol_warnings.is_empty(),
+            "did not expect dropped late echoes to surface warnings, got: {:?}",
+            second.protocol_warnings
+        );
+        assert_eq!(second.echo_events.len(), 1);
+        assert_eq!(second.echo_events[0].prompt, "> ");
+        assert_eq!(second.echo_events[0].line, "second()\n");
+    }
+
+    #[test]
+    fn next_request_result_is_retained_when_prompt_is_already_active() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+
+        driver_on_input_start("first()", &server);
+        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "> ".to_string(),
+        });
+        let first = driver_wait_for_completion(Duration::from_millis(200), server.clone())
+            .expect("expected first completion");
+        assert_eq!(first.prompt.as_deref(), Some("> "));
+
+        driver_on_input_start("second()", &server);
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "second()\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+
+        let second = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected second completion");
+
+        assert!(second.protocol_warnings.is_empty());
+        assert_eq!(second.echo_events.len(), 1);
+        assert_eq!(second.echo_events[0].prompt, "> ");
+        assert_eq!(second.echo_events[0].line, "second()\n");
     }
 
     #[test]
