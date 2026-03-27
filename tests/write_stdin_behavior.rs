@@ -1019,6 +1019,10 @@ async fn timeout_bundle_stops_before_ctrl_d_restart_output() -> TestResult<()> {
     session.cancel().await?;
 
     assert!(
+        restart_text.contains("new session started"),
+        "expected ctrl-d inline reply to keep the restart notice, got: {restart_text:?}"
+    );
+    assert!(
         restart_text.contains("after reset"),
         "expected restarted session output, got: {restart_text:?}"
     );

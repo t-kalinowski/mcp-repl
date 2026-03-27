@@ -691,7 +691,9 @@ impl WorkerManager {
             if remaining.is_empty() {
                 return Ok(control_reply);
             }
-            return self.write_stdin_files(remaining.to_string(), worker_timeout, server_timeout);
+            let remaining_reply =
+                self.write_stdin_files(remaining.to_string(), worker_timeout, server_timeout)?;
+            return Ok(prefix_worker_reply(control_reply, remaining_reply));
         }
 
         if self.guardrail_busy_event_pending() {
@@ -3505,6 +3507,34 @@ fn strip_prompt_from_contents(contents: &mut Vec<WorkerContent>, prompt: &str) {
         } else {
             idx = idx.saturating_add(1);
         }
+    }
+}
+
+fn prefix_worker_reply(prefix: WorkerReply, suffix: WorkerReply) -> WorkerReply {
+    let WorkerReply::Output {
+        mut contents,
+        is_error,
+        error_code,
+        prompt,
+        prompt_variants,
+    } = prefix;
+    let WorkerReply::Output {
+        contents: suffix_contents,
+        is_error: suffix_is_error,
+        error_code: suffix_error_code,
+        prompt: suffix_prompt,
+        prompt_variants: suffix_prompt_variants,
+    } = suffix;
+    if let Some(prompt_text) = prompt.as_deref() {
+        strip_trailing_prompt(&mut contents, prompt_text);
+    }
+    contents.extend(suffix_contents);
+    WorkerReply::Output {
+        contents,
+        is_error: is_error || suffix_is_error,
+        error_code: suffix_error_code.or(error_code),
+        prompt: suffix_prompt.or(prompt),
+        prompt_variants: suffix_prompt_variants.or(prompt_variants),
     }
 }
 

@@ -24,6 +24,7 @@ struct PendingOutputTapeInner {
 struct PendingTextTail {
     bytes: Vec<u8>,
     origin: Option<ContentOrigin>,
+    start_seq: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,6 +47,16 @@ pub(crate) enum PendingOutputEvent {
         seq: u64,
         kind: PendingSidebandKind,
     },
+}
+
+impl PendingOutputEvent {
+    fn seq(&self) -> u64 {
+        match self {
+            Self::TextFragment { seq, .. }
+            | Self::Image { seq, .. }
+            | Self::Sideband { seq, .. } => *seq,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -129,13 +140,16 @@ impl PendingOutputTape {
         flush_tail(&mut guard, TextStream::Stdout, true);
         flush_tail(&mut guard, TextStream::Stderr, true);
         let seq = next_seq(&mut guard);
-        guard.events.push_back(PendingOutputEvent::Image {
-            seq,
-            data,
-            mime_type,
-            id,
-            is_new,
-        });
+        append_event(
+            &mut guard,
+            PendingOutputEvent::Image {
+                seq,
+                data,
+                mime_type,
+                id,
+                is_new,
+            },
+        );
     }
 
     pub(crate) fn append_sideband(&self, kind: PendingSidebandKind) {
@@ -147,9 +161,7 @@ impl PendingOutputTape {
         flush_tail(&mut guard, TextStream::Stdout, false);
         flush_tail(&mut guard, TextStream::Stderr, false);
         let seq = next_seq(&mut guard);
-        guard
-            .events
-            .push_back(PendingOutputEvent::Sideband { seq, kind });
+        append_event(&mut guard, PendingOutputEvent::Sideband { seq, kind });
     }
 
     pub(crate) fn has_pending(&self) -> bool {
@@ -237,6 +249,10 @@ impl PendingOutputTape {
             .is_some_and(|tail_origin| tail_origin != origin)
         {
             flush_tail(&mut guard, stream, true);
+        }
+        if tail_mut(&mut guard, stream).bytes.is_empty() {
+            let seq = next_seq(&mut guard);
+            tail_mut(&mut guard, stream).start_seq = Some(seq);
         }
         let tail = tail_mut(&mut guard, stream);
         if tail.origin.is_none() {
@@ -587,22 +603,28 @@ fn append_complete_bytes(
         return;
     }
     let seq = next_seq(inner);
-    inner.events.push_back(PendingOutputEvent::TextFragment {
-        seq,
-        stream,
-        origin,
-        bytes: bytes.to_vec(),
-        terminated: bytes.ends_with(b"\n"),
-    });
+    append_event(
+        inner,
+        PendingOutputEvent::TextFragment {
+            seq,
+            stream,
+            origin,
+            bytes: bytes.to_vec(),
+            terminated: bytes.ends_with(b"\n"),
+        },
+    );
 }
 
 fn commit_complete_lines(inner: &mut PendingOutputTapeInner, stream: TextStream) {
     loop {
-        let (origin, line, tail_empty) = {
+        let (seq, origin, line, tail_empty) = {
             let tail = tail_mut(inner, stream);
             let Some(newline_idx) = tail.bytes.iter().position(|byte| *byte == b'\n') else {
                 break;
             };
+            let seq = tail
+                .start_seq
+                .expect("text tail should reserve a sequence while bytes are buffered");
             let origin = tail
                 .origin
                 .expect("text tail should record origin while bytes are buffered");
@@ -610,25 +632,29 @@ fn commit_complete_lines(inner: &mut PendingOutputTapeInner, stream: TextStream)
             let tail_empty = tail.bytes.is_empty();
             if tail_empty {
                 tail.origin = None;
+                tail.start_seq = None;
             }
-            (origin, line, tail_empty)
+            (seq, origin, line, tail_empty)
         };
-        let seq = next_seq(inner);
-        inner.events.push_back(PendingOutputEvent::TextFragment {
-            seq,
-            stream,
-            origin,
-            bytes: line,
-            terminated: true,
-        });
-        if tail_empty {
-            break;
+        append_event(
+            inner,
+            PendingOutputEvent::TextFragment {
+                seq,
+                stream,
+                origin,
+                bytes: line,
+                terminated: true,
+            },
+        );
+        if !tail_empty {
+            let next = next_seq(inner);
+            tail_mut(inner, stream).start_seq = Some(next);
         }
     }
 }
 
 fn flush_tail(inner: &mut PendingOutputTapeInner, stream: TextStream, flush_incomplete: bool) {
-    let (origin, bytes) = {
+    let (seq, origin, bytes, tail_empty) = {
         let tail = tail_mut(inner, stream);
         if tail.bytes.is_empty() {
             return;
@@ -640,23 +666,48 @@ fn flush_tail(inner: &mut PendingOutputTapeInner, stream: TextStream, flush_inco
         if flush_len == 0 {
             return;
         }
+        let seq = tail
+            .start_seq
+            .expect("text tail should reserve a sequence while bytes are buffered");
         let origin = tail
             .origin
             .expect("text tail should record origin while bytes are buffered");
         let bytes = tail.bytes.drain(..flush_len).collect::<Vec<u8>>();
-        if tail.bytes.is_empty() {
+        let tail_empty = tail.bytes.is_empty();
+        if tail_empty {
             tail.origin = None;
+            tail.start_seq = None;
         }
-        (origin, bytes)
+        (seq, origin, bytes, tail_empty)
     };
-    let seq = next_seq(inner);
-    inner.events.push_back(PendingOutputEvent::TextFragment {
-        seq,
-        stream,
-        origin,
-        bytes,
-        terminated: false,
-    });
+    append_event(
+        inner,
+        PendingOutputEvent::TextFragment {
+            seq,
+            stream,
+            origin,
+            bytes,
+            terminated: false,
+        },
+    );
+    if !tail_empty {
+        let next = next_seq(inner);
+        tail_mut(inner, stream).start_seq = Some(next);
+    }
+}
+
+fn append_event(inner: &mut PendingOutputTapeInner, event: PendingOutputEvent) {
+    let seq = event.seq();
+    if inner.events.back().is_none_or(|last| last.seq() < seq) {
+        inner.events.push_back(event);
+        return;
+    }
+    let idx = inner
+        .events
+        .iter()
+        .position(|existing| existing.seq() > seq)
+        .unwrap_or(inner.events.len());
+    inner.events.insert(idx, event);
 }
 
 fn last_text_fragment_bytes(events: &VecDeque<PendingOutputEvent>) -> Option<&[u8]> {
@@ -921,6 +972,24 @@ mod tests {
         assert_eq!(
             second.format_contents().contents,
             vec![WorkerContent::stdout("é\n")]
+        );
+    }
+
+    #[test]
+    fn split_utf8_stdout_keeps_order_when_stderr_arrives_before_completion() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_stdout_bytes(&[0xC3]);
+        tape.append_stderr_bytes(b"boom\n");
+        tape.append_stdout_bytes(&[0xA9, b'\n']);
+
+        let snapshot = tape.drain_snapshot();
+        assert_eq!(
+            snapshot.format_contents().contents,
+            vec![
+                WorkerContent::stdout("é\n"),
+                WorkerContent::stderr("stderr: boom\n"),
+            ]
         );
     }
 
