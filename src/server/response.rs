@@ -1624,12 +1624,14 @@ fn compact_output_bundle_items(items: &[ReplyItem], bundle: &ActiveOutputBundle)
         .iter()
         .rposition(|item| matches!(item, ReplyItem::Image(_)));
     let mut out = Vec::new();
-    let first_anchor = (bundle.next_image_number > 0)
-        .then(|| load_output_bundle_history_image_content(bundle, 1, 1))
-        .flatten();
-    let last_anchor = (bundle.next_image_number > 1)
-        .then(|| load_output_bundle_image_content(bundle, bundle.next_image_number))
-        .flatten();
+    let (first_anchor, last_anchor) = match bundle.next_image_number {
+        0 => (None, None),
+        1 => (load_output_bundle_image_content(bundle, 1), None),
+        _ => (
+            load_output_bundle_history_image_content(bundle, 1, 1),
+            load_output_bundle_image_content(bundle, bundle.next_image_number),
+        ),
+    };
     let displayed_anchor_count =
         usize::from(first_anchor.is_some()) + usize::from(last_anchor.is_some());
 
@@ -1911,7 +1913,7 @@ fn build_output_bundle_notice(
             path.display(),
             omitted
         ),
-        1 if bundle.next_image_number <= 1 => format!(
+        1 if bundle.next_image_number <= 1 && bundle.history_image_count <= 1 => format!(
             "...[middle truncated; first image shown inline; {label}: {}{}]...",
             path.display(),
             omitted
@@ -2817,8 +2819,8 @@ mod tests {
         );
         assert_eq!(
             images[0],
-            vec![0_u8],
-            "expected the inline anchor to use the first history frame"
+            vec![(update_count - 1) as u8],
+            "expected the inline anchor to use the final image state"
         );
 
         let bundle_dir = state
@@ -3569,7 +3571,7 @@ mod tests {
     }
 
     #[test]
-    fn single_image_update_bundle_uses_first_history_frame_as_inline_anchor() {
+    fn single_image_update_bundle_uses_final_image_as_inline_anchor() {
         let mut store = OutputStore::new().expect("output store should initialize");
         let mut bundle = store.new_bundle().expect("bundle should initialize");
         let first_bytes = vec![0_u8];
@@ -3601,8 +3603,8 @@ mod tests {
 
         assert_eq!(images.len(), 1, "expected exactly one inline anchor image");
         assert_eq!(
-            images[0], first_bytes,
-            "expected inline anchor to use the first history frame"
+            images[0], last_bytes,
+            "expected inline anchor to use the final image state"
         );
     }
 
