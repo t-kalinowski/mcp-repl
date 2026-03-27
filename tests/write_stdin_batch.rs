@@ -115,19 +115,42 @@ async fn write_stdin_timeout_then_busy_then_recovers() -> TestResult<()> {
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
 async fn write_stdin_timeout_polling_returns_pending_output() -> TestResult<()> {
-    let mut snapshot = McpSnapshot::new();
+    let mut session = common::spawn_server().await?;
 
-    snapshot
-        .session("timeout_poll", mcp_script! {
-            write_stdin("cat(\"start\\n\"); flush.console(); Sys.sleep(1); cat(\"end\\n\")", timeout = 0.5);
-            write_stdin("", timeout = 2.0);
-        })
+    let first = session
+        .write_stdin_raw_with(
+            "cat(\"start\\n\"); flush.console(); Sys.sleep(1); cat(\"end\\n\")",
+            Some(0.5),
+        )
         .await?;
+    let first_text = collect_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_batch backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        first_text.contains("start"),
+        "expected timeout reply to include early output, got: {first_text:?}"
+    );
+    assert!(
+        first_text.contains("<<console status: busy"),
+        "expected timeout status marker, got: {first_text:?}"
+    );
 
-    assert_snapshot_or_skip(
-        "write_stdin_timeout_polling_returns_pending_output",
-        &snapshot,
-    )
+    let second = session.write_stdin_raw_with("", Some(2.0)).await?;
+    let second_text = collect_text(&second);
+    session.cancel().await?;
+
+    assert!(
+        !second_text.contains("<<console status: busy"),
+        "expected empty poll to finish request, got: {second_text:?}"
+    );
+    assert!(
+        second_text.contains("end"),
+        "expected empty poll to return trailing output, got: {second_text:?}"
+    );
+    Ok(())
 }
 
 #[cfg(not(windows))]
@@ -214,7 +237,7 @@ async fn write_stdin_recovers_after_error() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_preserves_huge_echo_only_inputs() -> TestResult<()> {
+async fn write_stdin_drops_huge_echo_only_inputs() -> TestResult<()> {
     let mut session = common::spawn_server().await?;
 
     let input = (1..=2_000)
@@ -238,18 +261,15 @@ async fn write_stdin_preserves_huge_echo_only_inputs() -> TestResult<()> {
         "did not expect pager activation for echo-only input, got: {text:?}"
     );
     assert!(
-        text.contains("x1 <- 1") && text.contains("x2000 <- 2000"),
-        "expected echoed input to be preserved, got: {text:?}"
-    );
-    assert!(
         !text.contains("echoed input elided"),
         "did not expect echo elision marker, got: {text:?}"
     );
+    assert_eq!(text, "> ", "expected prompt-only reply, got: {text:?}");
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_preserves_huge_echo_with_output() -> TestResult<()> {
+async fn write_stdin_trims_huge_leading_echo_prefix_and_preserves_later_echo() -> TestResult<()> {
     let mut session = common::spawn_server().await?;
 
     let mut input = String::new();
@@ -281,14 +301,17 @@ async fn write_stdin_preserves_huge_echo_with_output() -> TestResult<()> {
         .transpose()?;
     session.cancel().await?;
     assert!(
-        text.contains("transcript.txt")
-            || (text.contains("x500 <- 500") && text.contains("y500 <- 500")),
+        text.contains("transcript.txt") || (text.contains("ok") && text.contains("y500 <- 500")),
         "expected either an inline transcript or a spill path, got: {text:?}"
     );
     if let Some(spill_text) = spill_text {
         assert!(
-            spill_text.contains("x500 <- 500") && spill_text.contains("y500 <- 500"),
-            "expected full echoed transcript in spill file, got: {spill_text:?}"
+            !spill_text.contains("x500 <- 500"),
+            "did not expect the pure leading echo prefix in spill file, got: {spill_text:?}"
+        );
+        assert!(
+            spill_text.contains("y500 <- 500"),
+            "expected later echoed input to remain after output interleaving, got: {spill_text:?}"
         );
         assert!(
             spill_text.contains("ok") && spill_text.contains("done"),
@@ -304,8 +327,12 @@ async fn write_stdin_preserves_huge_echo_with_output() -> TestResult<()> {
             "expected output from both cat() calls inline, got: {text:?}"
         );
         assert!(
-            text.contains("x500 <- 500") && text.contains("y500 <- 500"),
-            "expected echoed transcript to be preserved inline, got: {text:?}"
+            !text.contains("x500 <- 500"),
+            "did not expect the pure leading echo prefix inline, got: {text:?}"
+        );
+        assert!(
+            text.contains("y500 <- 500"),
+            "expected later echoed input to remain after output interleaving, got: {text:?}"
         );
     }
     assert!(

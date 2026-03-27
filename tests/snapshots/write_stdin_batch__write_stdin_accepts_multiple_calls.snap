@@ -19,10 +19,6 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> x <- 1"
-    },
-    {
-      "type": "text",
       "text": "> "
     }
   ]
@@ -43,7 +39,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> x + 1\n[1] 2"
+      "text": "[1] 2"
     },
     {
       "type": "text",

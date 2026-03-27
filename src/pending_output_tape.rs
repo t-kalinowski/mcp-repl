@@ -280,8 +280,115 @@ impl PendingOutputSnapshot {
                 PendingOutputEvent::Sideband { .. } => {}
             }
         }
+        maybe_trim_leading_echo_prefix(&self.events, &mut formatted.contents);
         formatted
     }
+}
+
+fn maybe_trim_leading_echo_prefix(
+    events: &[PendingOutputEvent],
+    contents: &mut Vec<WorkerContent>,
+) {
+    let echo_events = collect_all_readline_results(events);
+    let Some(echo_prefix) = echo_transcript_from_events(&echo_events) else {
+        return;
+    };
+    trim_matching_echo_prefix_from_contents(contents, &echo_prefix);
+}
+
+fn collect_all_readline_results(events: &[PendingOutputEvent]) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for event in events {
+        if let PendingOutputEvent::Sideband {
+            kind: PendingSidebandKind::ReadlineResult { prompt, line },
+            ..
+        } = event
+        {
+            out.push((prompt.clone(), line.clone()));
+        }
+    }
+    out
+}
+
+fn echo_transcript_from_events(events: &[(String, String)]) -> Option<String> {
+    if events.is_empty() {
+        return None;
+    }
+    let mut transcript = String::new();
+    for (prompt, line) in events {
+        transcript.push_str(prompt);
+        transcript.push_str(line);
+    }
+    Some(transcript)
+}
+
+fn trim_matching_echo_prefix_from_contents(contents: &mut Vec<WorkerContent>, echo_prefix: &str) {
+    if echo_prefix.is_empty() {
+        return;
+    }
+
+    let mut remaining = echo_prefix;
+    let mut matched_bytes = 0usize;
+    for content in contents.iter() {
+        let WorkerContent::ContentText {
+            text,
+            stream,
+            origin,
+        } = content
+        else {
+            break;
+        };
+        if !matches!(stream, TextStream::Stdout) || !matches!(origin, ContentOrigin::Worker) {
+            break;
+        }
+        let common = common_prefix_len(remaining, text);
+        matched_bytes = matched_bytes.saturating_add(common);
+        remaining = &remaining[common..];
+        if common < text.len() || remaining.is_empty() {
+            break;
+        }
+    }
+
+    if matched_bytes == 0 {
+        return;
+    }
+
+    let mut remaining = &echo_prefix[..matched_bytes];
+    let mut idx = 0usize;
+    while idx < contents.len() && !remaining.is_empty() {
+        let remove_current = match &mut contents[idx] {
+            WorkerContent::ContentText { text, .. } => {
+                if remaining.len() >= text.len() {
+                    remaining = &remaining[text.len()..];
+                    text.clear();
+                    true
+                } else {
+                    let updated = text[remaining.len()..].to_string();
+                    *text = updated;
+                    remaining = "";
+                    false
+                }
+            }
+            _ => return,
+        };
+
+        if remove_current {
+            contents.remove(idx);
+            continue;
+        }
+        idx = idx.saturating_add(1);
+    }
+}
+
+fn common_prefix_len(left: &str, right: &str) -> usize {
+    let mut matched = 0usize;
+    for (lch, rch) in left.chars().zip(right.chars()) {
+        if lch != rch {
+            break;
+        }
+        matched = matched.saturating_add(lch.len_utf8());
+    }
+    matched
 }
 
 fn push_text(

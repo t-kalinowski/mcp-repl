@@ -19,10 +19,6 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> Sys.sleep(5)"
-    },
-    {
-      "type": "text",
       "text": "<<console status: busy, write_stdin timeout reached; elapsed_ms=N>>"
     }
   ]
@@ -67,7 +63,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> 1+1\n[1] 2"
+      "text": "[1] 2"
     },
     {
       "type": "text",

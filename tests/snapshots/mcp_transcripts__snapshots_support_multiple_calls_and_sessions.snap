@@ -19,10 +19,6 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> x <- 40 + 2"
-    },
-    {
-      "type": "text",
       "text": "> "
     }
   ]
@@ -43,7 +39,7 @@ response:
   "content": [
     {
       "type": "text",
-      "text": "> x\n[1] 42"
+      "text": "[1] 42"
     },
     {
       "type": "text",
@@ -86,10 +82,6 @@ response:
   "type": "tool_result",
   "is_error": false,
   "content": [
-    {
-      "type": "text",
-      "text": "> x"
-    },
     {
       "type": "text",
       "text": "stderr: Error: object 'x' not found"

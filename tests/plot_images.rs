@@ -1063,12 +1063,12 @@ cat("\nPOST_END\n")
         "expected single-image reply to keep exactly one inline image"
     );
     assert_eq!(
-        text_occurrences(&text, "\nPRE_UNIQUE_START\n"),
+        text_occurrences(&text, "PRE_UNIQUE_START\n"),
         1,
         "did not expect duplicated pre-image preview text, got: {text:?}"
     );
     assert_eq!(
-        text_occurrences(&text, "\nPRE_UNIQUE_END\n"),
+        text_occurrences(&text, "PRE_UNIQUE_END\n"),
         1,
         "did not expect duplicated pre-image preview tail, got: {text:?}"
     );
@@ -1383,11 +1383,13 @@ cat("TAIL_ONLY\n")
         "expected output bundle disclosure in final timeout poll, got: {final_text:?}"
     );
     assert_eq!(
-        final_text
-            .matches("> cat(\"TAIL_ONLY\\n\")\nTAIL_ONLY")
-            .count(),
+        final_text.matches("TAIL_ONLY\n").count(),
         1,
         "expected trailing timeout text segment to appear once, got: {final_text:?}"
+    );
+    assert!(
+        !final_text.contains("> cat(\"TAIL_ONLY\\n\")"),
+        "did not expect the trailing command echo to survive the final timeout poll: {final_text:?}"
     );
     assert!(
         !final_text.contains("[repl] input discarded while worker busy"),

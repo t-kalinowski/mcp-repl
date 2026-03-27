@@ -202,7 +202,7 @@ async fn write_stdin_discards_when_busy() -> TestResult<()> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn write_stdin_preserves_multiline_echo() -> TestResult<()> {
+async fn write_stdin_trims_continuation_echo_prefix() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_behavior_session().await?;
 
@@ -221,12 +221,110 @@ async fn write_stdin_preserves_multiline_echo() -> TestResult<()> {
     session.cancel().await?;
     assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
     assert!(
-        text.contains("> 1+"),
-        "expected echoed first line to be preserved, got: {text:?}"
+        !text.contains("> 1+"),
+        "did not expect echoed first line in trimmed reply, got: {text:?}"
     );
     assert!(
-        text.contains("\n+ 1"),
-        "expected echoed continuation line to be preserved, got: {text:?}"
+        !text.contains("\n+ 1"),
+        "did not expect echoed continuation line in trimmed reply, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_trims_full_noninterleaved_multiexpression_echo_prefix() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let result = session
+        .write_stdin_raw_with("x <- 1\nx + 1", Some(30.0))
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if text.contains("<<console status: busy") {
+        eprintln!("write_stdin_behavior multi-expression output still busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+    assert!(text.contains("[1] 2"), "expected result, got: {text:?}");
+    assert!(
+        !text.contains("> x <- 1"),
+        "did not expect leading assignment echo in trimmed reply, got: {text:?}"
+    );
+    assert!(
+        !text.contains("> x + 1"),
+        "did not expect trailing expression echo when the whole prefix is safe to trim, got: {text:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_drops_echo_only_multiexpression_reply() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let result = session
+        .write_stdin_raw_with("x <- 1\ny <- 2", Some(30.0))
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if text.contains("<<console status: busy") {
+        eprintln!("write_stdin_behavior echo-only multi-expression output still busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+    assert_eq!(text, "> ", "expected prompt-only reply, got: {text:?}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn write_stdin_preserves_later_echo_when_output_is_interleaved() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let result = session
+        .write_stdin_raw_with("cat('A\\n')\n1+1", Some(30.0))
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if text.contains("<<console status: busy") {
+        eprintln!("write_stdin_behavior interleaved output still busy; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    session.cancel().await?;
+    assert!(
+        text.contains("A\n"),
+        "expected first expression output, got: {text:?}"
+    );
+    assert!(
+        text.contains("[1] 2"),
+        "expected second expression result, got: {text:?}"
+    );
+    assert!(
+        !text.contains("> cat('A\\n')"),
+        "did not expect the leading echoed prefix to remain, got: {text:?}"
+    );
+    assert!(
+        text.contains("> 1+1"),
+        "expected later echoed expression to remain for attribution after output interleaving, got: {text:?}"
     );
     Ok(())
 }
@@ -303,11 +401,11 @@ async fn write_stdin_normalizes_error_prompt() -> TestResult<()> {
     }
     session.cancel().await?;
     assert!(
-        text.contains("\nError: boom\n"),
+        text.contains("Error: boom\n"),
         "missing error text, got: {text:?}"
     );
     assert!(
-        !text.contains("\n> Error: boom\n"),
+        !text.contains("> Error: boom\n"),
         "expected leading prompt to be normalized, got: {text:?}"
     );
     assert_ne!(result.is_error, Some(true));
@@ -485,8 +583,8 @@ async fn timeout_output_bundle_backfills_earlier_worker_text_and_excludes_timeou
     session.cancel().await?;
 
     assert!(
-        file_text.contains("> big <- paste"),
-        "expected echoed input in spill file, got: {file_text:?}"
+        !file_text.contains("> big <- paste"),
+        "did not expect echoed input in spill file after pruning, got: {file_text:?}"
     );
     assert!(
         file_text.contains("start"),
