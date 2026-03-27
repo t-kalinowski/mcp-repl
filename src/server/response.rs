@@ -371,11 +371,13 @@ impl ResponseState {
             active_timeout_bundle,
             staged_timeout_output,
         );
+        let reply_is_server_only_follow_up = material.reply_worker_text.is_empty()
+            && count_images(&material.reply_bundle_items) == 0;
 
         let TimeoutReplySegment {
             contents: reply_contents,
-            retained_active_timeout_bundle: retained_reply_timeout_bundle,
-            retained_staged_timeout_output: retained_reply_staged_timeout_output,
+            retained_active_timeout_bundle: mut retained_reply_timeout_bundle,
+            retained_staged_timeout_output: mut retained_reply_staged_timeout_output,
         } = self.render_timeout_reply_segment(
             TimeoutReplyView {
                 bundle_items: &material.reply_bundle_items,
@@ -389,11 +391,20 @@ impl ResponseState {
             None,
         );
         contents.extend(reply_contents);
+        if pending_request_after && reply_is_server_only_follow_up {
+            if let Some(active) = retained_reply_timeout_bundle.take()
+                && let Err(err) = self.finish_bundle(active)
+            {
+                eprintln!("dropping closed timeout bundle after output-bundle error: {err}");
+            }
+            retained_reply_staged_timeout_output = None;
+        }
         self.active_timeout_bundle = retained_reply_timeout_bundle;
         self.staged_timeout_output = retained_reply_staged_timeout_output;
 
         if pending_request_after
-            && material.error_code != Some(WorkerErrorCode::Timeout)
+            && (material.error_code != Some(WorkerErrorCode::Timeout)
+                || reply_is_server_only_follow_up)
             && self.active_timeout_bundle.is_none()
             && self.staged_timeout_output.is_none()
         {
@@ -3492,6 +3503,62 @@ mod tests {
         assert!(
             transcript.contains("HEAD\nTAIL\n"),
             "expected the disclosed timeout bundle to keep appending after the busy follow-up, got: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn disclosed_timeout_bundle_survives_timeout_coded_busy_follow_up_until_later_poll() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+        let mut bundle = state
+            .output_store
+            .new_bundle()
+            .expect("timeout bundle should initialize");
+        bundle
+            .append_worker_text(&mut state.output_store, "HEAD\n")
+            .expect("existing timeout text should append");
+        bundle.disclosed = true;
+        let transcript_path = bundle.paths.transcript.clone();
+        state.active_timeout_bundle = Some(bundle);
+
+        let second = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::server_stdout("<<console status: busy>>\n")],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::FollowUpInput,
+            0,
+        );
+        let second_text = result_text(&second);
+        assert!(
+            second_text.contains("<<console status: busy>>"),
+            "expected a busy follow-up marker, got: {second_text:?}"
+        );
+        assert!(
+            state.has_active_timeout_bundle(),
+            "expected timeout-coded busy follow-up replies to keep the disclosed timeout bundle active"
+        );
+
+        let third = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout("TAIL\n")],
+                None,
+            )),
+            false,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+        let third_text = result_text(&third);
+        let transcript = fs::read_to_string(&transcript_path)
+            .unwrap_or_else(|err| panic!("expected timeout transcript to be readable: {err}"));
+
+        assert!(
+            third_text.contains("TAIL\n"),
+            "expected the later poll to keep its small reply inline, got: {third_text:?}"
+        );
+        assert!(
+            transcript.contains("HEAD\nTAIL\n"),
+            "expected timeout-coded busy follow-up replies to keep appending to the existing timeout bundle, got: {transcript:?}"
         );
     }
 

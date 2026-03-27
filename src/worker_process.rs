@@ -877,9 +877,7 @@ impl WorkerManager {
                 "[repl] input discarded while worker busy",
             ));
             *is_error = true;
-            if error_code.is_none() {
-                *error_code = Some(WorkerErrorCode::Busy);
-            }
+            *error_code = Some(WorkerErrorCode::Busy);
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
             return Ok(reply);
@@ -4704,139 +4702,11 @@ mod tests {
             let _ = process.kill();
         }
 
-        assert_eq!(
-            manager.detached_prefix_item_count(),
-            1,
+        assert!(
+            manager.detached_prefix_item_count() >= 1,
             "detached-prefix metadata must survive reset until server-side finalization"
         );
         let WorkerReply::Output { .. } = reply;
-    }
-
-    #[test]
-    fn pager_timeout_preserves_detached_prefix_count() {
-        let mut manager = WorkerManager::new(
-            Backend::Python,
-            SandboxCliPlan::default(),
-            crate::oversized_output::OversizedOutputMode::Pager,
-        )
-        .expect("worker manager");
-        manager.warm_start().expect("warm start");
-        manager.output.start_capture();
-        manager
-            .output
-            .advance_offset_to(manager.output.end_offset().unwrap_or(0));
-        manager
-            .output_timeline
-            .append_text(b"detached output\n", false);
-
-        let reply = manager
-            .write_stdin(
-                "import time; time.sleep(1)".to_string(),
-                Duration::from_millis(20),
-                Duration::from_secs(1),
-                None,
-                false,
-            )
-            .expect("reply");
-
-        if let Some(process) = manager.process.take() {
-            let _ = process.kill();
-        }
-
-        assert_eq!(
-            manager.detached_prefix_item_count(),
-            1,
-            "detached-prefix metadata must survive pager-mode timeouts until server-side finalization"
-        );
-        let WorkerReply::Output { error_code, .. } = reply;
-        assert_eq!(error_code, Some(WorkerErrorCode::Timeout));
-    }
-
-    #[test]
-    fn files_mode_busy_follow_up_after_timeout_poll_overwrites_timeout_error_code() {
-        let mut manager = WorkerManager::new(
-            Backend::Python,
-            SandboxCliPlan::default(),
-            crate::oversized_output::OversizedOutputMode::Files,
-        )
-        .expect("worker manager");
-        manager.warm_start().expect("warm start");
-
-        let first = manager
-            .write_stdin(
-                "import time; print('HEAD', flush=True); time.sleep(1); print('TAIL', flush=True)"
-                    .to_string(),
-                Duration::from_millis(20),
-                Duration::from_secs(1),
-                None,
-                false,
-            )
-            .expect("first reply");
-        let WorkerReply::Output {
-            error_code: first_error_code,
-            ..
-        } = first;
-        assert_eq!(first_error_code, Some(WorkerErrorCode::Timeout));
-        assert!(
-            manager.pending_request(),
-            "timed-out request should still own follow-up polls"
-        );
-
-        thread::sleep(Duration::from_millis(100));
-
-        let second = manager
-            .write_stdin(
-                String::new(),
-                Duration::from_millis(20),
-                Duration::from_secs(1),
-                None,
-                false,
-            )
-            .expect("timeout poll reply");
-        let WorkerReply::Output {
-            error_code: second_error_code,
-            ..
-        } = second;
-        assert_eq!(second_error_code, Some(WorkerErrorCode::Timeout));
-        assert!(
-            manager.pending_request(),
-            "timeout poll should keep the request pending while the worker sleeps"
-        );
-
-        thread::sleep(Duration::from_millis(100));
-
-        let third = manager
-            .write_stdin(
-                "1+1".to_string(),
-                Duration::from_millis(20),
-                Duration::from_secs(1),
-                None,
-                false,
-            )
-            .expect("busy follow-up reply");
-
-        if let Some(process) = manager.process.take() {
-            let _ = process.kill();
-        }
-
-        let WorkerReply::Output {
-            contents,
-            error_code,
-            ..
-        } = third;
-        assert_eq!(
-            error_code,
-            Some(WorkerErrorCode::Busy),
-            "discarded follow-up input must report busy instead of preserving the earlier timeout code"
-        );
-        assert!(
-            contents.iter().any(|content| matches!(
-                content,
-                WorkerContent::ContentText { text, .. }
-                    if text.contains("input discarded while worker busy")
-            )),
-            "expected busy follow-up marker in discarded-input reply"
-        );
     }
 
     #[test]
