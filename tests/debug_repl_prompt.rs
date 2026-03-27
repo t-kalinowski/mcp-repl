@@ -131,7 +131,7 @@ fn debug_repl_prints_initial_prompt() -> TestResult<()> {
                     saw_prompt = true;
                     break;
                 }
-                if output.contains("<<console status: idle>>") {
+                if output.contains("<<repl status: idle>>") {
                     saw_idle = true;
                     break;
                 }
@@ -155,7 +155,7 @@ fn debug_repl_prints_initial_prompt() -> TestResult<()> {
     let err_output = String::from_utf8_lossy(&err_seen);
     let backend_unavailable = backend_unavailable(&output, &err_output);
     if !((saw_prompt && output.contains("> "))
-        || (saw_idle && output.contains("<<console status: idle>>")))
+        || (saw_idle && output.contains("<<repl status: idle>>")))
         && backend_unavailable
     {
         eprintln!("debug_repl backend unavailable in this environment; skipping");
@@ -163,7 +163,7 @@ fn debug_repl_prints_initial_prompt() -> TestResult<()> {
     }
     assert!(
         (saw_prompt && output.contains("> "))
-            || (saw_idle && output.contains("<<console status: idle>>")),
+            || (saw_idle && output.contains("<<repl status: idle>>")),
         "expected prompt or idle status in stdout, got: {output:?}, stderr: {err_output:?}"
     );
     Ok(())

@@ -101,7 +101,7 @@ async fn wait_until_not_busy(
 ) -> TestResult<rmcp::model::CallToolResult> {
     let mut result = initial;
     let mut text = result_text(&result);
-    if !text.contains("<<console status: busy") {
+    if !text.contains("<<repl status: busy") {
         return Ok(result);
     }
 
@@ -113,7 +113,7 @@ async fn wait_until_not_busy(
             .await?;
         text = result_text(&next);
         result = next;
-        if !text.contains("<<console status: busy") {
+        if !text.contains("<<repl status: busy") {
             return Ok(result);
         }
     }
@@ -191,8 +191,7 @@ async fn write_stdin_discards_when_busy() -> TestResult<()> {
         return Ok(());
     }
     assert!(
-        text.contains("input discarded while worker busy")
-            || text.contains("<<console status: busy"),
+        text.contains("input discarded while worker busy") || text.contains("<<repl status: busy"),
         "expected busy discard/timeout message, got: {text:?}"
     );
     assert_ne!(result.is_error, Some(true));
@@ -213,7 +212,7 @@ async fn write_stdin_trims_continuation_echo_prefix() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    if text.contains("<<console status: busy") {
+    if text.contains("<<repl status: busy") {
         eprintln!("write_stdin_behavior continuation output still busy; skipping");
         session.cancel().await?;
         return Ok(());
@@ -245,7 +244,7 @@ async fn write_stdin_trims_full_noninterleaved_multiexpression_echo_prefix() -> 
         session.cancel().await?;
         return Ok(());
     }
-    if text.contains("<<console status: busy") {
+    if text.contains("<<repl status: busy") {
         eprintln!("write_stdin_behavior multi-expression output still busy; skipping");
         session.cancel().await?;
         return Ok(());
@@ -278,7 +277,7 @@ async fn write_stdin_drops_echo_only_multiexpression_reply() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    if text.contains("<<console status: busy") {
+    if text.contains("<<repl status: busy") {
         eprintln!("write_stdin_behavior echo-only multi-expression output still busy; skipping");
         session.cancel().await?;
         return Ok(());
@@ -303,7 +302,7 @@ async fn write_stdin_preserves_later_echo_when_output_is_interleaved() -> TestRe
         session.cancel().await?;
         return Ok(());
     }
-    if text.contains("<<console status: busy") {
+    if text.contains("<<repl status: busy") {
         eprintln!("write_stdin_behavior interleaved output still busy; skipping");
         session.cancel().await?;
         return Ok(());
@@ -394,7 +393,7 @@ async fn write_stdin_normalizes_error_prompt() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    if text.contains("<<console status: busy") {
+    if text.contains("<<repl status: busy") {
         eprintln!("write_stdin_behavior error prompt output still busy; skipping");
         session.cancel().await?;
         return Ok(());
@@ -570,7 +569,7 @@ async fn timeout_output_bundle_backfills_earlier_worker_text_and_excludes_timeou
     sleep(Duration::from_millis(260)).await;
     let spilled = session.write_stdin_raw_with("", Some(2.0)).await?;
     let spilled_text = result_text(&spilled);
-    if spilled_text.contains("<<console status: busy") {
+    if spilled_text.contains("<<repl status: busy") {
         eprintln!("write_stdin_behavior spill poll remained busy; skipping");
         session.cancel().await?;
         return Ok(());
@@ -599,7 +598,7 @@ async fn timeout_output_bundle_backfills_earlier_worker_text_and_excludes_timeou
         "expected later worker text in spill file, got: {file_text:?}"
     );
     assert!(
-        !file_text.contains("<<console status: busy"),
+        !file_text.contains("<<repl status: busy"),
         "did not expect timeout marker in spill file, got: {file_text:?}"
     );
 
@@ -634,7 +633,7 @@ async fn timeout_output_bundle_is_disclosed_only_after_poll_crosses_hard_spill_t
     sleep(test_delay_ms(600, 900)).await;
     let spilled = session.write_stdin_raw_with("", Some(2.0)).await?;
     let spilled_text = result_text(&spilled);
-    if spilled_text.contains("<<console status: busy") {
+    if spilled_text.contains("<<repl status: busy") {
         eprintln!("write_stdin_behavior spill poll remained busy; skipping");
         session.cancel().await?;
         return Ok(());
@@ -682,7 +681,7 @@ async fn busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills() -> T
     let busy_follow_up = session.write_stdin_raw_with("1+1", Some(0.1)).await?;
     let busy_text = result_text(&busy_follow_up);
     if !busy_text.contains("input discarded while worker busy")
-        && !busy_text.contains("<<console status: busy")
+        && !busy_text.contains("<<repl status: busy")
     {
         eprintln!("write_stdin_behavior busy follow-up completed without a busy marker; skipping");
         session.cancel().await?;
@@ -703,14 +702,14 @@ async fn busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills() -> T
     );
     assert!(
         !spilled_text.contains("input discarded while worker busy")
-            && !spilled_text.contains("<<console status: busy"),
+            && !spilled_text.contains("<<repl status: busy"),
         "did not expect busy marker text inside the worker transcript, got: {spilled_text:?}"
     );
 
     sleep(test_delay_ms(1100, 2000)).await;
     let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
     let final_text = result_text(&final_poll);
-    if final_text.contains("<<console status: busy") {
+    if final_text.contains("<<repl status: busy") {
         eprintln!("write_stdin_behavior final poll remained busy; skipping");
         session.cancel().await?;
         return Ok(());
@@ -750,7 +749,7 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
     let spilled_text = result_text(&spilled);
     let transcript_path = match bundle_transcript_path(&spilled_text) {
         Some(path) => path,
-        None if spilled_text.contains("<<console status: busy") => {
+        None if spilled_text.contains("<<repl status: busy") => {
             eprintln!("write_stdin_behavior spill poll remained busy; skipping");
             session.cancel().await?;
             return Ok(());
@@ -763,7 +762,7 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
     sleep(Duration::from_millis(450)).await;
     let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
     let final_text = result_text(&final_poll);
-    if final_text.contains("<<console status: busy") {
+    if final_text.contains("<<repl status: busy") {
         eprintln!("write_stdin_behavior final poll remained busy; skipping");
         session.cancel().await?;
         return Ok(());
@@ -781,7 +780,7 @@ async fn timeout_spill_file_path_stays_stable_across_later_small_poll() -> TestR
         "expected later small poll output to append to existing spill file, got: {file_text:?}"
     );
     assert!(
-        final_text.contains("tail") || final_text.contains("<<console status: idle>>"),
+        final_text.contains("tail") || final_text.contains("<<repl status: idle>>"),
         "expected later small poll to either return inline tail text or settle idle after appending to the existing spill file, got: {final_text:?}"
     );
 
@@ -867,7 +866,7 @@ async fn hidden_timeout_bundle_is_removed_after_request_finishes_inline() -> Tes
     sleep(test_delay_ms(260, 600)).await;
     let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
     let final_text = result_text(&final_poll);
-    if final_text.contains("<<console status: busy") {
+    if final_text.contains("<<repl status: busy") {
         eprintln!("write_stdin_behavior final inline poll remained busy; skipping");
         session.cancel().await?;
         return Ok(());
@@ -910,7 +909,7 @@ async fn timeout_bundle_stops_before_ctrl_d_restart_output() -> TestResult<()> {
     let spilled_text = result_text(&spilled);
     let transcript_path = match bundle_transcript_path(&spilled_text) {
         Some(path) => path,
-        None if spilled_text.contains("<<console status: busy") => {
+        None if spilled_text.contains("<<repl status: busy") => {
             eprintln!("write_stdin_behavior spill poll remained busy; skipping");
             session.cancel().await?;
             return Ok(());
@@ -925,7 +924,7 @@ async fn timeout_bundle_stops_before_ctrl_d_restart_output() -> TestResult<()> {
         .write_stdin_raw_with("\u{4}print('after reset')", Some(10.0))
         .await?;
     let restart_text = result_text(&restart);
-    if restart_text.contains("<<console status: busy") {
+    if restart_text.contains("<<repl status: busy") {
         eprintln!("write_stdin_behavior ctrl-d restart did not complete in time; skipping");
         session.cancel().await?;
         return Ok(());
@@ -969,7 +968,7 @@ async fn disclosed_timeout_bundle_keeps_appending_after_busy_follow_up() -> Test
     let spilled_text = result_text(&spilled);
     let transcript_path = match bundle_transcript_path(&spilled_text) {
         Some(path) => path,
-        None if spilled_text.contains("<<console status: busy") => {
+        None if spilled_text.contains("<<repl status: busy") => {
             eprintln!("write_stdin_behavior spill poll remained busy; skipping");
             session.cancel().await?;
             return Ok(());
@@ -982,7 +981,7 @@ async fn disclosed_timeout_bundle_keeps_appending_after_busy_follow_up() -> Test
     let busy_follow_up = session.write_stdin_raw_with("1+1", Some(0.1)).await?;
     let busy_text = result_text(&busy_follow_up);
     if !busy_text.contains("input discarded while worker busy")
-        && !busy_text.contains("<<console status: busy")
+        && !busy_text.contains("<<repl status: busy")
     {
         eprintln!("write_stdin_behavior busy follow-up completed without a busy marker; skipping");
         session.cancel().await?;
@@ -992,7 +991,7 @@ async fn disclosed_timeout_bundle_keeps_appending_after_busy_follow_up() -> Test
     sleep(test_delay_ms(900, 1800)).await;
     let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
     let final_text = result_text(&final_poll);
-    if final_text.contains("<<console status: busy") {
+    if final_text.contains("<<repl status: busy") {
         eprintln!("write_stdin_behavior final poll remained busy; skipping");
         session.cancel().await?;
         return Ok(());
@@ -1038,7 +1037,7 @@ async fn disclosed_timeout_bundle_keeps_appending_after_idle_busy_follow_up() ->
     let spilled_text = result_text(&spilled);
     let transcript_path = match bundle_transcript_path(&spilled_text) {
         Some(path) => path,
-        None if spilled_text.contains("<<console status: busy") => {
+        None if spilled_text.contains("<<repl status: busy") => {
             eprintln!("write_stdin_behavior spill poll remained busy; skipping");
             session.cancel().await?;
             return Ok(());
@@ -1054,7 +1053,7 @@ async fn disclosed_timeout_bundle_keeps_appending_after_idle_busy_follow_up() ->
         .await?;
     let busy_text = result_text(&busy_follow_up);
     if !busy_text.contains("input discarded while worker busy")
-        && !busy_text.contains("<<console status: busy")
+        && !busy_text.contains("<<repl status: busy")
     {
         eprintln!("write_stdin_behavior busy follow-up completed without a busy marker; skipping");
         session.cancel().await?;
@@ -1064,7 +1063,7 @@ async fn disclosed_timeout_bundle_keeps_appending_after_idle_busy_follow_up() ->
     sleep(test_delay_ms(1300, 2500)).await;
     let final_poll = session.write_stdin_raw_with("", Some(2.0)).await?;
     let final_text = result_text(&final_poll);
-    if final_text.contains("<<console status: busy") {
+    if final_text.contains("<<repl status: busy") {
         eprintln!("write_stdin_behavior final poll remained busy; skipping");
         session.cancel().await?;
         return Ok(());
@@ -1106,7 +1105,7 @@ async fn timeout_bundle_stops_before_fresh_follow_up_output() -> TestResult<()> 
     let spilled_text = result_text(&spilled);
     let transcript_path = match bundle_transcript_path(&spilled_text) {
         Some(path) => path,
-        None if spilled_text.contains("<<console status: busy") => {
+        None if spilled_text.contains("<<repl status: busy") => {
             eprintln!("write_stdin_behavior spill poll remained busy; skipping");
             session.cancel().await?;
             return Ok(());
@@ -1121,7 +1120,7 @@ async fn timeout_bundle_stops_before_fresh_follow_up_output() -> TestResult<()> 
         .write_stdin_raw_with("cat('NEW_TURN\\n')", Some(2.0))
         .await?;
     let follow_up_text = result_text(&follow_up);
-    if follow_up_text.contains("<<console status: busy") {
+    if follow_up_text.contains("<<repl status: busy") {
         eprintln!("write_stdin_behavior fresh follow-up remained busy; skipping");
         session.cancel().await?;
         return Ok(());

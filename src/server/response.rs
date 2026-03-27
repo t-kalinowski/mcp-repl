@@ -3257,7 +3257,7 @@ mod tests {
         let second = state.finalize_worker_result(
             Ok(worker_reply(
                 vec![
-                    WorkerContent::server_stdout("<<console status: busy>>\n"),
+                    WorkerContent::server_stdout("<<repl status: busy>>\n"),
                     WorkerContent::worker_stdout("FOLLOW_UP_INLINE\n"),
                 ],
                 None,
@@ -3335,7 +3335,7 @@ mod tests {
             Ok(worker_reply(
                 vec![
                     WorkerContent::worker_stdout("MID\n"),
-                    WorkerContent::server_stdout("<<console status: busy>>\n"),
+                    WorkerContent::server_stdout("<<repl status: busy>>\n"),
                 ],
                 None,
             )),
@@ -3487,7 +3487,7 @@ mod tests {
 
         let second = state.finalize_worker_result(
             Ok(worker_reply(
-                vec![WorkerContent::server_stdout("<<console status: busy>>\n")],
+                vec![WorkerContent::server_stdout("<<repl status: busy>>\n")],
                 Some(WorkerErrorCode::Timeout),
             )),
             true,
@@ -3496,7 +3496,7 @@ mod tests {
         );
         let second_text = result_text(&second);
         assert!(
-            second_text.contains("<<console status: busy>>"),
+            second_text.contains("<<repl status: busy>>"),
             "expected the server-only timeout poll to stay inline, got: {second_text:?}"
         );
 
@@ -3531,7 +3531,7 @@ mod tests {
 
         let second = state.finalize_worker_result(
             Ok(worker_reply(
-                vec![WorkerContent::server_stdout("<<console status: busy>>\n")],
+                vec![WorkerContent::server_stdout("<<repl status: busy>>\n")],
                 None,
             )),
             true,
@@ -3540,7 +3540,7 @@ mod tests {
         );
         let second_text = result_text(&second);
         assert!(
-            second_text.contains("<<console status: busy>>"),
+            second_text.contains("<<repl status: busy>>"),
             "expected a busy follow-up marker, got: {second_text:?}"
         );
         assert!(
@@ -3587,7 +3587,7 @@ mod tests {
 
         let second = state.finalize_worker_result(
             Ok(worker_reply(
-                vec![WorkerContent::server_stdout("<<console status: busy>>\n")],
+                vec![WorkerContent::server_stdout("<<repl status: busy>>\n")],
                 Some(WorkerErrorCode::Timeout),
             )),
             true,
@@ -3596,7 +3596,7 @@ mod tests {
         );
         let second_text = result_text(&second);
         assert!(
-            second_text.contains("<<console status: busy>>"),
+            second_text.contains("<<repl status: busy>>"),
             "expected a busy follow-up marker, got: {second_text:?}"
         );
         assert!(
@@ -3794,7 +3794,7 @@ mod tests {
             "START\n{}\nEND\n",
             "q".repeat(super::INLINE_TEXT_HARD_SPILL_THRESHOLD + 200)
         );
-        let busy_marker = "<<console status: busy, write_stdin timeout reached; elapsed_ms=50>>";
+        let busy_marker = "<<repl status: busy, write_stdin timeout reached; elapsed_ms=50>>";
         let result = state.finalize_worker_result(
             Ok(worker_reply(
                 vec![
@@ -3832,7 +3832,7 @@ mod tests {
     #[test]
     fn mixed_timeout_bundle_events_log_excludes_server_status_lines() {
         let mut state = ResponseState::new().expect("response state should initialize");
-        let busy_marker = "<<console status: busy>>\n";
+        let busy_marker = "<<repl status: busy>>\n";
         let mut contents = vec![WorkerContent::worker_stdout("HEAD\n")];
         contents.extend((0..super::IMAGE_OUTPUT_BUNDLE_THRESHOLD).map(|index| {
             WorkerContent::ContentImage {

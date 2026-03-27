@@ -108,7 +108,7 @@
 ```text
 > cat('a\n'); flush.console(); Sys.sleep(1); cat('b\n')
 a
-<<console status: busy, write_stdin timeout reached; elapsed_ms=N>>
+<<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>
 ```
 
 3. At this point:

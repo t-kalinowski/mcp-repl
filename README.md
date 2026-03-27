@@ -1,8 +1,8 @@
 # mcp-repl
 
-`mcp-repl` is an MCP server provides an interactive console for agents.
+`mcp-repl` is an MCP server that provides an interactive REPL for agents.
 
-It gives an agent a persistent R or Python session that stays alive across tool calls, so it can work the way a person would in a console: load data once, inspect objects, try ideas, read help, make plots, and keep iterating in context.
+It gives an agent a persistent R or Python session that stays alive across tool calls, so it can work the way a person would in a REPL: load data once, inspect objects, try ideas, read help, make plots, and keep iterating in context.
 
 
 ## Why use it
@@ -39,14 +39,14 @@ Results come back as text and, when relevant, images.
 
 ### Safe by default
 
-Like a shell, R and Python are powerful. Without guardrails, an LLM can do real damage on the host (both accidental and prompt-induced). To reduce this risk, `mcp-repl` runs the backend process in a sandboxed environment. By default, network is disabled and writes are constrained to workspace roots and temp paths required by the worker. Sandbox policy is enforced with OS primitives at the process level, not command-specific runtime rules. On Unix backends, `mcp-repl` also enforces a memory resource guardrail on the child process tree and kills the worker if it exceeds the configured threshold.
+Like a shell, R and Python are powerful. Without guardrails, an LLM can do real damage on the host (both accidental and prompt-induced). To reduce this risk, `mcp-repl` runs the backend process in a sandboxed environment. By default, network is disabled and writes are constrained to workspace roots and temp paths required by the R or Python session. Sandbox policy is enforced with OS primitives at the process level, not command-specific runtime rules. On Unix backends, `mcp-repl` also enforces a memory resource guardrail on the child process tree and kills the worker if it exceeds the configured threshold.
 ## Token efficient
 
 ### Keeps output readable
 
-REPL output can get messy quickly. `mcp-repl` keeps the response focused on what matters:
+REPL output can get verbose and messy quickly. `mcp-repl` curates the response to avoid token-waste or confusing the model:
 
-- Echoed input is cleaned up so it is easier to see what happened.
+- Smart echo behavior: no echo if it's safe to do so, while ellided or collapsed echo for large multi-expression blocks. This way input is only reflected as necessary for attribution output to input.
 - Help pages render in-band instead of opening a separate browser flow.
 - Very large replies stay compact in the tool response, with a preview and a path to the full saved output when needed.
 - Plot images are returned directly through MCP instead of requiring a separate GUI workflow.
@@ -211,7 +211,7 @@ startup logs, sandbox-state tracing, and the external wire-trace proxy.
 
 - To force a specific R installation, set `R_HOME` in the environment that launches `mcp-repl`.
 - If `R_HOME` is not set, `mcp-repl` discovers it from `R` on `PATH` (via `R RHOME`).
-- To verify which R is active, run `R.home()` in the console session.
+- To verify which R is active, run `R.home()` in the REPL session.
 
 ### Python interpreter: which Python installation is used
 

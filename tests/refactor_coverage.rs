@@ -229,7 +229,7 @@ async fn windows_restart_interrupt_plot_smoke() -> TestResult<()> {
             if text.contains(expected) {
                 return Ok(true);
             }
-            if text.contains("<<console status: busy")
+            if text.contains("<<repl status: busy")
                 || text.contains("worker is busy")
                 || text.contains("request already running")
                 || text.contains("input discarded while worker busy")
@@ -256,7 +256,7 @@ async fn windows_restart_interrupt_plot_smoke() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    if !text.contains("plots_done") && !text.contains("<<console status: busy") {
+    if !text.contains("plots_done") && !text.contains("<<repl status: busy") {
         return Err(format!("expected plot command output marker, got: {text:?}").into());
     }
 

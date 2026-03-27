@@ -40,7 +40,7 @@ async fn wait_until_not_busy(
 ) -> TestResult<rmcp::model::CallToolResult> {
     let mut result = initial;
     let mut text = result_text(&result);
-    if !text.contains("<<console status: busy") {
+    if !text.contains("<<repl status: busy") {
         return Ok(result);
     }
 
@@ -52,7 +52,7 @@ async fn wait_until_not_busy(
             .await?;
         text = result_text(&next);
         result = next;
-        if !text.contains("<<console status: busy") {
+        if !text.contains("<<repl status: busy") {
             return Ok(result);
         }
     }
@@ -184,7 +184,7 @@ async fn r_show_doc_does_not_open_pdfs() -> TestResult<()> {
     session.cancel().await?;
     assert!(
         text.contains("[repl] browseURL file:") && text.contains("R-exts.html"),
-        "expected RShowDoc() to render HTML in console, got: {text:?}"
+        "expected RShowDoc() to render HTML in the REPL, got: {text:?}"
     );
     assert!(
         text.contains("Writing R Extensions"),

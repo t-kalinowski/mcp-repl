@@ -52,7 +52,7 @@ async fn reticulate_py_help_is_rendered_or_skipped() -> TestResult<()> {
         return Ok(());
     }
     if text.trim() == ">" {
-        eprintln!("reticulate::py_help() produced no console output in this environment; skipping");
+        eprintln!("reticulate::py_help() produced no REPL output in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }

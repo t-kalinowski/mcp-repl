@@ -76,7 +76,7 @@ async fn write_stdin_timeout_zero_is_non_blocking() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    if timeout_text.contains("<<console status: busy") {
+    if timeout_text.contains("<<repl status: busy") {
         let completed = session
             .write_stdin_raw_unterminated_with("", Some(5.0))
             .await?;
@@ -120,9 +120,9 @@ async fn write_stdin_accepts_crlf_input() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    if text.contains("<<console status: busy") {
+    if text.contains("<<repl status: busy") {
         let deadline = Instant::now() + Duration::from_secs(30);
-        while text.contains("<<console status: busy") && Instant::now() < deadline {
+        while text.contains("<<repl status: busy") && Instant::now() < deadline {
             let polled = session
                 .write_stdin_raw_unterminated_with("", Some(5.0))
                 .await?;
@@ -188,7 +188,7 @@ async fn write_stdin_empty_returns_prompt() -> TestResult<()> {
 
     assert_ne!(result.is_error, Some(true), "empty input should not error");
     assert!(
-        text.contains("<<console status: idle>>"),
+        text.contains("<<repl status: idle>>"),
         "expected idle status on empty poll, got: {text:?}"
     );
     assert!(
@@ -229,7 +229,7 @@ async fn empty_poll_after_completed_request_returns_idle_status_and_prompt() -> 
 
     assert_ne!(idle.is_error, Some(true), "empty input should not error");
     assert!(
-        idle_text.contains("<<console status: idle>>"),
+        idle_text.contains("<<repl status: idle>>"),
         "expected idle status after completed request, got: {idle_text:?}"
     );
     assert!(

@@ -18,7 +18,7 @@ fn result_text(result: &CallToolResult) -> String {
 }
 
 fn is_busy_response(text: &str) -> bool {
-    text.contains("<<console status: busy")
+    text.contains("<<repl status: busy")
         || text.contains("worker is busy")
         || text.contains("request already running")
         || text.contains("input discarded while worker busy")
@@ -63,7 +63,7 @@ async fn interrupt_unblocks_long_running_request() -> TestResult<()> {
         return Ok(());
     }
     assert!(
-        timeout_text.contains("<<console status: busy"),
+        timeout_text.contains("<<repl status: busy"),
         "expected sleep call to time out, got: {timeout_text:?}"
     );
 
@@ -76,7 +76,7 @@ async fn interrupt_unblocks_long_running_request() -> TestResult<()> {
     }
     assert!(
         interrupt_text.contains("> ")
-            || interrupt_text.contains("<<console status: busy")
+            || interrupt_text.contains("<<repl status: busy")
             || interrupt_text.contains("worker is busy")
             || interrupt_text.contains("request already running")
             || interrupt_text.contains("input discarded while worker busy"),
@@ -96,7 +96,7 @@ async fn interrupt_unblocks_long_running_request() -> TestResult<()> {
         if text.contains("worker is busy")
             || text.contains("request already running")
             || text.contains("input discarded while worker busy")
-            || text.contains("<<console status: busy")
+            || text.contains("<<repl status: busy")
         {
             sleep(Duration::from_millis(50)).await;
             continue;
@@ -127,13 +127,13 @@ async fn write_stdin_ctrl_c_prefix_interrupts_then_runs_remaining_input() -> Tes
         return Ok(());
     }
     assert!(
-        timeout_text.contains("<<console status: busy"),
+        timeout_text.contains("<<repl status: busy"),
         "expected sleep call to time out, got: {timeout_text:?}"
     );
 
     let result = session.write_stdin_raw_with("\u{3}1+1", Some(5.0)).await?;
     let text = result_text(&result);
-    if text.contains("<<console status: busy")
+    if text.contains("<<repl status: busy")
         || text.contains("worker is busy")
         || text.contains("request already running")
         || text.contains("input discarded while worker busy")

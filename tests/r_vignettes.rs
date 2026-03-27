@@ -55,7 +55,7 @@ async fn vignette_prints_contents_in_console() -> TestResult<()> {
     session.cancel().await?;
     assert!(
         text.contains("[repl] vignette: grid (package: grid)"),
-        "expected vignette info in console, got: {text:?}"
+        "expected vignette info in the REPL, got: {text:?}"
     );
     assert!(
         text.contains("Source:") && text.contains("grid.Rnw"),

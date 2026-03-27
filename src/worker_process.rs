@@ -3383,12 +3383,12 @@ fn timeout_status_content(timeout: Duration) -> WorkerContent {
     let elapsed_ms = duration_to_millis(timeout);
     let elapsed_ms = (elapsed_ms / TIMEOUT_STATUS_GRANULARITY_MS) * TIMEOUT_STATUS_GRANULARITY_MS;
     WorkerContent::server_stdout(format!(
-        "<<console status: busy, write_stdin timeout reached; elapsed_ms={elapsed_ms}>>"
+        "<<repl status: busy, write_stdin timeout reached; elapsed_ms={elapsed_ms}>>"
     ))
 }
 
 fn idle_status_content() -> WorkerContent {
-    WorkerContent::server_stdout("<<console status: idle>>")
+    WorkerContent::server_stdout("<<repl status: idle>>")
 }
 
 fn append_protocol_warnings(contents: &mut Vec<WorkerContent>, warnings: &[String]) {

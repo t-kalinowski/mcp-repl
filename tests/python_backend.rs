@@ -45,7 +45,7 @@ fn require_python() -> bool {
 }
 
 fn is_busy_response(text: &str) -> bool {
-    text.contains("<<console status: busy")
+    text.contains("<<repl status: busy")
         || text.contains("worker is busy")
         || text.contains("request already running")
         || text.contains("input discarded while worker busy")
@@ -220,7 +220,7 @@ async fn python_interrupt_unblocks_long_running_request() -> TestResult<()> {
         .await?;
     let timeout_text = result_text(&timeout_result);
     assert!(
-        timeout_text.contains("<<console status: busy"),
+        timeout_text.contains("<<repl status: busy"),
         "expected sleep call to time out, got: {timeout_text:?}"
     );
 
@@ -536,7 +536,7 @@ async fn python_interrupt_discards_buffered_tail_after_timeout() -> TestResult<(
         .await?;
     let timeout_text = result_text(&timeout_result);
     assert!(
-        timeout_text.contains("<<console status: busy"),
+        timeout_text.contains("<<repl status: busy"),
         "expected sleep call to time out, got: {timeout_text:?}"
     );
 

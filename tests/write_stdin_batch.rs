@@ -134,7 +134,7 @@ async fn write_stdin_timeout_polling_returns_pending_output() -> TestResult<()> 
         "expected timeout reply to include early output, got: {first_text:?}"
     );
     assert!(
-        first_text.contains("<<console status: busy"),
+        first_text.contains("<<repl status: busy"),
         "expected timeout status marker, got: {first_text:?}"
     );
 
@@ -143,7 +143,7 @@ async fn write_stdin_timeout_polling_returns_pending_output() -> TestResult<()> 
     session.cancel().await?;
 
     assert!(
-        !second_text.contains("<<console status: busy"),
+        !second_text.contains("<<repl status: busy"),
         "expected empty poll to finish request, got: {second_text:?}"
     );
     assert!(
@@ -223,7 +223,7 @@ async fn write_stdin_recovers_after_error() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    if text.contains("<<console status: busy") {
+    if text.contains("<<repl status: busy") {
         eprintln!("write_stdin_batch huge echo attribution still busy; skipping");
         session.cancel().await?;
         return Ok(());
@@ -250,7 +250,7 @@ async fn write_stdin_drops_huge_echo_only_inputs() -> TestResult<()> {
         session.cancel().await?;
         return Ok(());
     }
-    if text.contains("<<console status: busy") {
+    if text.contains("<<repl status: busy") {
         eprintln!("write_stdin_batch huge echo-only input still busy; skipping");
         session.cancel().await?;
         return Ok(());
@@ -289,7 +289,7 @@ async fn write_stdin_trims_huge_leading_echo_prefix_and_preserves_later_echo() -
         session.cancel().await?;
         return Ok(());
     }
-    if text.contains("<<console status: busy") {
+    if text.contains("<<repl status: busy") {
         eprintln!("write_stdin_batch huge echo attribution still busy; skipping");
         session.cancel().await?;
         return Ok(());

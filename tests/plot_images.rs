@@ -1284,7 +1284,7 @@ for (i in 1:6) {
 
     let result = session.write_stdin_raw_with("", Some(60.0)).await?;
     let text = result_text(&result);
-    if text.contains("<<console status: busy") {
+    if text.contains("<<repl status: busy") {
         eprintln!("plot_images timeout output-bundle poll remained busy; skipping");
         session.cancel().await?;
         return Ok(());
@@ -1314,7 +1314,7 @@ for (i in 1:6) {
         "expected transcript.txt to include later text, got: {transcript:?}"
     );
     assert!(
-        !transcript.contains("<<console status: busy"),
+        !transcript.contains("<<repl status: busy"),
         "did not expect timeout marker in transcript.txt, got: {transcript:?}"
     );
     assert!(
@@ -1323,7 +1323,7 @@ for (i in 1:6) {
         "expected events.log to cover the full image set, got: {events:?}"
     );
     assert!(
-        !events.contains("<<console status: busy"),
+        !events.contains("<<repl status: busy"),
         "did not expect timeout marker in events.log, got: {events:?}"
     );
 
@@ -1358,7 +1358,7 @@ cat("TAIL_ONLY\n")
     sleep(Duration::from_millis(600)).await;
     let bundled = session.write_stdin_raw_with("", Some(0.05)).await?;
     let bundled_text = result_text(&bundled);
-    if bundled_text.contains("<<console status: busy") && events_log_path(&bundled_text).is_none() {
+    if bundled_text.contains("<<repl status: busy") && events_log_path(&bundled_text).is_none() {
         eprintln!(
             "plot_images timeout output-bundle poll did not flush image history yet; skipping"
         );
@@ -1375,7 +1375,7 @@ cat("TAIL_ONLY\n")
         final_text
     );
     assert!(
-        !final_text.contains("<<console status: busy"),
+        !final_text.contains("<<repl status: busy"),
         "expected timeout text-only follow-up poll to finish, got: {final_text:?}"
     );
     assert!(
@@ -1431,7 +1431,7 @@ Sys.sleep(1)
     sleep(Duration::from_millis(600)).await;
     let bundled = session.write_stdin_raw_with("", Some(0.05)).await?;
     let bundled_text = result_text(&bundled);
-    if bundled_text.contains("<<console status: busy") && events_log_path(&bundled_text).is_none() {
+    if bundled_text.contains("<<repl status: busy") && events_log_path(&bundled_text).is_none() {
         eprintln!("plot_images timeout omission poll did not flush bundle state yet; skipping");
         session.cancel().await?;
         return Ok(());
@@ -1484,7 +1484,7 @@ Sys.sleep(1)
     sleep(Duration::from_millis(600)).await;
     let bundled = session.write_stdin_raw_with("", Some(0.05)).await?;
     let bundled_text = result_text(&bundled);
-    if bundled_text.contains("<<console status: busy") && events_log_path(&bundled_text).is_none() {
+    if bundled_text.contains("<<repl status: busy") && events_log_path(&bundled_text).is_none() {
         eprintln!("plot_images timeout bundle poll did not flush image history yet; skipping");
         session.cancel().await?;
         return Ok(());
@@ -1512,7 +1512,7 @@ Sys.sleep(1)
     );
 
     let mut settled_text = damaged_text;
-    while settled_text.contains("<<console status: busy") {
+    while settled_text.contains("<<repl status: busy") {
         sleep(Duration::from_millis(100)).await;
         let next = session.write_stdin_raw_with("", Some(0.5)).await?;
         settled_text = result_text(&next);

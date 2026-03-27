@@ -26,7 +26,7 @@ expression: transcript
 
 5) r_repl timeout_ms=200
 >>> Sys.sleep(5)
-<<< <<console status: busy, write_stdin timeout reached; elapsed_ms=N>>
+<<< <<repl status: busy, write_stdin timeout reached; elapsed_ms=N>>
 
 6) r_repl timeout_ms=5000
 >>> 

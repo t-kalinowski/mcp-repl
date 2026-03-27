@@ -57,7 +57,7 @@ Do not count as a new turn:
 
 - empty-input polls
 - timeout continuation polls
-- idle polls that only return `<<console status: idle>>`
+- idle polls that only return `<<repl status: idle>>`
 
 Important rule for control prefixes:
 
