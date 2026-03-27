@@ -164,6 +164,7 @@ fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) {
     ipc.clear_readline_tracking();
     ipc.clear_prompt_history();
     ipc.clear_echo_events();
+    ipc.set_expected_echo_event_count(expected_echo_event_count(_text));
 }
 
 const REQUEST_END_FALLBACK_WAIT: Duration = Duration::from_millis(20);
@@ -375,8 +376,8 @@ const COMPLETION_METADATA_STABLE: Duration = Duration::from_millis(10);
 fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Vec<String>) {
     let mut prompt = ipc.try_take_prompt().filter(|value| !value.is_empty());
     let mut prompt_variants = ipc.take_prompt_history();
+    let expected_echo_event_count = ipc.expected_echo_event_count();
     let mut echo_event_count = ipc.pending_echo_event_count();
-    let mut saw_late_echo_event = false;
 
     let start = std::time::Instant::now();
     let mut stable_for = Duration::from_millis(0);
@@ -385,9 +386,6 @@ fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Ve
         let next_prompt = ipc.try_take_prompt().filter(|value| !value.is_empty());
         let mut next_prompt_variants = ipc.take_prompt_history();
         let next_echo_event_count = ipc.pending_echo_event_count();
-        if next_echo_event_count > echo_event_count {
-            saw_late_echo_event = true;
-        }
         let changed = next_prompt.is_some()
             || !next_prompt_variants.is_empty()
             || next_echo_event_count != echo_event_count;
@@ -402,7 +400,9 @@ fn collect_completion_metadata(ipc: &ServerIpcConnection) -> (Option<String>, Ve
             stable_for = Duration::from_millis(0);
         } else {
             stable_for = stable_for.saturating_add(COMPLETION_METADATA_SETTLE_POLL);
-            if !saw_late_echo_event && stable_for >= COMPLETION_METADATA_STABLE {
+            if stable_for >= COMPLETION_METADATA_STABLE
+                && echo_event_count >= expected_echo_event_count
+            {
                 break;
             }
         }
@@ -3216,6 +3216,15 @@ fn normalize_prompt(prompt: Option<String>) -> Option<String> {
 
 fn normalize_input_newlines(text: &str) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
+}
+
+fn expected_echo_event_count(text: &str) -> usize {
+    if text.is_empty() {
+        return 0;
+    }
+    normalize_input_newlines(text)
+        .split_terminator('\n')
+        .count()
 }
 
 fn timeout_status_content(timeout: Duration) -> WorkerContent {

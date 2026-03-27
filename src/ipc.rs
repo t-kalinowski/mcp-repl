@@ -105,6 +105,7 @@ struct ServerIpcInbox {
     last_prompt: Option<String>,
     prompt_history: VecDeque<String>,
     echo_events: VecDeque<IpcEchoEvent>,
+    expected_echo_events: usize,
     readline_result_count: u64,
     readline_unmatched_starts: usize,
     readline_unmatched_since: Option<Instant>,
@@ -359,6 +360,16 @@ impl ServerIpcConnection {
         guard.readline_unmatched_starts = 0;
         guard.readline_unmatched_since = None;
         guard.last_prompt = None;
+    }
+
+    pub fn set_expected_echo_event_count(&self, count: usize) {
+        let mut guard = self.inbox.lock().unwrap();
+        guard.expected_echo_events = count;
+    }
+
+    pub fn expected_echo_event_count(&self) -> usize {
+        let guard = self.inbox.lock().unwrap();
+        guard.expected_echo_events
     }
 
     pub fn waiting_for_next_input(&self, min_wait: Duration) -> bool {
