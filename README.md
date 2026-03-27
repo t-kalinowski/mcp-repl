@@ -1,6 +1,6 @@
 # mcp-repl
 
-`mcp-repl` is an MCP server that provides an interactive REPL for agents.
+`mcp-repl` is an MCP server that provides a REPL for agents.
 
 It gives an agent a persistent R or Python session that stays alive across tool calls, so it can work the way a person would in a REPL: load data once, inspect objects, try ideas, read help, make plots, and keep iterating in context.
 
@@ -39,14 +39,15 @@ Results come back as text and, when relevant, images.
 
 ### Safe by default
 
-Like a shell, R and Python are powerful. Without guardrails, an LLM can do real damage on the host (both accidental and prompt-induced). To reduce this risk, `mcp-repl` runs the backend process in a sandboxed environment. By default, network is disabled and writes are constrained to workspace roots and temp paths required by the R or Python session. Sandbox policy is enforced with OS primitives at the process level, not command-specific runtime rules. On Unix backends, `mcp-repl` also enforces a memory resource guardrail on the child process tree and kills the worker if it exceeds the configured threshold.
+Like a shell, R and Python are powerful. Without guardrails, an LLM can do real damage on the host (both accidental and prompt-induced). To reduce this risk, `mcp-repl` runs the backend process in a sandboxed environment. By default, network is disabled and writes are constrained to workspace roots and temp paths required by the active R or Python session. Sandbox policy is enforced with OS primitives at the process level, not command-specific runtime rules. On Unix backends, `mcp-repl` also enforces a memory resource guardrail on the child process tree and kills the worker if it exceeds the configured threshold.
+
 ## Token efficient
 
 ### Keeps output readable
 
-REPL output can get verbose and messy quickly. `mcp-repl` curates the response to avoid token-waste or confusing the model:
+REPL output can get verbose and messy quickly. `mcp-repl` curates the response to avoid wasting tokens or confusing the model:
 
-- Smart echo behavior: no echo if it's safe to do so, while ellided or collapsed echo for large multi-expression blocks. This way input is only reflected as necessary for attribution output to input.
+- Smart echo behavior: no echo when it is safe to omit, and elided or collapsed echo for large multi-expression blocks. Input is reflected only when needed to connect output back to the code that produced it.
 - Help pages render in-band instead of opening a separate browser flow.
 - Very large replies stay compact in the tool response, with a preview and a path to the full saved output when needed.
 - Plot images are returned directly through MCP instead of requiring a separate GUI workflow.
