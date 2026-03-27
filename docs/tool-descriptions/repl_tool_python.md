@@ -24,5 +24,5 @@ Python REPL affordances:
 - Older output bundles may be pruned to keep storage bounded. A disclosed bundle path remains usable until it is pruned or the server exits.
 - Plot images are returned as image content (for example matplotlib output).
 - Help flows are in-band (`help()`, `dir()`, `pydoc.help`).
-- Debugging workflows are supported (`breakpoint()`, `pdb.set_trace()`).
+- Debugging works in the REPL, including interactive stops from `breakpoint()` and `pdb.set_trace()`.
 - Control prefixes in `input`: `\u0003` (interrupt) and `\u0004` (reset then run remaining input).

@@ -21,5 +21,5 @@ Behavior:
 - Pager responses use `[pager]` status lines and may suppress the backend prompt until pager mode ends.
 - Documentation entry points work in-band. Prefer the normal R interfaces such as `?topic`, `help()`, `vignette()`, and `RShowDoc("R-exts")`; the REPL renders their text/HTML output directly instead of launching an external viewer.
 - `?topic`, `help()`, `vignette()`, and `RShowDoc()` render directly into the tool response instead of opening a separate web-browser flow.
-- Debugging: `browser()`, `debug()`, `trace()`.
+- Debugging works in the REPL, including interactive stops from `browser()`, `debug()`, and `trace()`.
 - Control: `\u0003` in input interrupts; `\u0004` resets session then runs remaining input.

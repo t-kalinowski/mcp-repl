@@ -21,5 +21,5 @@ Python REPL affordances:
 - Pager responses use `[pager]` status lines and may suppress the backend prompt until pager mode ends.
 - Plot images are returned as image content (for example matplotlib output).
 - Help flows are in-band (`help()`, `dir()`, `pydoc.help`).
-- Debugging workflows are supported (`breakpoint()`, `pdb.set_trace()`).
+- Debugging works in the REPL, including interactive stops from `breakpoint()` and `pdb.set_trace()`.
 - Control prefixes in `input`: `\u0003` (interrupt) and `\u0004` (reset then run remaining input).
