@@ -121,7 +121,11 @@ async fn wait_until_not_busy(
     Err(format!("worker remained busy after polling: {text:?}").into())
 }
 
-async fn wait_until_file_contains(path: &std::path::Path, needle: &str) -> TestResult<String> {
+async fn wait_until_file_contains_via_polls(
+    session: &mut common::McpTestSession,
+    path: &std::path::Path,
+    needle: &str,
+) -> TestResult<String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut last_text = String::new();
     while Instant::now() < deadline {
@@ -134,6 +138,17 @@ async fn wait_until_file_contains(path: &std::path::Path, needle: &str) -> TestR
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
             Err(err) => return Err(err.into()),
+        }
+
+        let next = session
+            .write_stdin_raw_unterminated_with("", Some(0.5))
+            .await?;
+        let next_text = result_text(&next);
+        if let Some(disclosed_path) = bundle_transcript_path(&next_text) {
+            assert_eq!(
+                disclosed_path, path,
+                "did not expect later empty polls to switch transcript paths, got: {next_text:?}"
+            );
         }
         sleep(Duration::from_millis(50)).await;
     }
@@ -781,7 +796,8 @@ async fn busy_follow_up_reuses_hidden_timeout_bundle_when_it_first_spills() -> T
         session.cancel().await?;
         return Ok(());
     }
-    let final_transcript = wait_until_file_contains(&transcript_path, "TAIL").await?;
+    let final_transcript =
+        wait_until_file_contains_via_polls(&mut session, &transcript_path, "TAIL").await?;
 
     session.cancel().await?;
 
