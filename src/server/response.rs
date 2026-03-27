@@ -1466,13 +1466,12 @@ impl ResponseState {
 
 impl StagedTimeoutOutput {
     fn from_items(items: &[ReplyItem]) -> Option<Self> {
-        (!items.is_empty()).then(|| Self {
-            items: items.to_vec(),
-        })
+        let items = Self::retained_items(items);
+        (!items.is_empty()).then_some(Self { items })
     }
 
     fn extend(&mut self, items: &[ReplyItem]) {
-        self.items.extend(items.iter().cloned());
+        self.items.extend(Self::retained_items(items));
     }
 
     fn image_count(&self) -> usize {
@@ -1493,6 +1492,14 @@ impl StagedTimeoutOutput {
         self.items
             .iter()
             .any(|item| matches!(item, ReplyItem::WorkerText(_) | ReplyItem::Image(_)))
+    }
+
+    fn retained_items(items: &[ReplyItem]) -> Vec<ReplyItem> {
+        items
+            .iter()
+            .filter(|item| matches!(item, ReplyItem::WorkerText(_) | ReplyItem::Image(_)))
+            .cloned()
+            .collect()
     }
 }
 
@@ -3448,6 +3455,64 @@ mod tests {
             transcript.contains("SECOND_START") && transcript.contains("SECOND_END"),
             "expected the disclosed timeout bundle to include the later poll chunk, got: {transcript:?}"
         );
+    }
+
+    #[test]
+    fn server_only_timeout_poll_does_not_accumulate_in_staged_timeout_state() {
+        let mut state = ResponseState::new().expect("response state should initialize");
+
+        let first = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::worker_stdout("HEAD\n")],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+        let first_text = result_text(&first);
+        assert!(
+            first_text.contains("HEAD\n"),
+            "expected the initial timed-out reply to stay inline, got: {first_text:?}"
+        );
+        let staged = state
+            .staged_timeout_output
+            .as_ref()
+            .expect("expected the initial timed-out reply to retain staged timeout state");
+        assert_eq!(staged.items.len(), 1);
+        assert!(matches!(
+            staged.items.first(),
+            Some(ReplyItem::WorkerText(text)) if text == "HEAD\n"
+        ));
+
+        let second = state.finalize_worker_result(
+            Ok(worker_reply(
+                vec![WorkerContent::server_stdout("<<console status: busy>>\n")],
+                Some(WorkerErrorCode::Timeout),
+            )),
+            true,
+            TimeoutBundleReuse::FullReply,
+            0,
+        );
+        let second_text = result_text(&second);
+        assert!(
+            second_text.contains("<<console status: busy>>"),
+            "expected the server-only timeout poll to stay inline, got: {second_text:?}"
+        );
+
+        let staged = state
+            .staged_timeout_output
+            .as_ref()
+            .expect("expected staged timeout state to survive the server-only poll");
+        assert_eq!(
+            staged.items.len(),
+            1,
+            "did not expect server-only timeout status text to accumulate in staged timeout state"
+        );
+        assert!(matches!(
+            staged.items.first(),
+            Some(ReplyItem::WorkerText(text)) if text == "HEAD\n"
+        ));
     }
 
     #[test]

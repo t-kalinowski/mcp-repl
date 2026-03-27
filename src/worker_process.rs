@@ -993,7 +993,6 @@ impl WorkerManager {
                 .unwrap_or_else(|| poll_start.elapsed());
             contents.push(timeout_status_content(elapsed));
         }
-        append_protocol_warnings(&mut contents, &completion.protocol_warnings);
 
         let session_end = completion.session_end_seen;
         let resolved_prompt = normalize_prompt(completion.prompt.clone());
@@ -1003,14 +1002,16 @@ impl WorkerManager {
             resolved_prompt
         };
         self.remember_prompt(resolved_prompt.clone());
-        let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
-        let echo_transcript = echo_transcript_from_events(&completion.echo_events);
-        if !timed_out {
-            maybe_trim_echo_prefix(&mut contents, echo_transcript.as_deref(), trim_enabled);
-            if let Some(echo) = echo_transcript.as_deref() {
-                let _ = drop_echo_only_contents(&mut contents, echo);
-            }
-        }
+        let trim_enabled = !timed_out && should_trim_echo_prefix(&completion.echo_events);
+        let echo_transcript = (!timed_out)
+            .then(|| echo_transcript_from_events(&completion.echo_events))
+            .flatten();
+        trim_echo_then_append_protocol_warnings(
+            &mut contents,
+            echo_transcript.as_deref(),
+            trim_enabled,
+            &completion.protocol_warnings,
+        );
         if !timed_out && !session_end {
             if let Some(prompt_text) = resolved_prompt.as_deref() {
                 strip_prompt_from_contents(&mut contents, prompt_text);
@@ -1114,19 +1115,16 @@ impl WorkerManager {
                 .unwrap_or_else(|| poll_start.elapsed());
             contents.push(timeout_status_content(elapsed));
         }
-        append_protocol_warnings(&mut contents, &completion.protocol_warnings);
-        if !timed_out && let Some(echo) = echo_transcript_from_events(&completion.echo_events) {
-            let _ = drop_echo_only_contents(&mut contents, &echo);
-        }
-
-        let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
-        let echo_transcript = echo_transcript_from_events(&completion.echo_events);
-        if !timed_out {
-            maybe_trim_echo_prefix(&mut contents, echo_transcript.as_deref(), trim_enabled);
-            if let Some(echo) = echo_transcript.as_deref() {
-                let _ = drop_echo_only_contents(&mut contents, echo);
-            }
-        }
+        let trim_enabled = !timed_out && should_trim_echo_prefix(&completion.echo_events);
+        let echo_transcript = (!timed_out)
+            .then(|| echo_transcript_from_events(&completion.echo_events))
+            .flatten();
+        trim_echo_then_append_protocol_warnings(
+            &mut contents,
+            echo_transcript.as_deref(),
+            trim_enabled,
+            &completion.protocol_warnings,
+        );
         pager::maybe_activate_and_append_footer(
             &mut self.pager,
             &mut contents,
@@ -1345,7 +1343,6 @@ impl WorkerManager {
                 let formatted = self.drain_final_formatted_output();
                 let is_error = context.prefix_is_error || formatted.saw_stderr;
                 contents.extend(formatted.contents);
-                append_protocol_warnings(&mut contents, &completion.protocol_warnings);
                 let resolved_prompt = if session_end {
                     None
                 } else {
@@ -1354,10 +1351,12 @@ impl WorkerManager {
                 self.remember_prompt(resolved_prompt.clone());
                 let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
                 let echo_transcript = echo_transcript_from_events(&completion.echo_events);
-                maybe_trim_echo_prefix(&mut contents, echo_transcript.as_deref(), trim_enabled);
-                if let Some(echo) = echo_transcript.as_deref() {
-                    let _ = drop_echo_only_contents(&mut contents, echo);
-                }
+                trim_echo_then_append_protocol_warnings(
+                    &mut contents,
+                    echo_transcript.as_deref(),
+                    trim_enabled,
+                    &completion.protocol_warnings,
+                );
                 if !session_end {
                     if let Some(prompt_text) = resolved_prompt.as_deref() {
                         strip_prompt_from_contents(&mut contents, prompt_text);
@@ -1463,10 +1462,6 @@ impl WorkerManager {
                     last_range,
                 } = completion_snapshot.snapshot;
                 contents.append(&mut page_contents);
-                append_protocol_warnings(&mut contents, &completion.protocol_warnings);
-                if let Some(echo) = echo_transcript_from_events(&completion.echo_events) {
-                    let _ = drop_echo_only_contents(&mut contents, &echo);
-                }
                 pager::maybe_activate_and_append_footer(
                     &mut self.pager,
                     &mut contents,
@@ -1491,10 +1486,12 @@ impl WorkerManager {
                 };
                 let echo_transcript = echo_transcript_from_events(&completion.echo_events)
                     .or(fallback_input_transcript);
-                maybe_trim_echo_prefix(&mut contents, echo_transcript.as_deref(), trim_enabled);
-                if let Some(echo) = echo_transcript.as_deref() {
-                    let _ = drop_echo_only_contents(&mut contents, echo);
-                }
+                trim_echo_then_append_protocol_warnings(
+                    &mut contents,
+                    echo_transcript.as_deref(),
+                    trim_enabled,
+                    &completion.protocol_warnings,
+                );
                 if !session_end {
                     if let Some(prompt_text) = resolved_prompt.as_deref() {
                         strip_prompt_from_contents(&mut contents, prompt_text);
@@ -3351,6 +3348,19 @@ fn drop_echo_only_contents(contents: &mut Vec<WorkerContent>, echo: &str) -> boo
     true
 }
 
+fn trim_echo_then_append_protocol_warnings(
+    contents: &mut Vec<WorkerContent>,
+    echo: Option<&str>,
+    trim_enabled: bool,
+    warnings: &[String],
+) {
+    maybe_trim_echo_prefix(contents, echo, trim_enabled);
+    if let Some(echo) = echo {
+        let _ = drop_echo_only_contents(contents, echo);
+    }
+    append_protocol_warnings(contents, warnings);
+}
+
 fn normalize_prompt(prompt: Option<String>) -> Option<String> {
     prompt.filter(|value| !value.is_empty())
 }
@@ -4647,6 +4657,46 @@ mod tests {
             _ => "",
         };
         assert_eq!(text, "stderr: boom\n");
+    }
+
+    #[test]
+    fn trim_echo_then_append_protocol_warnings_drops_echo_only_multiline_input() {
+        let warning = "ReadlineResult after RequestEnd".to_string();
+        let echo = "> x <- 1\n> y <- 2\n";
+        let mut contents = vec![WorkerContent::stdout(echo)];
+
+        trim_echo_then_append_protocol_warnings(
+            &mut contents,
+            Some(echo),
+            false,
+            std::slice::from_ref(&warning),
+        );
+
+        assert_eq!(
+            contents,
+            vec![WorkerContent::server_stderr(format!("[repl] {warning}"))]
+        );
+    }
+
+    #[test]
+    fn trim_echo_then_append_protocol_warnings_keeps_output_before_warning() {
+        let warning = "ReadlineResult after RequestEnd".to_string();
+        let mut contents = vec![WorkerContent::stdout("> x <- 1\n[1] 1\n")];
+
+        trim_echo_then_append_protocol_warnings(
+            &mut contents,
+            Some("> x <- 1\n"),
+            true,
+            std::slice::from_ref(&warning),
+        );
+
+        assert_eq!(
+            contents,
+            vec![
+                WorkerContent::stdout("[1] 1\n"),
+                WorkerContent::server_stderr(format!("[repl] {warning}")),
+            ]
+        );
     }
 
     #[test]
