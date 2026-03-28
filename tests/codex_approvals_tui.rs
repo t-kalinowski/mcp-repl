@@ -641,10 +641,16 @@ mod unix_impl {
         let repo_root = toml_escape(&repo_root.display().to_string());
         let openai_base_url = toml_escape(openai_base_url);
         format!(
-            r#"model_provider = "openai"
-openai_base_url = "{openai_base_url}"
+            r#"model_provider = "mock-openai"
 disable_paste_burst = true
 project_doc_max_bytes = 0
+
+[model_providers.mock-openai]
+name = "Mock OpenAI"
+base_url = "{openai_base_url}"
+wire_api = "responses"
+requires_openai_auth = false
+supports_websockets = false
 
 [notice]
 hide_full_access_warning = true

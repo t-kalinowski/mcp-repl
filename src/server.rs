@@ -379,7 +379,14 @@ macro_rules! define_backend_tool_server {
             }
 
             #[doc = include_str!($repl_doc_path)]
-            #[tool(name = "repl")]
+            #[tool(
+                name = "repl",
+                annotations(
+                    read_only_hint = false,
+                    destructive_hint = false,
+                    open_world_hint = false
+                )
+            )]
             async fn repl(&self, params: Parameters<ReplArgs>) -> Result<CallToolResult, McpError> {
                 let ReplArgs { input, timeout_ms } = params.0;
                 let timeout = resolve_timeout_ms(timeout_ms, "repl", true)?;
@@ -387,7 +394,14 @@ macro_rules! define_backend_tool_server {
             }
 
             #[doc = include_str!("../docs/tool-descriptions/repl_reset_tool.md")]
-            #[tool(name = "repl_reset")]
+            #[tool(
+                name = "repl_reset",
+                annotations(
+                    read_only_hint = false,
+                    destructive_hint = false,
+                    open_world_hint = false
+                )
+            )]
             async fn repl_reset(
                 &self,
                 _params: Parameters<ReplResetArgs>,

@@ -172,6 +172,16 @@ fn repl_tool_descriptions_are_mode_specific() {
 }
 
 #[test]
+fn repl_tool_annotations_mark_local_mutation_without_open_world_access() {
+    let router = super::RFilesToolServer::tool_router();
+    let tool = router.get("repl").expect("repl tool should exist");
+    let annotations = tool.annotations.as_ref().expect("repl annotations");
+    assert_eq!(annotations.read_only_hint, Some(false));
+    assert_eq!(annotations.destructive_hint, Some(false));
+    assert_eq!(annotations.open_world_hint, Some(false));
+}
+
+#[test]
 fn timeout_bundle_reuse_treats_blank_lines_as_fresh_input() {
     assert!(matches!(
         super::response::timeout_bundle_reuse_for_input(""),
