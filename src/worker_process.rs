@@ -724,7 +724,10 @@ impl WorkerManager {
         self.maybe_emit_guardrail_notice();
         self.resolve_timeout_marker();
         if text.is_empty() {
-            if self.pending_request || self.pending_output_tape.has_pending() {
+            if self.pending_request
+                || self.pending_output_tape.has_pending()
+                || self.settled_pending_completion.is_some()
+            {
                 let reply = self.poll_pending_output_files(worker_timeout)?;
                 let reply = self.finalize_reply(reply);
                 self.maybe_reset_after_session_end();
@@ -947,6 +950,7 @@ impl WorkerManager {
     ) -> Result<ReplyWithOffset, WorkerError> {
         let poll_start = std::time::Instant::now();
         let mut timed_out = false;
+        let mut completed_request = false;
         let mut completion = CompletionInfo {
             prompt: None,
             prompt_variants: None,
@@ -963,6 +967,7 @@ impl WorkerManager {
                         self.note_session_end(true);
                     }
                     completion = info;
+                    completed_request = true;
                 }
                 Err(WorkerError::Timeout(_)) => {
                     let worker_exited = match self.process.as_mut() {
@@ -973,12 +978,19 @@ impl WorkerManager {
                         self.note_session_end(true);
                         self.clear_pending_request_state();
                         completion.session_end_seen = true;
+                        completed_request = true;
                     } else {
                         timed_out = true;
                     }
                 }
                 Err(err) => return Err(err),
             }
+        }
+        if !timed_out
+            && !completed_request
+            && let Some(info) = self.settled_pending_completion.take()
+        {
+            completion = info;
         }
 
         let FormattedPendingOutput {
@@ -1183,10 +1195,22 @@ impl WorkerManager {
     /// Drains detached output that arrived before the next accepted request so it can be prefixed
     /// into that request's visible reply.
     fn prepare_input_context_files(&mut self) -> InputContext {
+        let settled_completion = self.settled_pending_completion.take();
         let FormattedPendingOutput {
-            contents,
+            mut contents,
             saw_stderr,
         } = self.drain_sealed_formatted_output();
+        if let Some(completion) = settled_completion.as_ref() {
+            let trim_enabled = should_trim_echo_prefix(&completion.echo_events);
+            let echo_transcript = echo_transcript_from_events(&completion.echo_events);
+            trim_echo_then_append_protocol_warnings(
+                &mut contents,
+                echo_transcript.as_deref(),
+                trim_enabled,
+                should_drop_echo_only_contents(&completion.echo_events),
+                &completion.protocol_warnings,
+            );
+        }
         InputContext {
             prefix_contents: contents,
             prefix_is_error: saw_stderr,
@@ -2495,9 +2519,7 @@ impl WorkerManager {
         };
         match status {
             Ok(()) => {
-                let settled_completion =
-                    matches!(self.oversized_output, OversizedOutputMode::Pager)
-                        .then(|| completion_info_from_ipc(&ipc, false));
+                let settled_completion = Some(completion_info_from_ipc(&ipc, false));
                 self.settle_output_after_request_end(Duration::from_millis(120));
                 if matches!(self.oversized_output, OversizedOutputMode::Pager) {
                     update_last_reply_marker_offset_max(self.output.end_offset().unwrap_or(0));

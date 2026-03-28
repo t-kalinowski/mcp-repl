@@ -1257,6 +1257,45 @@ async fn disclosed_timeout_bundle_keeps_appending_after_idle_busy_follow_up() ->
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn files_empty_poll_after_resolved_timeout_restores_prompt() -> TestResult<()> {
+    let _guard = lock_test_mutex();
+    let mut session = spawn_behavior_session().await?;
+
+    let first = session
+        .write_stdin_raw_with("Sys.sleep(0.2); 1+1", Some(0.05))
+        .await?;
+    let first_text = result_text(&first);
+    if backend_unavailable(&first_text) {
+        eprintln!("write_stdin_behavior backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+
+    sleep(test_delay_ms(260, 700)).await;
+    let follow_up = session
+        .write_stdin_raw_unterminated_with("", Some(2.0))
+        .await?;
+    let follow_up_text = result_text(&follow_up);
+
+    session.cancel().await?;
+
+    assert!(
+        !follow_up_text.contains("<<repl status: busy"),
+        "expected the empty poll to return the settled result, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains("[1] 2"),
+        "expected the settled timeout result, got: {follow_up_text:?}"
+    );
+    assert!(
+        follow_up_text.contains(">"),
+        "expected the restored prompt after the settled files-mode poll, got: {follow_up_text:?}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pager_follow_up_after_resolved_timeout_trims_detached_echo_prefix() -> TestResult<()> {
     let _guard = lock_test_mutex();
     let mut session = spawn_pager_behavior_session(20_000).await?;
