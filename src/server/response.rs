@@ -1618,6 +1618,9 @@ fn prepare_reply_material(reply: WorkerReply, detached_prefix_item_count: usize)
             WorkerContent::ContentImage {
                 data,
                 mime_type,
+                // Intentionally drop worker image ids here. The public tool surface emits plain
+                // image items without mcpConsole metadata, and the plot-image tests assert that
+                // repeated renders stay metadata-free.
                 id: _,
                 is_new,
             } => {
