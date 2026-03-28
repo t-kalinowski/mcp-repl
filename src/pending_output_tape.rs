@@ -199,6 +199,10 @@ impl PendingOutputTape {
     }
 
     pub(crate) fn drain_final_snapshot(&self) -> PendingOutputSnapshot {
+        self.drain_snapshot_with_policy(false)
+    }
+
+    pub(crate) fn drain_sealed_snapshot(&self) -> PendingOutputSnapshot {
         self.drain_snapshot_with_policy(true)
     }
 
@@ -976,6 +980,26 @@ mod tests {
     }
 
     #[test]
+    fn split_utf8_sequence_is_preserved_across_final_snapshot_drains() {
+        let tape = PendingOutputTape::new();
+
+        tape.append_stdout_bytes(&[0xC3]);
+        tape.append_sideband(PendingSidebandKind::RequestEnd);
+        let first = tape.drain_final_snapshot();
+        assert!(
+            first.format_contents().contents.is_empty(),
+            "final request drains should keep incomplete utf-8 buffered for late bytes"
+        );
+
+        tape.append_stdout_bytes(&[0xA9, b'\n']);
+        let second = tape.drain_snapshot();
+        assert_eq!(
+            second.format_contents().contents,
+            vec![WorkerContent::stdout("é\n")]
+        );
+    }
+
+    #[test]
     fn split_utf8_stdout_keeps_order_when_stderr_arrives_before_completion() {
         let tape = PendingOutputTape::new();
 
@@ -1142,11 +1166,11 @@ mod tests {
     }
 
     #[test]
-    fn final_snapshot_flushes_incomplete_utf8_as_hex_escape() {
+    fn sealed_snapshot_flushes_incomplete_utf8_as_hex_escape() {
         let tape = PendingOutputTape::new();
         tape.append_stdout_bytes(&[0xC3]);
 
-        let snapshot = tape.drain_final_snapshot();
+        let snapshot = tape.drain_sealed_snapshot();
         assert_eq!(
             snapshot.format_contents().contents,
             vec![WorkerContent::stdout("\\xC3")]

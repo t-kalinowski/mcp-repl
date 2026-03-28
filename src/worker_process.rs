@@ -1186,7 +1186,7 @@ impl WorkerManager {
         let FormattedPendingOutput {
             contents,
             saw_stderr,
-        } = self.drain_final_formatted_output();
+        } = self.drain_sealed_formatted_output();
         InputContext {
             prefix_contents: contents,
             prefix_is_error: saw_stderr,
@@ -1293,7 +1293,7 @@ impl WorkerManager {
     ) -> ReplyWithOffset {
         self.last_detached_prefix_item_count = context.prefix_contents.len();
         let mut contents = context.prefix_contents;
-        let formatted = self.drain_final_formatted_output();
+        let formatted = self.drain_sealed_formatted_output();
         contents.extend(formatted.contents);
         contents.push(WorkerContent::server_stderr(format!("worker error: {err}")));
         ReplyWithOffset {
@@ -2322,6 +2322,12 @@ impl WorkerManager {
             .format_contents()
     }
 
+    fn drain_sealed_formatted_output(&self) -> FormattedPendingOutput {
+        self.pending_output_tape
+            .drain_sealed_snapshot()
+            .format_contents()
+    }
+
     fn build_idle_poll_reply_files(&mut self) -> ReplyWithOffset {
         let prompt = self.current_prompt_hint();
         self.remember_prompt(prompt.clone());
@@ -2531,7 +2537,7 @@ impl WorkerManager {
         let FormattedPendingOutput {
             mut contents,
             saw_stderr,
-        } = self.drain_final_formatted_output();
+        } = self.drain_sealed_formatted_output();
         contents.retain(|content| match content {
             WorkerContent::ContentText { text, .. } => !text.trim().is_empty(),
             _ => true,
