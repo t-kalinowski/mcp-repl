@@ -129,8 +129,7 @@ impl SharedServer {
                 detached_prefix_item_count,
                 use_inline_pager_materialization
                     && !pending_request_after
-                    && !state.response.has_timeout_bundle_state()
-                    && !raw_input.trim_start().starts_with(':'),
+                    && !state.response.has_timeout_bundle_state(),
             );
             strip_text_stream_meta(&mut result);
             result

@@ -4,10 +4,6 @@ mod common;
 use common::McpSnapshot;
 use common::TestResult;
 use rmcp::model::RawContent;
-#[cfg(not(windows))]
-use std::fs;
-#[cfg(not(windows))]
-use std::path::PathBuf;
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -19,17 +15,6 @@ fn result_text(result: &rmcp::model::CallToolResult) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
-}
-
-#[cfg(not(windows))]
-fn bundle_transcript_path(text: &str) -> Option<PathBuf> {
-    let end = text
-        .find("transcript.txt")?
-        .saturating_add("transcript.txt".len());
-    let start = text[..end]
-        .rfind(|ch: char| ch.is_whitespace() || matches!(ch, '"' | '\'' | '[' | '('))
-        .map_or(0, |idx| idx.saturating_add(1));
-    Some(PathBuf::from(&text[start..end]))
 }
 
 #[cfg(windows)]
@@ -136,7 +121,7 @@ async fn pager_commands_are_handled_server_side() -> TestResult<()> {
 
 #[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
-async fn pager_matches_bundle_excludes_server_metadata_from_transcript() -> TestResult<()> {
+async fn pager_matches_stays_inline_in_pager_mode() -> TestResult<()> {
     let mut session = common::spawn_server_with_pager_page_chars(120).await?;
 
     let initial = session
@@ -160,24 +145,20 @@ async fn pager_matches_bundle_excludes_server_metadata_from_transcript() -> Test
         .write_stdin_raw_with(":matches foo", Some(30.0))
         .await?;
     let matches_text = result_text(&matches);
-    let transcript_path = bundle_transcript_path(&matches_text).unwrap_or_else(|| {
-        panic!("expected transcript path for oversized :matches output, got: {matches_text:?}")
-    });
-    let transcript = fs::read_to_string(&transcript_path)?;
 
     session.cancel().await?;
 
     assert!(
-        matches_text.contains("[pager]"),
-        "expected pager metadata inline, got: {matches_text:?}"
+        !matches_text.contains("transcript.txt"),
+        "did not expect oversized :matches output to spill to a bundle, got: {matches_text:?}"
     );
     assert!(
-        transcript.contains("line0001") || transcript.contains("line0002"),
-        "expected worker match content in transcript, got: {transcript:?}"
+        matches_text.contains("[pager] matches:"),
+        "expected pager summary inline, got: {matches_text:?}"
     );
     assert!(
-        !transcript.contains("[pager]"),
-        "did not expect pager metadata in transcript, got: {transcript:?}"
+        matches_text.contains("#1 @"),
+        "expected inline :matches rows to remain navigable in the pager, got: {matches_text:?}"
     );
 
     Ok(())
