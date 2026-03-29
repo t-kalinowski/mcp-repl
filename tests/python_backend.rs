@@ -129,6 +129,7 @@ subprocess.Popen(
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
     close_fds=False,
+    start_new_session=True,
 )
 print("ipc background ready")
 "#
@@ -343,6 +344,7 @@ def leave_background_ipc_tail():
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         close_fds=False,
+        start_new_session=True,
     )
     os._exit(0)
 threading.Thread(target=leave_background_ipc_tail, daemon=True).start()

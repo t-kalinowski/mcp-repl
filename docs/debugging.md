@@ -33,6 +33,8 @@ MCP_REPL_DEBUG_DIR=/tmp/mcp-repl-debug mcp-repl --interpreter r
 
 Use `MCP_REPL_DEBUG_DIR` or `--debug-dir` when the worker fails early or startup feels slow. The startup trace lines go into `startup.log` and `worker-startup.log` inside the session directory.
 
+The worker-side `MCP_REPL_IPC_*` env vars are bootstrap-only. Backends clear them before handing control to user code, so child-process debugging should not rely on those names being visible inside the REPL.
+
 Example:
 
 ```sh

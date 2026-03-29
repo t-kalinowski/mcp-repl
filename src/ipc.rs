@@ -15,6 +15,8 @@ use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::windows::ffi::OsStrExt;
 #[cfg(target_family = "windows")]
 use std::os::windows::io::{AsRawHandle, FromRawHandle};
+#[cfg(target_family = "unix")]
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering as AtomicOrdering};
 #[cfg(target_family = "windows")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, mpsc};
@@ -65,6 +67,14 @@ pub const IPC_PIPE_TO_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_TO_WORKER";
 #[cfg(target_family = "windows")]
 pub const IPC_PIPE_FROM_WORKER_ENV: &str = "MCP_REPL_IPC_PIPE_FROM_WORKER";
 const MAX_PROMPT_HISTORY: usize = 16;
+#[cfg(target_family = "unix")]
+static WORKER_IPC_ALLOWED: AtomicBool = AtomicBool::new(true);
+#[cfg(target_family = "unix")]
+static WORKER_IPC_FORK_CLOSE_READ_FD: AtomicI32 = AtomicI32::new(-1);
+#[cfg(target_family = "unix")]
+static WORKER_IPC_FORK_CLOSE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+#[cfg(target_family = "unix")]
+static WORKER_IPC_ATFORK_REGISTER_RESULT: OnceLock<i32> = OnceLock::new();
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -1177,6 +1187,14 @@ pub fn connect_from_env(_timeout: Duration) -> io::Result<WorkerIpcConnection> {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid IPC write fd"))?;
         set_cloexec(read_fd, true)?;
         set_cloexec(write_fd, true)?;
+        register_worker_ipc_fork_contract(read_fd, write_fd)?;
+        // The main worker owns the live sideband fds. Once startup has consumed the bootstrap env
+        // vars, user code and descendants must not see or reuse them.
+        // SAFETY: worker startup consumes these env vars before any worker-managed threads exist.
+        unsafe {
+            std::env::remove_var(IPC_READ_FD_ENV);
+            std::env::remove_var(IPC_WRITE_FD_ENV);
+        }
         let reader = unsafe { File::from_raw_fd(read_fd) };
         let writer = unsafe { File::from_raw_fd(write_fd) };
         WorkerIpcConnection::new(IpcTransport {
@@ -1253,7 +1271,39 @@ pub fn set_global_ipc(conn: WorkerIpcConnection) {
 }
 
 pub fn global_ipc() -> Option<&'static WorkerIpcConnection> {
+    #[cfg(target_family = "unix")]
+    if !WORKER_IPC_ALLOWED.load(AtomicOrdering::SeqCst) {
+        return None;
+    }
     IPC_GLOBAL.get()
+}
+
+#[cfg(target_family = "unix")]
+extern "C" fn close_worker_ipc_in_fork_child() {
+    WORKER_IPC_ALLOWED.store(false, AtomicOrdering::SeqCst);
+    let read_fd = WORKER_IPC_FORK_CLOSE_READ_FD.load(AtomicOrdering::SeqCst);
+    let write_fd = WORKER_IPC_FORK_CLOSE_WRITE_FD.load(AtomicOrdering::SeqCst);
+    unsafe {
+        if read_fd >= 0 {
+            libc::close(read_fd);
+        }
+        if write_fd >= 0 {
+            libc::close(write_fd);
+        }
+    }
+}
+
+#[cfg(target_family = "unix")]
+fn register_worker_ipc_fork_contract(read_fd: RawFd, write_fd: RawFd) -> io::Result<()> {
+    let result = *WORKER_IPC_ATFORK_REGISTER_RESULT.get_or_init(|| unsafe {
+        libc::pthread_atfork(None, None, Some(close_worker_ipc_in_fork_child))
+    });
+    if result != 0 {
+        return Err(io::Error::from_raw_os_error(result));
+    }
+    WORKER_IPC_FORK_CLOSE_READ_FD.store(read_fd, AtomicOrdering::SeqCst);
+    WORKER_IPC_FORK_CLOSE_WRITE_FD.store(write_fd, AtomicOrdering::SeqCst);
+    Ok(())
 }
 
 pub fn emit_readline_start(prompt: &str) {

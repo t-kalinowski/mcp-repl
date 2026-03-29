@@ -4342,8 +4342,6 @@ impl WorkerProcess {
             let _ = self.send_sigkill();
             // TODO: Track descendants or use stronger OS-level containment so children that have
             // escaped the worker process group are still killable after the root exits.
-            // TODO: Reset the worker-side IPC fds back to CLOEXEC in the backend after startup so
-            // ordinary exec'd children do not inherit them in the first place.
         }
         self.quiesce_output_producers()?;
         self.cleanup_session_tmpdir();
@@ -4355,8 +4353,10 @@ impl WorkerProcess {
         // Keep teardown bounded even if a detached descendant still holds stdio open. A more
         // robust long-term design would pair this with session-scoped output rings or stronger
         // OS-level containment so stale descendants cannot target a future session at all.
-        // TODO: Give the IPC reader the same local wake/cancel path as stdout/stderr so teardown
-        // never has to rely on remote EOF to unblock that thread.
+        // IPC is stricter than stdout/stderr by contract: only the main worker may own the
+        // sideband fds. Backend startup strips the bootstrap env vars, marks the fds
+        // close-on-exec, and closes them again in forked children, so EOF should track the root
+        // worker lifetime.
         if let Some(reader) = self.stdout_reader.take() {
             reader.stop_and_join("worker stdout reader thread panicked")?;
         }

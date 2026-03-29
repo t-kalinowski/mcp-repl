@@ -3,10 +3,6 @@ mod common;
 use common::TestResult;
 use rmcp::model::RawContent;
 use serde_json::json;
-#[cfg(not(windows))]
-use std::time::Duration;
-#[cfg(not(windows))]
-use tokio::time::Instant;
 
 fn result_text(result: &rmcp::model::CallToolResult) -> String {
     result
@@ -35,15 +31,6 @@ fn busy_response(text: &str) -> bool {
         || text.contains("worker is busy")
         || text.contains("request already running")
         || text.contains("input discarded while worker busy")
-}
-
-#[cfg(not(windows))]
-fn shutdown_completion_budget() -> Duration {
-    if cfg!(target_os = "macos") {
-        Duration::from_millis(1_500)
-    } else {
-        Duration::from_millis(1_200)
-    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -132,71 +119,35 @@ async fn repl_reset_clears_state() -> TestResult<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
 #[tokio::test(flavor = "multi_thread")]
-async fn repl_reset_does_not_wait_for_background_ipc_holders() -> TestResult<()> {
+async fn repl_tool_hides_ipc_fd_env_vars_from_r_user_code() -> TestResult<()> {
     let mut session = common::spawn_server().await?;
 
-    let setup = session
+    let result = session
         .call_tool_raw(
             session.repl_tool_name(),
             json!({
-                "input": "fd <- Sys.getenv(\"MCP_REPL_IPC_WRITE_FD\"); cmd <- sprintf(\"eval 'exec 3>&%s'; sleep 2.5\", fd); system2(\"/bin/sh\", c(\"-c\", cmd), wait = FALSE, stdout = FALSE, stderr = FALSE); cat(\"ipc background ready\\n\")\n",
+                "input": "cat(sprintf(\"%s %s\\n\", nzchar(Sys.getenv(\"MCP_REPL_IPC_READ_FD\")), nzchar(Sys.getenv(\"MCP_REPL_IPC_WRITE_FD\"))))\n",
                 "timeout_ms": 10_000
             }),
         )
         .await?;
-    let setup_text = result_text(&setup);
-    if backend_unavailable(&setup_text) {
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
         eprintln!("repl_surface backend unavailable in this environment; skipping");
         session.cancel().await?;
         return Ok(());
     }
-    if busy_response(&setup_text) {
-        eprintln!("repl_surface worker remained busy before reset; skipping");
+    if busy_response(&text) {
+        eprintln!("repl_surface worker remained busy; skipping");
         session.cancel().await?;
         return Ok(());
     }
-    assert!(
-        setup_text.contains("ipc background ready"),
-        "expected setup confirmation, got: {setup_text:?}"
-    );
-
-    let start = Instant::now();
-    let reset = session.call_tool_raw("repl_reset", json!({})).await?;
-    let elapsed = start.elapsed();
-    let reset_text = result_text(&reset);
-    if backend_unavailable(&reset_text) {
-        eprintln!("repl_surface backend unavailable in this environment; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-    if busy_response(&reset_text) {
-        eprintln!("repl_surface worker remained busy during reset; skipping");
-        session.cancel().await?;
-        return Ok(());
-    }
-
-    assert!(
-        elapsed < shutdown_completion_budget(),
-        "expected repl_reset to finish before background IPC holder exit, got {elapsed:?}: {reset_text:?}"
-    );
-
-    let after_reset = session
-        .call_tool_raw(
-            session.repl_tool_name(),
-            json!({
-                "input": "1+1\n",
-                "timeout_ms": 10_000
-            }),
-        )
-        .await?;
-    let after_reset_text = result_text(&after_reset);
     session.cancel().await?;
 
     assert!(
-        after_reset_text.contains("2"),
-        "expected prompt recovery after reset, got: {after_reset_text:?}"
+        text.contains("FALSE FALSE"),
+        "expected IPC fd env vars to be hidden from R user code, got: {text:?}"
     );
 
     Ok(())

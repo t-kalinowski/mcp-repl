@@ -19,6 +19,7 @@ The repository is organized around a few concrete subsystems rather than deep pa
 
 - `src/worker.rs`, `src/worker_process.rs`, and `src/worker_protocol.rs` manage the child runtime and the server-to-worker contract.
 - `src/backend.rs` selects between the R and Python implementations.
+- The IPC sideband is single-owner by design: startup env vars only bootstrap the main worker, then they are scrubbed before user code runs. Descendants must not emit sideband messages.
 - R-specific behavior lives in `src/r_session.rs`, `src/r_controls.rs`, `src/r_graphics.rs`, and `src/r_htmd.rs`.
 - Python startup is driven by the worker plus the files under `python/`.
 
