@@ -58,7 +58,7 @@ use sysinfo::{Pid, ProcessesToUpdate, System};
 #[cfg(target_family = "windows")]
 use windows_sys::Win32::Foundation::{ERROR_BROKEN_PIPE, ERROR_HANDLE_EOF};
 #[cfg(target_family = "windows")]
-use windows_sys::Win32::Storage::FileSystem::PeekNamedPipe;
+use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
 #[cfg(all(test, target_family = "unix"))]
 thread_local! {
