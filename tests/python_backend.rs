@@ -334,11 +334,7 @@ os.fdopen = _wrapped_fdopen
     let result = session
         .write_stdin_raw_with(
             r#"import os
-pid = os.fork()
-if pid == 0:
-    os._exit(0)
-_, status = os.waitpid(pid, 0)
-print("FORK_OK", status)
+exec("pid = os.fork()\nif pid == 0:\n    os._exit(0)\n_, status = os.waitpid(pid, 0)\nprint('FORK_OK', status)")
 "#,
             Some(5.0),
         )

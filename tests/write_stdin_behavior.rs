@@ -765,7 +765,14 @@ async fn follow_up_after_timeout_spills_when_prefix_and_reply_exceed_threshold()
         "did not expect the initial under-threshold timeout reply to spill, got: {first_text:?}"
     );
 
-    sleep(test_delay_ms(260, 700)).await;
+    sleep(Duration::from_millis(
+        if cfg!(any(target_os = "macos", windows)) {
+            700
+        } else {
+            350
+        },
+    ))
+    .await;
     let follow_up_input = format!(
         "fresh <- paste(rep('f', {UNDER_HARD_SPILL_TEXT_LEN}), collapse = ''); cat('FRESH_START\\n'); cat(fresh); cat('\\nFRESH_END\\n')"
     );
