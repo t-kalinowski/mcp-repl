@@ -164,8 +164,8 @@ impl PendingOutputTape {
             .lock()
             .expect("pending output tape mutex poisoned");
         note_progress(&mut guard);
-        flush_tail(&mut guard, TextStream::Stdout, true);
-        flush_tail(&mut guard, TextStream::Stderr, true);
+        flush_tail(&mut guard, TextStream::Stdout, false);
+        flush_tail(&mut guard, TextStream::Stderr, false);
         let seq = next_seq(&mut guard);
         append_event(
             &mut guard,
@@ -1133,7 +1133,7 @@ mod tests {
     }
 
     #[test]
-    fn split_utf8_prefix_flushes_before_image_event() {
+    fn split_utf8_prefix_survives_image_event_without_escape_corruption() {
         let tape = PendingOutputTape::new();
 
         tape.append_stdout_bytes(&[0xC3]);
@@ -1146,14 +1146,20 @@ mod tests {
         tape.append_stdout_bytes(&[0xA9, b'\n']);
 
         let snapshot = tape.drain_snapshot();
-        assert!(matches!(
-            snapshot.events.as_slice(),
-            [
-                PendingOutputEvent::TextFragment { bytes, .. },
-                PendingOutputEvent::Image { .. },
-                PendingOutputEvent::TextFragment { bytes: second, .. },
-            ] if bytes == &vec![0xC3] && second == &vec![0xA9, b'\n']
-        ));
+        let formatted = snapshot.format_contents();
+
+        assert_eq!(
+            formatted.contents,
+            vec![
+                WorkerContent::stdout("é\n"),
+                WorkerContent::ContentImage {
+                    data: "AA==".to_string(),
+                    mime_type: "image/png".to_string(),
+                    id: "img-1".to_string(),
+                    is_new: true,
+                },
+            ]
+        );
     }
 
     #[test]

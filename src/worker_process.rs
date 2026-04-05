@@ -2634,16 +2634,26 @@ impl WorkerManager {
         };
         match status {
             Ok(()) => {
-                let settled_completion = Some(completion_info_from_ipc(&ipc, false));
+                let mut settled_completion = completion_info_from_ipc(&ipc, false);
                 self.settle_output_after_request_end(Duration::from_millis(120));
                 if matches!(self.oversized_output, OversizedOutputMode::Pager) {
                     update_last_reply_marker_offset_max(self.output.end_offset().unwrap_or(0));
                 }
+                let worker_exited = match self.process.as_mut() {
+                    Some(process) => match process.is_running() {
+                        Ok(running) => !running,
+                        Err(_) => false,
+                    },
+                    None => true,
+                };
                 self.clear_pending_request_state();
-                if let Some(completion) = settled_completion {
-                    self.remember_prompt(completion.prompt.clone());
-                    self.settled_pending_completion = Some(completion);
+                if worker_exited {
+                    settled_completion.session_end_seen = true;
+                    self.note_session_end(true);
+                } else {
+                    self.remember_prompt(settled_completion.prompt.clone());
                 }
+                self.settled_pending_completion = Some(settled_completion);
             }
             Err(IpcWaitError::SessionEnd) => {
                 self.note_session_end(true);
@@ -5942,6 +5952,61 @@ mod tests {
         assert!(
             text.contains("worker exited with status 7"),
             "expected the exit-status notice to stay visible, got: {text:?}"
+        );
+    }
+
+    #[cfg(target_family = "unix")]
+    #[test]
+    fn timed_out_request_end_with_exited_worker_reports_session_end_immediately() {
+        let _guard = env_test_mutex().lock().expect("env mutex");
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        let mut manager = WorkerManager::new(
+            Backend::Python,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Files,
+        )
+        .expect("worker manager");
+        let process = test_worker_process(successful_test_child());
+        process.ipc.set(server);
+        manager.process = Some(process);
+        manager.pending_request = true;
+        manager.pending_request_started_at = Some(std::time::Instant::now());
+        manager.pending_request_input = Some("quit()\n".to_string());
+
+        let prompt = ">>> ".to_string();
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: prompt.clone(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt,
+            line: "quit()\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
+        drop(worker);
+        thread::sleep(Duration::from_millis(20));
+
+        manager.resolve_timeout_marker_with_wait(Duration::from_millis(0));
+        let formatted = manager.drain_final_formatted_output();
+        let text = contents_text(&formatted.contents);
+
+        assert!(
+            manager.session_end_seen,
+            "expected timed-out completion resolution to notice the exited session"
+        );
+        assert!(
+            manager
+                .settled_pending_completion
+                .as_ref()
+                .is_some_and(|completion| completion.session_end_seen),
+            "expected queued completion metadata to be marked as session-ended"
+        );
+        assert!(
+            text.contains("[repl] session ended"),
+            "expected timed-out completion resolution to record the session-end notice, got: {text:?}"
+        );
+        assert!(
+            !text.contains(">>> "),
+            "did not expect the exited session to keep advertising its prompt, got: {text:?}"
         );
     }
 
