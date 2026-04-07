@@ -2531,12 +2531,14 @@ impl WorkerManager {
             self.backend,
             &self.exe_path,
             &self.sandbox_state,
-            self.oversized_output,
-            self.pending_output_tape.clone(),
-            self.output_timeline.clone(),
-            self.guardrail.clone(),
-            #[cfg(target_os = "windows")]
-            prepared_windows_launch.as_ref(),
+            WorkerSpawnContext {
+                oversized_output: self.oversized_output,
+                pending_output_tape: self.pending_output_tape.clone(),
+                output_timeline: self.output_timeline.clone(),
+                guardrail: self.guardrail.clone(),
+                #[cfg(target_os = "windows")]
+                prepared_windows_launch,
+            },
         )?;
         let ipc = process
             .ipc
@@ -2578,12 +2580,14 @@ impl WorkerManager {
             self.backend,
             &self.exe_path,
             &self.sandbox_state,
-            self.oversized_output,
-            self.pending_output_tape.clone(),
-            self.output_timeline.clone(),
-            self.guardrail.clone(),
-            #[cfg(target_os = "windows")]
-            prepared_windows_launch.as_ref(),
+            WorkerSpawnContext {
+                oversized_output: self.oversized_output,
+                pending_output_tape: self.pending_output_tape.clone(),
+                output_timeline: self.output_timeline.clone(),
+                guardrail: self.guardrail.clone(),
+                #[cfg(target_os = "windows")]
+                prepared_windows_launch,
+            },
         )?;
         let ipc = process
             .ipc
@@ -4141,6 +4145,15 @@ struct SpawnedWorker {
     denial_logger: Option<crate::sandbox::DenialLogger>,
 }
 
+struct WorkerSpawnContext {
+    oversized_output: OversizedOutputMode,
+    pending_output_tape: PendingOutputTape,
+    output_timeline: OutputTimeline,
+    guardrail: GuardrailShared,
+    #[cfg(target_os = "windows")]
+    prepared_windows_launch: Option<crate::windows_sandbox::PreparedSandboxLaunch>,
+}
+
 struct OutputReader {
     handle: std::thread::JoinHandle<()>,
     done_rx: mpsc::Receiver<()>,
@@ -4261,14 +4274,17 @@ impl WorkerProcess {
         backend: Backend,
         exe_path: &Path,
         sandbox_state: &SandboxState,
-        oversized_output: OversizedOutputMode,
-        pending_output_tape: PendingOutputTape,
-        output_timeline: OutputTimeline,
-        guardrail: GuardrailShared,
-        #[cfg(target_os = "windows")] prepared_windows_launch: Option<
-            &crate::windows_sandbox::PreparedSandboxLaunch,
-        >,
+        context: WorkerSpawnContext,
     ) -> Result<Self, WorkerError> {
+        let WorkerSpawnContext {
+            oversized_output,
+            pending_output_tape,
+            output_timeline,
+            guardrail,
+            #[cfg(target_os = "windows")]
+            prepared_windows_launch,
+        } = context;
+
         #[cfg(not(target_family = "unix"))]
         let _ = &guardrail;
 
@@ -4293,7 +4309,7 @@ impl WorkerProcess {
                 live_output.clone(),
                 &mut ipc_server,
                 #[cfg(target_os = "windows")]
-                prepared_windows_launch,
+                prepared_windows_launch.as_ref(),
             )?,
             Backend::Python => {
                 Self::spawn_python_worker(sandbox_state, live_output.clone(), &mut ipc_server)?
