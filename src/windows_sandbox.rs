@@ -358,6 +358,7 @@ pub fn prepare_sandbox_launch(
     unsafe {
         let psid_capability = convert_string_sid_to_sid(&cap_sid)
             .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
+        let mut acl_guards: Vec<(PathBuf, *mut c_void)> = Vec::new();
         let paths = compute_allow_deny_paths(
             policy,
             &canonical_cwd,
@@ -366,18 +367,33 @@ pub fn prepare_sandbox_launch(
             &env_map,
         );
         for path in &paths.allow {
-            add_allow_ace(path, psid_capability).map_err(|err| {
-                format!(
-                    "failed to apply writable ACL to '{}': {err}",
-                    path.display()
-                )
-            })?;
+            match add_allow_ace(path, psid_capability) {
+                Ok(true) => acl_guards.push((path.clone(), psid_capability)),
+                Ok(false) => {}
+                Err(err) => {
+                    cleanup_capability_acl_state(&acl_guards, psid_capability, false);
+                    LocalFree(psid_capability as HLOCAL);
+                    return Err(format!(
+                        "failed to apply writable ACL to '{}': {err}",
+                        path.display()
+                    ));
+                }
+            }
         }
         if matches!(policy, SandboxPolicy::WorkspaceWrite { .. }) {
             for path in &paths.deny {
-                add_deny_write_ace(path, psid_capability).map_err(|err| {
-                    format!("failed to apply deny ACL to '{}': {err}", path.display())
-                })?;
+                match add_deny_write_ace(path, psid_capability) {
+                    Ok(true) => acl_guards.push((path.clone(), psid_capability)),
+                    Ok(false) => {}
+                    Err(err) => {
+                        cleanup_capability_acl_state(&acl_guards, psid_capability, false);
+                        LocalFree(psid_capability as HLOCAL);
+                        return Err(format!(
+                            "failed to apply deny ACL to '{}': {err}",
+                            path.display()
+                        ));
+                    }
+                }
             }
         }
         LocalFree(psid_capability as HLOCAL);
@@ -557,11 +573,12 @@ pub fn run_sandboxed_command(
 
         let mut exit_code: u32 = 1;
         if GetExitCodeProcess(proc_info.hProcess, &mut exit_code) == 0 {
-            let _ = stdout_forwarder.join();
-            let _ = stderr_forwarder.join();
             if let Some(job) = job_handle {
                 CloseHandle(job);
             }
+            drop(stdin_forwarder);
+            drop(stdout_forwarder);
+            drop(stderr_forwarder);
             cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
             CloseHandle(proc_info.hThread);
             CloseHandle(proc_info.hProcess);
@@ -577,8 +594,8 @@ pub fn run_sandboxed_command(
             CloseHandle(job);
         }
         drop(stdin_forwarder);
-        let _ = stdout_forwarder.join();
-        let _ = stderr_forwarder.join();
+        drop(stdout_forwarder);
+        drop(stderr_forwarder);
         cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
         CloseHandle(proc_info.hThread);
         CloseHandle(proc_info.hProcess);
