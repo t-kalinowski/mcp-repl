@@ -58,5 +58,6 @@
 - 2026-04-08: Deterministic capability SIDs must include the full workspace-write policy shape, not just mode plus cwd. Otherwise tightening writable roots or related flags can silently keep the old write access alive through stale ACEs.
 - 2026-04-08: Parent-side Windows sandbox preparation must roll back any newly added ACEs if a later allow/deny update fails. Deterministic capability SIDs make partial prep state persistent unless errors clean up after themselves.
 - 2026-04-08: The Windows wrapper must not block exit on stdout/stderr forwarding thread joins after the worker process exits. Descendants can inherit those pipe writers, so EOF on the wrapper-owned readers is not a safe shutdown condition.
+- 2026-04-08: Wrapper shutdown should still give stdout/stderr forwarders a short bounded grace period to flush buffered pipe data after the child exits. Immediate thread drop avoids hangs but can truncate the tail of fast-exiting commands.
 - 2026-04-08: Windows embedded R must use `UImode_RTerm`. With `UImode_RGui`, even simple child-process launches like `system2("cmd", c("/c", "echo", "CMD_OK"))` can hang inside the worker.
 - 2026-04-08: Embedded-worker stdin ownership is tracked separately in `docs/futurework/stdin-transport-single-owner.md` so this PR can stay focused on the sandbox refactor.

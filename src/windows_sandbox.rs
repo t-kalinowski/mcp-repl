@@ -11,7 +11,9 @@ use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use crate::sandbox::{R_SESSION_TMPDIR_ENV, SandboxPolicy};
 use windows_sys::Win32::Foundation::CloseHandle;
@@ -102,6 +104,7 @@ const REVOKE_ACCESS: i32 = 4;
 const CONTAINER_INHERIT_ACE: u32 = 0x2;
 const OBJECT_INHERIT_ACE: u32 = 0x1;
 const INHERIT_ONLY_ACE: u8 = 0x08;
+const WRAPPER_STDIO_DRAIN_TIMEOUT: Duration = Duration::from_millis(200);
 
 #[derive(Debug, Default)]
 struct AllowDenyPaths {
@@ -141,6 +144,14 @@ struct WrapperChildStdio {
     child_stdin: HANDLE,
     child_stdout: HANDLE,
     child_stderr: HANDLE,
+}
+
+struct WrapperStdioForwarders {
+    stdin_forwarder: thread::JoinHandle<()>,
+    stdout_forwarder: thread::JoinHandle<()>,
+    stderr_forwarder: thread::JoinHandle<()>,
+    stdout_done: mpsc::Receiver<()>,
+    stderr_done: mpsc::Receiver<()>,
 }
 
 fn should_apply_network_block(policy: &SandboxPolicy) -> bool {
@@ -520,7 +531,15 @@ pub fn run_sandboxed_command(
             }
         }
 
-        let stdio_pipes = create_wrapper_child_stdio()?;
+        let stdio_pipes = match create_wrapper_child_stdio() {
+            Ok(pipes) => pipes,
+            Err(err) => {
+                cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
+                CloseHandle(restricted_token);
+                LocalFree(psid_capability as HLOCAL);
+                return Err(err);
+            }
+        };
         crate::diagnostics::startup_log("windows-sandbox: stdio pipes created");
         let spawn_result = create_process_as_user(
             restricted_token,
@@ -547,8 +566,13 @@ pub fn run_sandboxed_command(
         CloseHandle(stdio_pipes.child_stdin);
         CloseHandle(stdio_pipes.child_stdout);
         CloseHandle(stdio_pipes.child_stderr);
-        let (stdin_forwarder, stdout_forwarder, stderr_forwarder) =
-            spawn_wrapper_stdio_forwarders(stdio_pipes);
+        let WrapperStdioForwarders {
+            stdin_forwarder,
+            stdout_forwarder,
+            stderr_forwarder,
+            stdout_done,
+            stderr_done,
+        } = spawn_wrapper_stdio_forwarders(stdio_pipes);
 
         let job_handle = create_job_kill_on_close().ok();
         if let Some(job) = job_handle {
@@ -594,8 +618,8 @@ pub fn run_sandboxed_command(
             CloseHandle(job);
         }
         drop(stdin_forwarder);
-        drop(stdout_forwarder);
-        drop(stderr_forwarder);
+        drain_wrapper_forwarder(stdout_forwarder, stdout_done);
+        drain_wrapper_forwarder(stderr_forwarder, stderr_done);
         cleanup_capability_acl_state(&acl_guards, psid_capability, null_device_ace_applied);
         CloseHandle(proc_info.hThread);
         CloseHandle(proc_info.hProcess);
@@ -817,13 +841,7 @@ unsafe fn create_wrapper_child_stdio() -> Result<WrapperChildStdio, String> {
     })
 }
 
-fn spawn_wrapper_stdio_forwarders(
-    stdio: WrapperChildStdio,
-) -> (
-    thread::JoinHandle<()>,
-    thread::JoinHandle<()>,
-    thread::JoinHandle<()>,
-) {
+fn spawn_wrapper_stdio_forwarders(stdio: WrapperChildStdio) -> WrapperStdioForwarders {
     let WrapperChildStdio {
         stdin_write,
         stdout_read,
@@ -832,6 +850,9 @@ fn spawn_wrapper_stdio_forwarders(
         child_stdout: _,
         child_stderr: _,
     } = stdio;
+
+    let (stdout_done_tx, stdout_done_rx) = mpsc::channel();
+    let (stderr_done_tx, stderr_done_rx) = mpsc::channel();
 
     let stdin_forwarder = thread::spawn(move || {
         let mut wrapper_stdin = io::stdin();
@@ -844,15 +865,31 @@ fn spawn_wrapper_stdio_forwarders(
         let mut wrapper_stdout = io::stdout();
         let _ = io::copy(&mut child_stdout, &mut wrapper_stdout);
         let _ = wrapper_stdout.flush();
+        let _ = stdout_done_tx.send(());
     });
     let stderr_forwarder = thread::spawn(move || {
         let mut child_stderr = stderr_read;
         let mut wrapper_stderr = io::stderr();
         let _ = io::copy(&mut child_stderr, &mut wrapper_stderr);
         let _ = wrapper_stderr.flush();
+        let _ = stderr_done_tx.send(());
     });
 
-    (stdin_forwarder, stdout_forwarder, stderr_forwarder)
+    WrapperStdioForwarders {
+        stdin_forwarder,
+        stdout_forwarder,
+        stderr_forwarder,
+        stdout_done: stdout_done_rx,
+        stderr_done: stderr_done_rx,
+    }
+}
+
+fn drain_wrapper_forwarder(handle: thread::JoinHandle<()>, done: mpsc::Receiver<()>) {
+    if done.recv_timeout(WRAPPER_STDIO_DRAIN_TIMEOUT).is_ok() {
+        let _ = handle.join();
+    } else {
+        drop(handle);
+    }
 }
 
 unsafe fn ensure_inheritable_stdio(startup_info: &mut STARTUPINFOW) -> Result<(), String> {
