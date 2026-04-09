@@ -9,6 +9,7 @@ use std::io;
 use std::io::Read;
 use std::io::Write;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::io::AsRawHandle;
 use std::os::windows::io::FromRawHandle;
 use std::path::Path;
 use std::path::PathBuf;
@@ -95,6 +96,8 @@ use windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
 use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::GetExitCodeProcess;
+#[cfg(test)]
+use windows_sys::Win32::System::Threading::GetProcessHandleCount;
 use windows_sys::Win32::System::Threading::INFINITE;
 use windows_sys::Win32::System::Threading::OpenProcessToken;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
@@ -159,9 +162,9 @@ struct WrapperChildStdio {
     stdin_write: File,
     stdout_read: File,
     stderr_read: File,
-    child_stdin: HANDLE,
-    child_stdout: HANDLE,
-    child_stderr: HANDLE,
+    child_stdin: File,
+    child_stdout: File,
+    child_stderr: File,
 }
 
 struct WrapperStdioForwarders {
@@ -327,13 +330,8 @@ unsafe fn convert_string_sid_to_sid(value: &str) -> Option<*mut c_void> {
     if ok != 0 { Some(sid) } else { None }
 }
 
-fn stable_cap_sid_string(
-    policy: &SandboxPolicy,
-    sandbox_policy_cwd: &Path,
-    session_temp_dir: &Path,
-) -> String {
+fn stable_cap_sid_string(policy: &SandboxPolicy, sandbox_policy_cwd: &Path) -> String {
     let canonical_cwd = canonicalize_or_identity(sandbox_policy_cwd);
-    let canonical_session_temp_dir = canonicalize_or_identity(session_temp_dir);
     let policy_seed = match policy {
         SandboxPolicy::ReadOnly => serde_json::json!({
             "mode": "read-only",
@@ -372,9 +370,8 @@ fn stable_cap_sid_string(
         }
     };
     let seed = format!(
-        "mcp-repl-windows-sandbox-v2\0{}\0{}\0{}",
+        "mcp-repl-windows-sandbox-v2\0{}\0{}",
         canonical_cwd.display(),
-        canonical_session_temp_dir.display(),
         policy_seed,
     );
     let a = stable_sid_word(seed.as_bytes(), 0x243f_6a88);
@@ -400,16 +397,11 @@ fn make_random_sid_string() -> String {
 fn resolve_launch_capability_sids(
     policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
-    session_temp_dir: Option<&Path>,
     prepared_capability_sid: Option<&str>,
 ) -> Result<LaunchCapabilitySids, String> {
     match prepared_capability_sid {
         Some(value) => {
-            let session_temp_dir = session_temp_dir.ok_or_else(|| {
-                "prepared capability SID requires MCP_REPL_R_SESSION_TMPDIR".to_string()
-            })?;
-            let expected_filesystem_sid =
-                stable_cap_sid_string(policy, sandbox_policy_cwd, session_temp_dir);
+            let expected_filesystem_sid = stable_cap_sid_string(policy, sandbox_policy_cwd);
             if value != expected_filesystem_sid {
                 return Err(
                     "prepared capability SID did not match expected workspace identity".to_string(),
@@ -533,7 +525,7 @@ pub fn prepare_sandbox_launch(
 
     let canonical_cwd = canonicalize_or_identity(sandbox_policy_cwd);
     let canonical_session_temp_dir = canonicalize_or_identity(session_temp_dir);
-    let cap_sid = stable_cap_sid_string(policy, &canonical_cwd, &canonical_session_temp_dir);
+    let cap_sid = stable_cap_sid_string(policy, &canonical_cwd);
     let launch = PreparedSandboxLaunch {
         policy: policy.clone(),
         sandbox_policy_cwd: canonical_cwd,
@@ -590,12 +582,8 @@ pub fn run_sandboxed_command(
         let session_temp_dir =
             env_get_case_insensitive(&env_map, R_SESSION_TMPDIR_ENV).map(PathBuf::from);
 
-        let capability_sids = resolve_launch_capability_sids(
-            policy,
-            sandbox_policy_cwd,
-            session_temp_dir.as_deref(),
-            prepared_capability_sid,
-        )?;
+        let capability_sids =
+            resolve_launch_capability_sids(policy, sandbox_policy_cwd, prepared_capability_sid)?;
         let psid_capability = convert_string_sid_to_sid(&capability_sids.filesystem_sid)
             .ok_or_else(|| "ConvertStringSidToSidW failed for filesystem SID".to_string())?;
         let launch_sid_is_distinct = capability_sids.launch_sid != capability_sids.filesystem_sid;
@@ -710,9 +698,9 @@ pub fn run_sandboxed_command(
             sandbox_policy_cwd,
             &env_map,
             Some((
-                stdio_pipes.child_stdin,
-                stdio_pipes.child_stdout,
-                stdio_pipes.child_stderr,
+                stdio_pipes.child_stdin.as_raw_handle() as HANDLE,
+                stdio_pipes.child_stdout.as_raw_handle() as HANDLE,
+                stdio_pipes.child_stderr.as_raw_handle() as HANDLE,
             )),
         );
         let (proc_info, _startup_info) = match spawn_result {
@@ -729,9 +717,6 @@ pub fn run_sandboxed_command(
             }
         };
         crate::diagnostics::startup_log("windows-sandbox: child spawned");
-        CloseHandle(stdio_pipes.child_stdin);
-        CloseHandle(stdio_pipes.child_stdout);
-        CloseHandle(stdio_pipes.child_stderr);
         let WrapperStdioForwarders {
             stdin_forwarder,
             stdout_forwarder,
@@ -1010,9 +995,9 @@ unsafe fn create_wrapper_child_stdio() -> Result<WrapperChildStdio, String> {
         stdin_write: File::from_raw_handle(stdin_write as _),
         stdout_read: File::from_raw_handle(stdout_read as _),
         stderr_read: File::from_raw_handle(stderr_read as _),
-        child_stdin,
-        child_stdout,
-        child_stderr,
+        child_stdin: File::from_raw_handle(child_stdin as _),
+        child_stdout: File::from_raw_handle(child_stdout as _),
+        child_stderr: File::from_raw_handle(child_stderr as _),
     })
 }
 
@@ -2151,23 +2136,13 @@ mod tests {
     }
 
     #[test]
-    fn stable_capability_sid_is_deterministic_for_workspace_and_session_temp_dir() {
+    fn stable_capability_sid_is_deterministic_for_workspace_and_policy() {
         let tmp = tempdir().expect("tempdir");
         let cwd = tmp.path().join("workspace");
-        let session_temp_dir = tmp.path().join("session-temp");
         std::fs::create_dir_all(&cwd).expect("workspace dir");
-        std::fs::create_dir_all(&session_temp_dir).expect("session temp dir");
 
-        let first = stable_cap_sid_string(
-            &workspace_policy(Vec::new(), false, false),
-            &cwd,
-            &session_temp_dir,
-        );
-        let second = stable_cap_sid_string(
-            &workspace_policy(Vec::new(), false, false),
-            &cwd,
-            &session_temp_dir,
-        );
+        let first = stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd);
+        let second = stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd);
 
         assert_eq!(first, second);
     }
@@ -2180,15 +2155,10 @@ mod tests {
         std::fs::create_dir_all(&cwd).expect("workspace dir");
         std::fs::create_dir_all(&session_temp_dir).expect("session temp dir");
 
-        let expected = stable_cap_sid_string(
-            &workspace_policy(Vec::new(), false, false),
-            &cwd,
-            &session_temp_dir,
-        );
+        let expected = stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd);
         let resolved = resolve_launch_capability_sids(
             &workspace_policy(Vec::new(), false, false),
             &cwd,
-            Some(&session_temp_dir),
             Some(&expected),
         )
         .expect("prepared launch SIDs");
@@ -2198,56 +2168,70 @@ mod tests {
     }
 
     #[test]
-    fn prepared_launch_sid_requires_session_temp_metadata() {
+    fn prepared_launch_sid_does_not_require_session_temp_metadata() {
         let tmp = tempdir().expect("tempdir");
         let cwd = tmp.path().join("workspace");
         std::fs::create_dir_all(&cwd).expect("workspace dir");
+        let expected = stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd);
 
         let result = resolve_launch_capability_sids(
             &workspace_policy(Vec::new(), false, false),
             &cwd,
-            None,
-            Some("S-1-5-21-1-2-3-4"),
+            Some(&expected),
         );
 
         assert!(
-            result.is_err(),
-            "prepared capability SID should require session temp metadata"
+            result.is_ok(),
+            "prepared capability SID should not depend on session temp metadata"
         );
     }
 
     #[test]
-    fn stable_capability_sid_changes_with_policy_workspace_or_session_temp_dir() {
+    fn stable_capability_sid_changes_with_policy_or_workspace() {
         let tmp = tempdir().expect("tempdir");
         let cwd_a = tmp.path().join("workspace-a");
         let cwd_b = tmp.path().join("workspace-b");
-        let session_temp_a = tmp.path().join("session-temp-a");
-        let session_temp_b = tmp.path().join("session-temp-b");
         std::fs::create_dir_all(&cwd_a).expect("workspace a dir");
         std::fs::create_dir_all(&cwd_b).expect("workspace b dir");
-        std::fs::create_dir_all(&session_temp_a).expect("session temp a dir");
-        std::fs::create_dir_all(&session_temp_b).expect("session temp b dir");
 
-        let workspace_a = stable_cap_sid_string(
-            &workspace_policy(Vec::new(), false, false),
-            &cwd_a,
-            &session_temp_a,
-        );
-        let workspace_b = stable_cap_sid_string(
-            &workspace_policy(Vec::new(), false, false),
-            &cwd_b,
-            &session_temp_a,
-        );
-        let different_temp_a = stable_cap_sid_string(
-            &workspace_policy(Vec::new(), false, false),
-            &cwd_a,
-            &session_temp_b,
-        );
-        let readonly_a = stable_cap_sid_string(&SandboxPolicy::ReadOnly, &cwd_a, &session_temp_a);
+        let workspace_a =
+            stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd_a);
+        let workspace_b =
+            stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd_b);
+        let readonly_a = stable_cap_sid_string(&SandboxPolicy::ReadOnly, &cwd_a);
 
         assert_ne!(workspace_a, workspace_b);
-        assert_ne!(workspace_a, different_temp_a);
         assert_ne!(workspace_a, readonly_a);
+    }
+
+    #[test]
+    fn stable_capability_sid_ignores_session_temp_dir() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let session_temp_a = tmp.path().join("session-temp-a");
+        let session_temp_b = tmp.path().join("session-temp-b");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_a).expect("session temp a dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_b).expect("session temp b dir");
+
+        let first = prepare_sandbox_launch(
+            &workspace_policy(Vec::new(), false, false),
+            &cwd,
+            &session_temp_a,
+        )
+        .expect("prepare launch a");
+        let second = prepare_sandbox_launch(
+            &workspace_policy(Vec::new(), false, false),
+            &cwd,
+            &session_temp_b,
+        )
+        .expect("prepare launch b");
+
+        assert_eq!(
+            first.capability_sid(),
+            second.capability_sid(),
+            "stable filesystem SID should be reused across per-session temp dirs"
+        );
     }
 
     #[test]
@@ -2255,35 +2239,43 @@ mod tests {
         let tmp = tempdir().expect("tempdir");
         let cwd = tmp.path().join("workspace");
         let extra_root = tmp.path().join("extra");
-        let session_temp_dir = tmp.path().join("session-temp");
         std::fs::create_dir_all(&cwd).expect("workspace dir");
         std::fs::create_dir_all(&extra_root).expect("extra dir");
-        std::fs::create_dir_all(&session_temp_dir).expect("session temp dir");
 
-        let base = stable_cap_sid_string(
-            &workspace_policy(Vec::new(), false, false),
-            &cwd,
-            &session_temp_dir,
-        );
-        let with_root = stable_cap_sid_string(
-            &workspace_policy(vec![extra_root], false, false),
-            &cwd,
-            &session_temp_dir,
-        );
-        let with_network = stable_cap_sid_string(
-            &workspace_policy(Vec::new(), true, false),
-            &cwd,
-            &session_temp_dir,
-        );
-        let with_tmp_exclusion = stable_cap_sid_string(
-            &workspace_policy(Vec::new(), false, true),
-            &cwd,
-            &session_temp_dir,
-        );
+        let base = stable_cap_sid_string(&workspace_policy(Vec::new(), false, false), &cwd);
+        let with_root =
+            stable_cap_sid_string(&workspace_policy(vec![extra_root], false, false), &cwd);
+        let with_network = stable_cap_sid_string(&workspace_policy(Vec::new(), true, false), &cwd);
+        let with_tmp_exclusion =
+            stable_cap_sid_string(&workspace_policy(Vec::new(), false, true), &cwd);
 
         assert_ne!(base, with_root);
         assert_ne!(base, with_network);
         assert_ne!(base, with_tmp_exclusion);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn dropping_wrapper_child_stdio_closes_all_pipe_handles() {
+        unsafe fn current_process_handle_count() -> u32 {
+            let mut count = 0;
+            let ok = GetProcessHandleCount(GetCurrentProcess(), &mut count);
+            assert_ne!(ok, 0, "GetProcessHandleCount should succeed");
+            count
+        }
+
+        let baseline = unsafe { current_process_handle_count() };
+        for _ in 0..8 {
+            let stdio =
+                unsafe { create_wrapper_child_stdio() }.expect("create wrapper child stdio");
+            drop(stdio);
+        }
+        let after = unsafe { current_process_handle_count() };
+
+        assert!(
+            after <= baseline + 2,
+            "dropping wrapper stdio should not leak raw child pipe handles: baseline={baseline}, after={after}"
+        );
     }
 
     #[test]
