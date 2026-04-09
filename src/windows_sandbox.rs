@@ -28,6 +28,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::sandbox::{R_SESSION_TMPDIR_ENV, SandboxPolicy};
 use windows_sys::Win32::Foundation::CloseHandle;
+#[cfg(test)]
+use windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE;
+#[cfg(test)]
+use windows_sys::Win32::Foundation::GetHandleInformation;
 use windows_sys::Win32::Foundation::GetLastError;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::Foundation::HLOCAL;
@@ -96,8 +100,6 @@ use windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
 use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::GetExitCodeProcess;
-#[cfg(test)]
-use windows_sys::Win32::System::Threading::GetProcessHandleCount;
 use windows_sys::Win32::System::Threading::INFINITE;
 use windows_sys::Win32::System::Threading::OpenProcessToken;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
@@ -582,6 +584,22 @@ pub fn run_sandboxed_command(
     command: &[String],
     prepared_capability_sid: Option<&str>,
 ) -> Result<i32, String> {
+    run_sandboxed_command_with_env_map(
+        policy,
+        sandbox_policy_cwd,
+        command,
+        prepared_capability_sid,
+        std::env::vars().collect(),
+    )
+}
+
+fn run_sandboxed_command_with_env_map(
+    policy: &SandboxPolicy,
+    sandbox_policy_cwd: &Path,
+    command: &[String],
+    prepared_capability_sid: Option<&str>,
+    mut env_map: HashMap<String, String>,
+) -> Result<i32, String> {
     if command.is_empty() {
         return Err("no command specified to execute".to_string());
     }
@@ -590,7 +608,6 @@ pub fn run_sandboxed_command(
 
     unsafe {
         crate::diagnostics::startup_log("windows-sandbox: begin");
-        let mut env_map = std::env::vars().collect::<HashMap<_, _>>();
         if should_apply_network_block(policy) {
             apply_no_network_to_env(&mut env_map);
         }
@@ -1843,11 +1860,6 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
 
-    fn env_test_mutex() -> &'static Mutex<()> {
-        static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-        TEST_MUTEX.get_or_init(|| Mutex::new(()))
-    }
-
     fn workspace_policy(
         writable_roots: Vec<PathBuf>,
         network_access: bool,
@@ -2416,30 +2428,36 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn dropping_wrapper_child_stdio_closes_all_pipe_handles() {
-        unsafe fn current_process_handle_count() -> u32 {
-            let mut count = 0;
-            let ok = GetProcessHandleCount(GetCurrentProcess(), &mut count);
-            assert_ne!(ok, 0, "GetProcessHandleCount should succeed");
-            count
+        unsafe fn dropped_handle_is_invalid(handle: HANDLE) -> bool {
+            let mut flags = 0;
+            let ok = GetHandleInformation(handle, &mut flags);
+            ok == 0 && GetLastError() == ERROR_INVALID_HANDLE
         }
 
-        let baseline = unsafe { current_process_handle_count() };
         for _ in 0..8 {
             let stdio =
                 unsafe { create_wrapper_child_stdio() }.expect("create wrapper child stdio");
+            let handles = [
+                stdio.stdin_write.as_raw_handle() as HANDLE,
+                stdio.stdout_read.as_raw_handle() as HANDLE,
+                stdio.stderr_read.as_raw_handle() as HANDLE,
+                stdio.child_stdin.as_raw_handle() as HANDLE,
+                stdio.child_stdout.as_raw_handle() as HANDLE,
+                stdio.child_stderr.as_raw_handle() as HANDLE,
+            ];
             drop(stdio);
-        }
-        let after = unsafe { current_process_handle_count() };
 
-        assert!(
-            after <= baseline + 2,
-            "dropping wrapper stdio should not leak raw child pipe handles: baseline={baseline}, after={after}"
-        );
+            for (index, handle) in handles.into_iter().enumerate() {
+                assert!(
+                    unsafe { dropped_handle_is_invalid(handle) },
+                    "dropping wrapper stdio should close handle #{index} ({handle:p})"
+                );
+            }
+        }
     }
 
     #[test]
     fn prepared_launch_tempdir_can_be_refreshed_after_reset() {
-        let _guard = env_test_mutex().lock().expect("env mutex");
         let tmp = tempdir().expect("tempdir");
         let cwd = tmp.path().join("workspace");
         let session_temp_dir = tmp.path().join("session-temp");
@@ -2463,40 +2481,15 @@ mod tests {
             format!("Set-Content -LiteralPath '{}' -Value 'OK'", probe.display()),
         ];
 
-        let original_tmp = std::env::var_os("TMP");
-        let original_temp = std::env::var_os("TEMP");
-        let original_session_tmp = std::env::var_os(R_SESSION_TMPDIR_ENV);
-        unsafe {
-            std::env::set_var("TMP", &session_temp_dir);
-            std::env::set_var("TEMP", &session_temp_dir);
-            std::env::set_var(R_SESSION_TMPDIR_ENV, &session_temp_dir);
-        }
-        let run_result =
-            run_sandboxed_command(&policy, &cwd, &command, Some(prepared.capability_sid()));
-        match original_tmp {
-            Some(value) => unsafe {
-                std::env::set_var("TMP", value);
-            },
-            None => unsafe {
-                std::env::remove_var("TMP");
-            },
-        }
-        match original_temp {
-            Some(value) => unsafe {
-                std::env::set_var("TEMP", value);
-            },
-            None => unsafe {
-                std::env::remove_var("TEMP");
-            },
-        }
-        match original_session_tmp {
-            Some(value) => unsafe {
-                std::env::set_var(R_SESSION_TMPDIR_ENV, value);
-            },
-            None => unsafe {
-                std::env::remove_var(R_SESSION_TMPDIR_ENV);
-            },
-        }
+        let mut env_map = std::env::vars().collect::<HashMap<_, _>>();
+        env_map.extend(sandbox_acl_env_map(&session_temp_dir));
+        let run_result = run_sandboxed_command_with_env_map(
+            &policy,
+            &cwd,
+            &command,
+            Some(prepared.capability_sid()),
+            env_map,
+        );
 
         unsafe {
             let sid = convert_string_sid_to_sid(prepared.capability_sid())
