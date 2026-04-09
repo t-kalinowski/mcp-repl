@@ -5446,7 +5446,7 @@ fn worker_error_code(err: &WorkerError) -> Option<WorkerErrorCode> {
 mod tests {
     use super::*;
     use crate::output_capture::{
-        OUTPUT_RING_CAPACITY_BYTES, OutputBuffer, ensure_output_ring,
+        OUTPUT_RING_CAPACITY_BYTES, OutputEventKind, OutputRing, ensure_output_ring,
         reset_last_reply_marker_offset, reset_output_ring,
     };
     use crate::sandbox::SandboxPolicy;
@@ -6254,16 +6254,12 @@ mod tests {
 
     #[test]
     fn pager_output_capture_skips_pending_output_tape() {
-        let output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
-        reset_output_ring();
-        let output = OutputBuffer::default();
-        output.start_capture();
-
+        let output_ring = Arc::new(OutputRing::with_capacity(OUTPUT_RING_CAPACITY_BYTES));
         let tape = PendingOutputTape::new();
         let capture = LiveOutputCapture::new(
             OversizedOutputMode::Pager,
             tape.clone(),
-            OutputTimeline::new(output_ring),
+            OutputTimeline::new(output_ring.clone()),
         );
         capture.append_text(b"pager output\n", TextStream::Stdout);
         capture.append_image(IpcPlotImage {
@@ -6278,9 +6274,25 @@ mod tests {
             tape.drain_final_snapshot().events.is_empty(),
             "pager mode should not mirror text, images, or sideband events into the pending tape"
         );
+        let output_end = output_ring.end_offset();
+        let output_range = output_ring.read_range(0, output_end);
         assert!(
-            output.end_offset().unwrap_or(0) > 0,
+            output_end > 0,
             "pager mode should still append text to the output timeline"
+        );
+        assert_eq!(
+            output_range.bytes, b"pager output\n",
+            "pager mode should keep stdout text in the output timeline"
+        );
+        assert!(
+            output_range.events.iter().any(|event| {
+                matches!(
+                    &event.kind,
+                    OutputEventKind::Image { id, mime_type, .. }
+                    if id == "img-1" && mime_type == "image/png"
+                )
+            }),
+            "pager mode should keep image events in the output timeline"
         );
     }
 
