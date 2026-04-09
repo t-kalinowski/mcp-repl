@@ -63,4 +63,5 @@
 - 2026-04-08: Windows embedded R must use `UImode_RTerm`. With `UImode_RGui`, even simple child-process launches like `system2("cmd", c("/c", "echo", "CMD_OK"))` can hang inside the worker.
 - 2026-04-08: Launch-scoped resources such as `\\.\NUL` must use a per-launch SID even when filesystem ACLs are prepared on a stable capability SID. Otherwise concurrent sandboxes for the same workspace can revoke each other's device access on exit.
 - 2026-04-08: Worker respawns should refresh the recreated session temp directory against the cached prepared launch instead of invalidating the whole Windows setup cache. Resetting the temp dir destroys only that directory's ACEs, not the prepared workspace ACLs.
+- 2026-04-08: Prepared-launch cache hits must recompute and reapply the full allow/deny ACL plan, not just the session temp dir ACE. Recreated writable roots and newly created protected directories can change the effective ACL set without changing the cache key.
 - 2026-04-08: Embedded-worker stdin ownership is tracked separately in `docs/futurework/stdin-transport-single-owner.md` so this PR can stay focused on the sandbox refactor.

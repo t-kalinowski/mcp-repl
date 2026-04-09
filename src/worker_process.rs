@@ -2665,7 +2665,7 @@ impl WorkerManager {
             )
         });
         if launch_matches {
-            crate::windows_sandbox::refresh_prepared_sandbox_launch_session_temp_dir(
+            crate::windows_sandbox::refresh_prepared_sandbox_launch_acl_state(
                 self.windows_sandbox_launch
                     .as_ref()
                     .expect("matching launch must exist"),

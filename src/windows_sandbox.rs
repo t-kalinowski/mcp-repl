@@ -434,6 +434,58 @@ fn sandbox_acl_env_map(session_temp_dir: &Path) -> HashMap<String, String> {
     ])
 }
 
+fn prepared_launch_acl_paths(launch: &PreparedSandboxLaunch) -> AllowDenyPaths {
+    let env_map = sandbox_acl_env_map(&launch.session_temp_dir);
+    compute_allow_deny_paths(
+        &launch.policy,
+        &launch.sandbox_policy_cwd,
+        &launch.sandbox_policy_cwd,
+        Some(&launch.session_temp_dir),
+        &env_map,
+    )
+}
+
+unsafe fn apply_prepared_launch_acl_state(
+    launch: &PreparedSandboxLaunch,
+    sid: *mut c_void,
+    action: &str,
+) -> Result<(), String> {
+    let paths = prepared_launch_acl_paths(launch);
+    let mut acl_guards: Vec<(PathBuf, *mut c_void)> = Vec::new();
+
+    for path in &paths.allow {
+        match add_allow_ace(path, sid) {
+            Ok(true) => acl_guards.push((path.clone(), sid)),
+            Ok(false) => {}
+            Err(err) => {
+                cleanup_capability_acl_state(&acl_guards, sid, false);
+                return Err(format!(
+                    "failed to {action} writable ACL on '{}': {err}",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    if matches!(launch.policy, SandboxPolicy::WorkspaceWrite { .. }) {
+        for path in &paths.deny {
+            match add_deny_write_ace(path, sid) {
+                Ok(true) => acl_guards.push((path.clone(), sid)),
+                Ok(false) => {}
+                Err(err) => {
+                    cleanup_capability_acl_state(&acl_guards, sid, false);
+                    return Err(format!(
+                        "failed to {action} deny ACL on '{}': {err}",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 pub fn prepare_sandbox_launch(
     policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
@@ -443,76 +495,34 @@ pub fn prepare_sandbox_launch(
 
     let canonical_cwd = canonicalize_or_identity(sandbox_policy_cwd);
     let canonical_session_temp_dir = canonicalize_or_identity(session_temp_dir);
-    let env_map = sandbox_acl_env_map(&canonical_session_temp_dir);
     let cap_sid = stable_cap_sid_string(policy, &canonical_cwd, &canonical_session_temp_dir);
-
-    unsafe {
-        let psid_capability = convert_string_sid_to_sid(&cap_sid)
-            .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
-        let mut acl_guards: Vec<(PathBuf, *mut c_void)> = Vec::new();
-        let paths = compute_allow_deny_paths(
-            policy,
-            &canonical_cwd,
-            &canonical_cwd,
-            Some(&canonical_session_temp_dir),
-            &env_map,
-        );
-        for path in &paths.allow {
-            match add_allow_ace(path, psid_capability) {
-                Ok(true) => acl_guards.push((path.clone(), psid_capability)),
-                Ok(false) => {}
-                Err(err) => {
-                    cleanup_capability_acl_state(&acl_guards, psid_capability, false);
-                    LocalFree(psid_capability as HLOCAL);
-                    return Err(format!(
-                        "failed to apply writable ACL to '{}': {err}",
-                        path.display()
-                    ));
-                }
-            }
-        }
-        if matches!(policy, SandboxPolicy::WorkspaceWrite { .. }) {
-            for path in &paths.deny {
-                match add_deny_write_ace(path, psid_capability) {
-                    Ok(true) => acl_guards.push((path.clone(), psid_capability)),
-                    Ok(false) => {}
-                    Err(err) => {
-                        cleanup_capability_acl_state(&acl_guards, psid_capability, false);
-                        LocalFree(psid_capability as HLOCAL);
-                        return Err(format!(
-                            "failed to apply deny ACL to '{}': {err}",
-                            path.display()
-                        ));
-                    }
-                }
-            }
-        }
-        LocalFree(psid_capability as HLOCAL);
-    }
-
-    Ok(PreparedSandboxLaunch {
+    let launch = PreparedSandboxLaunch {
         policy: policy.clone(),
         sandbox_policy_cwd: canonical_cwd,
         session_temp_dir: canonical_session_temp_dir,
         capability_sid: cap_sid,
-    })
+    };
+
+    unsafe {
+        let psid_capability = convert_string_sid_to_sid(launch.capability_sid())
+            .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
+        let apply_result = apply_prepared_launch_acl_state(&launch, psid_capability, "prepare");
+        LocalFree(psid_capability as HLOCAL);
+        apply_result?;
+    }
+
+    Ok(launch)
 }
 
-pub fn refresh_prepared_sandbox_launch_session_temp_dir(
+pub fn refresh_prepared_sandbox_launch_acl_state(
     launch: &PreparedSandboxLaunch,
 ) -> Result<(), String> {
     unsafe {
         let psid_capability = convert_string_sid_to_sid(launch.capability_sid())
             .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
-        let refresh_result = add_allow_ace(&launch.session_temp_dir, psid_capability);
+        let refresh_result = apply_prepared_launch_acl_state(launch, psid_capability, "refresh");
         LocalFree(psid_capability as HLOCAL);
-        match refresh_result {
-            Ok(_) => Ok(()),
-            Err(err) => Err(format!(
-                "failed to refresh writable ACL on '{}': {err}",
-                launch.session_temp_dir.display()
-            )),
-        }
+        refresh_result
     }
 }
 
@@ -2228,8 +2238,8 @@ mod tests {
             prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
         crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
             .expect("reset session temp dir");
-        refresh_prepared_sandbox_launch_session_temp_dir(&prepared)
-            .expect("refresh session temp dir ACL");
+        refresh_prepared_sandbox_launch_acl_state(&prepared)
+            .expect("refresh prepared launch ACL state");
 
         let probe = session_temp_dir.join("probe.txt");
         let command = vec![
@@ -2396,5 +2406,133 @@ mod tests {
                 .contains(&canonicalize_or_identity(&missing_root)),
             "declared writable root should remain allowed even before it exists"
         );
+    }
+
+    unsafe fn path_has_allow_ace(path: &Path, sid: *mut c_void) -> bool {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return false;
+        }
+        let has_ace = dacl_has_allow_for_sid(dacl, sid);
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        has_ace
+    }
+
+    unsafe fn path_has_write_deny_ace(path: &Path, sid: *mut c_void) -> bool {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return false;
+        }
+        let has_ace = dacl_has_write_deny_for_sid(dacl, sid);
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        has_ace
+    }
+
+    unsafe fn revoke_capability_sid_paths(capability_sid: &str, paths: &[&Path]) {
+        let sid = convert_string_sid_to_sid(capability_sid).expect("capability SID should convert");
+        for path in paths {
+            revoke_ace(path, sid);
+        }
+        LocalFree(sid as HLOCAL);
+    }
+
+    #[test]
+    fn prepared_launch_refresh_reapplies_allow_acl_to_recreated_writable_root() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let extra_root = tmp.path().join("extra");
+        let session_temp_dir = tmp.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        std::fs::create_dir_all(&extra_root).expect("extra dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(vec![extra_root.clone()], false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        std::fs::remove_dir_all(&extra_root).expect("remove extra root");
+        std::fs::create_dir_all(&extra_root).expect("recreate extra root");
+
+        refresh_prepared_sandbox_launch_acl_state(&prepared)
+            .expect("refresh prepared launch ACL state");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            assert!(
+                path_has_allow_ace(&extra_root, sid),
+                "refresh should restore allow ACEs on recreated writable roots"
+            );
+            LocalFree(sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    extra_root.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_refresh_applies_deny_acl_to_late_created_protected_dir() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let git_dir = cwd.join(".git");
+        let session_temp_dir = tmp.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        std::fs::create_dir_all(&git_dir).expect("create git dir after prepare");
+
+        refresh_prepared_sandbox_launch_acl_state(&prepared)
+            .expect("refresh prepared launch ACL state");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            assert!(
+                path_has_write_deny_ace(&git_dir, sid),
+                "refresh should apply deny ACEs to protected directories created after prepare"
+            );
+            LocalFree(sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[cwd.as_path(), git_dir.as_path(), session_temp_dir.as_path()],
+            );
+        }
     }
 }
