@@ -69,6 +69,46 @@ fn plans_layout_exists() {
 }
 
 #[test]
+fn readme_documents_dev_binary_download_contract() {
+    let readme = read(&repo_root().join("README.md"));
+
+    for required in [
+        "Download prebuilt dev binaries",
+        "https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-x86_64-unknown-linux-gnu.tar.gz",
+        "https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-aarch64-apple-darwin.tar.gz",
+        "https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-x86_64-pc-windows-msvc.zip",
+        "binaries do not bundle R or Python",
+        "glibc build produced on Ubuntu 22.04",
+        "**Windows**: experimental",
+    ] {
+        assert!(readme.contains(required), "missing {required} in README.md");
+    }
+}
+
+#[test]
+fn ci_workflow_defines_dev_release_contract() {
+    let workflow = read(&repo_root().join(".github/workflows/ci.yml"));
+
+    for required in [
+        "publish-dev:",
+        "ubuntu-22.04",
+        "macos-15",
+        "windows-2022",
+        "mcp-repl-x86_64-unknown-linux-gnu.tar.gz",
+        "mcp-repl-aarch64-apple-darwin.tar.gz",
+        "mcp-repl-x86_64-pc-windows-msvc.zip",
+        "SHA256SUMS.txt",
+        "gh release upload dev dist/* --clobber",
+        "group: publish-dev",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "missing {required} in .github/workflows/ci.yml"
+        );
+    }
+}
+
+#[test]
 fn plot_image_snapshots_do_not_expose_mcp_console_meta() {
     let snapshots_dir = repo_root().join("tests/snapshots");
     for entry in fs::read_dir(&snapshots_dir)

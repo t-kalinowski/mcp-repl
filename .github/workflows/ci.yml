@@ -10,12 +10,24 @@ on:
 
 jobs:
   checks:
-    name: ${{ matrix.os }}
+    name: ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            asset_name: mcp-repl-x86_64-unknown-linux-gnu.tar.gz
+            artifact_name: release-x86_64-unknown-linux-gnu
+          - os: macos-15
+            target: aarch64-apple-darwin
+            asset_name: mcp-repl-aarch64-apple-darwin.tar.gz
+            artifact_name: release-aarch64-apple-darwin
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            asset_name: mcp-repl-x86_64-pc-windows-msvc.zip
+            artifact_name: release-x86_64-pc-windows-msvc
 
     steps:
       - uses: actions/checkout@v4
@@ -40,15 +52,205 @@ jobs:
         run: cargo build
 
       - name: cargo clippy
-        run: cargo clippy --all-targets --all-features
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: cargo test (skip client integrations)
-        if: matrix.os != 'windows-latest'
+        if: matrix.os != 'windows-2022'
         run: cargo test -- --skip codex_tui_initial_sandbox_state --skip codex_tui_initial_sandbox_state_windows_stub
 
       - name: cargo test (windows serial, skip client integrations)
-        if: matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-2022'
         run: cargo test -j 1 -- --test-threads=1 --skip codex_tui_initial_sandbox_state --skip codex_tui_initial_sandbox_state_windows_stub
 
       - name: cargo +nightly fmt
         run: cargo +nightly fmt --all -- --check
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      - name: Smoke test release binary
+        if: matrix.os != 'windows-2022'
+        run: ./target/release/mcp-repl --help
+
+      - name: Smoke test release binary (windows)
+        if: matrix.os == 'windows-2022'
+        shell: pwsh
+        run: |
+          & ".\\target\\release\\mcp-repl.exe" --help | Out-Null
+
+      - name: Package release archive
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.os != 'windows-2022'
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_dir="dist/mcp-repl-${{ matrix.target }}"
+          mkdir -p "$package_dir"
+          cp target/release/mcp-repl "$package_dir/mcp-repl"
+          cp README.md LICENSE "$package_dir/"
+          tar -C dist -czf "dist/${{ matrix.asset_name }}" "mcp-repl-${{ matrix.target }}"
+
+      - name: Package release archive (windows)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.os == 'windows-2022'
+        shell: pwsh
+        run: |
+          $packageDir = "dist/mcp-repl-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $packageDir | Out-Null
+          Copy-Item "target/release/mcp-repl.exe" "$packageDir/mcp-repl.exe"
+          Copy-Item "README.md" "$packageDir/README.md"
+          Copy-Item "LICENSE" "$packageDir/LICENSE"
+          Push-Location "dist"
+          Compress-Archive -Path "mcp-repl-${{ matrix.target }}" -DestinationPath "${{ matrix.asset_name }}" -Force
+          Pop-Location
+
+      - name: Upload packaged artifact
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.asset_name }}
+          if-no-files-found: error
+
+  publish-dev:
+    name: publish-dev
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: checks
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: write
+    concurrency:
+      group: publish-dev
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Verify packaged asset set
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_assets=(
+            mcp-repl-x86_64-unknown-linux-gnu.tar.gz
+            mcp-repl-aarch64-apple-darwin.tar.gz
+            mcp-repl-x86_64-pc-windows-msvc.zip
+          )
+          for asset in "${expected_assets[@]}"; do
+            test -f "dist/$asset"
+          done
+          actual_count="$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          test "$actual_count" = "3"
+
+      - name: Check whether this run should publish
+        id: publish_guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          workflow_runs_json="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/ci.yml/runs?event=push&branch=main&per_page=100")"
+          newer_successful_run="$(printf '%s' "$workflow_runs_json" | jq -r \
+            --argjson current_run_id "${GITHUB_RUN_ID}" \
+            --argjson current_run_number "${GITHUB_RUN_NUMBER}" '
+              [.workflow_runs[]
+               | select(.id != $current_run_id)
+               | select(.status == "completed" and .conclusion == "success")
+               | select(.run_number > $current_run_number)]
+              | sort_by(.run_number)
+              | last // empty
+              | .run_number // empty
+            ')"
+          if [ -n "$newer_successful_run" ]; then
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping publish because run ${newer_successful_run} is a newer successful push-to-main run."
+            exit 0
+          fi
+          echo "should_publish=true" >> "$GITHUB_OUTPUT"
+
+      - name: Write SHA256SUMS.txt
+        if: steps.publish_guard.outputs.should_publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            sha256sum \
+              mcp-repl-x86_64-unknown-linux-gnu.tar.gz \
+              mcp-repl-aarch64-apple-darwin.tar.gz \
+              mcp-repl-x86_64-pc-windows-msvc.zip \
+              > SHA256SUMS.txt
+          )
+
+      - name: Write release notes
+        if: steps.publish_guard.outputs.should_publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit_date="$(git show -s --format=%cI "${GITHUB_SHA}")"
+          run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          cat > RELEASE_NOTES.md <<EOF
+          Rolling development build from \`${GITHUB_SHA}\`
+
+          - Commit SHA: \`${GITHUB_SHA}\`
+          - Commit date: ${commit_date}
+          - Workflow run: ${run_url}
+
+          | Platform | Asset |
+          | --- | --- |
+          | Linux x86_64 (glibc build produced on Ubuntu 22.04) | \`mcp-repl-x86_64-unknown-linux-gnu.tar.gz\` |
+          | macOS arm64 | \`mcp-repl-aarch64-apple-darwin.tar.gz\` |
+          | Windows x86_64 | \`mcp-repl-x86_64-pc-windows-msvc.zip\` |
+          EOF
+
+      - name: Force-move dev tag
+        if: steps.publish_guard.outputs.should_publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git tag -f dev "${GITHUB_SHA}"
+          git push origin refs/tags/dev --force
+
+      - name: Create or update dev prerelease
+        if: steps.publish_guard.outputs.should_publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view dev >/dev/null 2>&1; then
+            release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/dev" --jq .id)"
+            gh api \
+              --method PATCH \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+              -F tag_name=dev \
+              -F target_commitish="${GITHUB_SHA}" \
+              -F name=dev \
+              -F body=@RELEASE_NOTES.md \
+              -F draft=false \
+              -F prerelease=true \
+              -F make_latest=false \
+              >/dev/null
+          else
+            gh api \
+              --method POST \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${GITHUB_REPOSITORY}/releases" \
+              -F tag_name=dev \
+              -F target_commitish="${GITHUB_SHA}" \
+              -F name=dev \
+              -F body=@RELEASE_NOTES.md \
+              -F draft=false \
+              -F prerelease=true \
+              -F make_latest=false \
+              >/dev/null
+          fi
+
+      - name: Upload dev assets
+        if: steps.publish_guard.outputs.should_publish == 'true'
+        shell: bash
+        run: gh release upload dev dist/* --clobber

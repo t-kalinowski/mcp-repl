@@ -85,16 +85,27 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 #### Install with cargo (from GitHub)
 
 ```sh
-cargo install --git https://github.com/t-kalinowski/mcp-repl --locked
+cargo install --git https://github.com/posit-dev/mcp-repl --locked
 ```
 
 To install a specific version, pin the tag:
 
 ```sh
-cargo install --git https://github.com/t-kalinowski/mcp-repl --tag v0.1.0 --locked
+cargo install --git https://github.com/posit-dev/mcp-repl --tag v0.1.0 --locked
 ```
 
 This installs `mcp-repl` into Cargo’s bin directory (typically `~/.cargo/bin`). Ensure that directory is on your `PATH`.
+
+#### Download prebuilt dev binaries
+
+The rolling `dev` prerelease publishes the newest available `main` build at stable URLs:
+
+- Linux x86_64 (glibc build produced on Ubuntu 22.04): `https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-x86_64-unknown-linux-gnu.tar.gz`
+- macOS arm64: `https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-aarch64-apple-darwin.tar.gz`
+- Windows x86_64 (experimental): `https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-x86_64-pc-windows-msvc.zip`
+
+These binaries do not bundle R or Python. You still need compatible local runtimes installed.
+After download, unpack the archive and put `mcp-repl` (or `mcp-repl.exe` on Windows) on your `PATH`.
 
 ### 2) Wire into your MCP client
 
@@ -229,7 +240,8 @@ Notes:
 
 ## Platform support
 
-- **macOS / Linux**: supported.
+- **macOS**: supported.
+- **Linux**: supported. Dev binaries are a glibc build produced on Ubuntu 22.04.
 - **Windows**: experimental for the R backend. The Python backend currently requires a Unix PTY and is not available on Windows.
 
 ## Sandbox
