@@ -289,6 +289,28 @@ fn canonicalize_or_identity(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn stable_sid_seed_path(path: &Path) -> String {
+    stable_sid_seed_path_buf(canonicalize_or_identity(path))
+}
+
+fn stable_sid_seed_path_buf(path: PathBuf) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let path = path.to_string_lossy();
+        if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+            return format!(r"\\{rest}");
+        }
+        if let Some(rest) = path.strip_prefix(r"\\?\") {
+            return rest.to_string();
+        }
+        path.into_owned()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        path.to_string_lossy().into_owned()
+    }
+}
+
 fn compute_allow_deny_paths(
     policy: &SandboxPolicy,
     policy_cwd: &Path,
@@ -368,6 +390,7 @@ unsafe fn convert_string_sid_to_sid(value: &str) -> Option<*mut c_void> {
 
 fn stable_cap_sid_string(policy: &SandboxPolicy, sandbox_policy_cwd: &Path) -> String {
     let canonical_cwd = canonicalize_or_identity(sandbox_policy_cwd);
+    let stable_cwd = stable_sid_seed_path_buf(canonical_cwd.clone());
     let policy_seed = match policy {
         SandboxPolicy::ReadOnly => serde_json::json!({
             "mode": "read-only",
@@ -382,12 +405,11 @@ fn stable_cap_sid_string(policy: &SandboxPolicy, sandbox_policy_cwd: &Path) -> S
                 .iter()
                 .map(|root| {
                     if root.is_absolute() {
-                        canonicalize_or_identity(root)
+                        stable_sid_seed_path(root)
                     } else {
-                        canonicalize_or_identity(&canonical_cwd.join(root))
+                        stable_sid_seed_path_buf(canonical_cwd.join(root))
                     }
                 })
-                .map(|path| path.to_string_lossy().to_string())
                 .collect::<Vec<_>>();
             canonical_roots.sort();
             canonical_roots.dedup();
@@ -407,8 +429,7 @@ fn stable_cap_sid_string(policy: &SandboxPolicy, sandbox_policy_cwd: &Path) -> S
     };
     let seed = format!(
         "mcp-repl-windows-sandbox-v2\0{}\0{}",
-        canonical_cwd.display(),
-        policy_seed,
+        stable_cwd, policy_seed,
     );
     let a = stable_sid_word(seed.as_bytes(), 0x243f_6a88);
     let b = stable_sid_word(seed.as_bytes(), 0x85a3_08d3);
@@ -2546,6 +2567,25 @@ mod tests {
         assert_ne!(base, with_root);
         assert_ne!(base, with_network);
         assert_ne!(base, with_tmp_exclusion);
+    }
+
+    #[test]
+    fn prepared_capability_sid_survives_late_created_absolute_writable_root() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let late_root = tmp.path().join("late-root");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+
+        let policy = workspace_policy(vec![late_root.clone()], false, false);
+        let prepared_sid = stable_cap_sid_string(&policy, &cwd);
+
+        std::fs::create_dir_all(&late_root).expect("late root dir");
+
+        let resolved = resolve_launch_capability_sids(&policy, &cwd, Some(&prepared_sid));
+        assert!(
+            resolved.is_ok(),
+            "prepared SID should remain valid after a declared absolute writable root is created"
+        );
     }
 
     #[cfg(target_os = "windows")]
