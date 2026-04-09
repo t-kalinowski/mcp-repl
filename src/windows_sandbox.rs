@@ -183,6 +183,12 @@ struct WrapperForwarderState {
     write_in_progress: AtomicBool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WrapperStdioMode {
+    Inherit,
+    ForwardedPipes,
+}
+
 impl WrapperForwarderState {
     fn new() -> Self {
         Self {
@@ -197,6 +203,14 @@ impl WrapperForwarderState {
         WrapperWriteGuard {
             write_in_progress: &self.write_in_progress,
         }
+    }
+}
+
+fn wrapper_stdio_mode(prepared_capability_sid: Option<&str>) -> WrapperStdioMode {
+    if prepared_capability_sid.is_some() {
+        WrapperStdioMode::ForwardedPipes
+    } else {
+        WrapperStdioMode::Inherit
     }
 }
 
@@ -728,29 +742,42 @@ fn run_sandboxed_command_with_env_map(
             }
         }
 
-        let stdio_pipes = match create_wrapper_child_stdio() {
-            Ok(pipes) => pipes,
-            Err(err) => {
-                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
-                CloseHandle(restricted_token);
-                if launch_sid_is_distinct {
-                    LocalFree(psid_launch as HLOCAL);
-                }
-                LocalFree(psid_capability as HLOCAL);
-                return Err(err);
+        let stdio_mode = wrapper_stdio_mode(prepared_capability_sid);
+        let stdio_pipes = match stdio_mode {
+            WrapperStdioMode::Inherit => None,
+            WrapperStdioMode::ForwardedPipes => {
+                let pipes = match create_wrapper_child_stdio() {
+                    Ok(pipes) => pipes,
+                    Err(err) => {
+                        cleanup_capability_acl_state(
+                            &acl_guards,
+                            psid_launch,
+                            null_device_ace_applied,
+                        );
+                        CloseHandle(restricted_token);
+                        if launch_sid_is_distinct {
+                            LocalFree(psid_launch as HLOCAL);
+                        }
+                        LocalFree(psid_capability as HLOCAL);
+                        return Err(err);
+                    }
+                };
+                crate::diagnostics::startup_log("windows-sandbox: stdio pipes created");
+                Some(pipes)
             }
         };
-        crate::diagnostics::startup_log("windows-sandbox: stdio pipes created");
         let spawn_result = create_process_as_user(
             restricted_token,
             command,
             sandbox_policy_cwd,
             &env_map,
-            Some((
-                stdio_pipes.child_stdin.as_raw_handle() as HANDLE,
-                stdio_pipes.child_stdout.as_raw_handle() as HANDLE,
-                stdio_pipes.child_stderr.as_raw_handle() as HANDLE,
-            )),
+            stdio_pipes.as_ref().map(|pipes| {
+                (
+                    pipes.child_stdin.as_raw_handle() as HANDLE,
+                    pipes.child_stdout.as_raw_handle() as HANDLE,
+                    pipes.child_stderr.as_raw_handle() as HANDLE,
+                )
+            }),
         );
         let (proc_info, _startup_info) = match spawn_result {
             Ok(value) => value,
@@ -766,13 +793,7 @@ fn run_sandboxed_command_with_env_map(
             }
         };
         crate::diagnostics::startup_log("windows-sandbox: child spawned");
-        let WrapperStdioForwarders {
-            stdin_forwarder,
-            stdout_forwarder,
-            stderr_forwarder,
-            stdout_state,
-            stderr_state,
-        } = spawn_wrapper_stdio_forwarders(stdio_pipes);
+        let stdio_forwarders = stdio_pipes.map(spawn_wrapper_stdio_forwarders);
 
         let job_handle = create_job_kill_on_close().ok();
         if let Some(job) = job_handle {
@@ -803,9 +824,17 @@ fn run_sandboxed_command_with_env_map(
             if let Some(job) = job_handle {
                 CloseHandle(job);
             }
-            drop(stdin_forwarder);
-            drop(stdout_forwarder);
-            drop(stderr_forwarder);
+            if let Some(WrapperStdioForwarders {
+                stdin_forwarder,
+                stdout_forwarder,
+                stderr_forwarder,
+                ..
+            }) = stdio_forwarders
+            {
+                drop(stdin_forwarder);
+                drop(stdout_forwarder);
+                drop(stderr_forwarder);
+            }
             cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
             CloseHandle(proc_info.hThread);
             CloseHandle(proc_info.hProcess);
@@ -823,9 +852,18 @@ fn run_sandboxed_command_with_env_map(
         if let Some(job) = job_handle {
             CloseHandle(job);
         }
-        drop(stdin_forwarder);
-        drain_wrapper_forwarder(stdout_forwarder, &stdout_state);
-        drain_wrapper_forwarder(stderr_forwarder, &stderr_state);
+        if let Some(WrapperStdioForwarders {
+            stdin_forwarder,
+            stdout_forwarder,
+            stderr_forwarder,
+            stdout_state,
+            stderr_state,
+        }) = stdio_forwarders
+        {
+            drop(stdin_forwarder);
+            drain_wrapper_forwarder(stdout_forwarder, &stdout_state);
+            drain_wrapper_forwarder(stderr_forwarder, &stderr_state);
+        }
         cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
         CloseHandle(proc_info.hThread);
         CloseHandle(proc_info.hProcess);
@@ -1145,11 +1183,6 @@ fn drain_wrapper_forwarder_with_timeouts(
         if state.done.load(Ordering::Acquire) {
             let _ = handle.join();
             return;
-        }
-
-        if state.write_in_progress.load(Ordering::Acquire) {
-            thread::sleep(poll_interval);
-            continue;
         }
 
         let now = Instant::now();
@@ -1942,7 +1975,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_wrapper_forwarder_waits_for_blocked_write_to_finish() {
+    fn drain_wrapper_forwarder_stops_after_max_wait_for_blocked_write() {
         let tmp = tempdir().expect("tempdir");
         let payload_path = tmp.path().join("payload.bin");
         std::fs::write(&payload_path, vec![b'x'; 8192]).expect("write payload");
@@ -1987,12 +2020,25 @@ mod tests {
         let finished_before_cleanup = state.done.load(Ordering::Acquire);
         releaser.join().expect("releaser thread should not panic");
         assert!(
-            elapsed >= Duration::from_millis(90),
-            "drain should wait for blocked writes to finish"
+            elapsed < Duration::from_millis(80),
+            "drain should stop waiting once the blocked write exceeds the timeout"
         );
         assert!(
-            finished_before_cleanup,
-            "forwarder should finish before drain returns"
+            !finished_before_cleanup,
+            "drain should return before a blocked write finishes"
+        );
+    }
+
+    #[test]
+    fn direct_wrapper_launch_uses_inherited_stdio() {
+        assert_eq!(wrapper_stdio_mode(None), WrapperStdioMode::Inherit);
+    }
+
+    #[test]
+    fn prepared_wrapper_launch_uses_forwarded_pipes() {
+        assert_eq!(
+            wrapper_stdio_mode(Some("S-1-5-21-1-2-3-4")),
+            WrapperStdioMode::ForwardedPipes
         );
     }
 
