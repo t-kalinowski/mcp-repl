@@ -298,12 +298,18 @@ fn stable_sid_seed_path_buf(path: PathBuf) -> String {
     {
         let path = path.to_string_lossy();
         if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
-            return format!(r"\\{rest}");
+            let mut stable = format!(r"\\{rest}");
+            stable.make_ascii_lowercase();
+            return stable;
         }
         if let Some(rest) = path.strip_prefix(r"\\?\") {
-            return rest.to_string();
+            let mut stable = rest.to_string();
+            stable.make_ascii_lowercase();
+            return stable;
         }
-        path.into_owned()
+        let mut stable = path.into_owned();
+        stable.make_ascii_lowercase();
+        stable
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -1237,6 +1243,9 @@ fn drain_wrapper_forwarder_with_timeouts(
             last_bytes = bytes;
             last_progress = now;
         }
+        if state.write_in_progress.load(Ordering::Acquire) {
+            last_progress = now;
+        }
 
         if now.duration_since(last_progress) >= idle_timeout
             || now.duration_since(start) >= max_wait
@@ -2105,6 +2114,61 @@ mod tests {
     }
 
     #[test]
+    fn drain_wrapper_forwarder_waits_for_inflight_write_before_idle_timeout() {
+        let tmp = tempdir().expect("tempdir");
+        let payload_path = tmp.path().join("payload.bin");
+        std::fs::write(&payload_path, vec![b'x'; 8192]).expect("write payload");
+
+        let state = Arc::new(WrapperForwarderState::new());
+        let entered = Arc::new(AtomicBool::new(false));
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+
+        let thread_state = Arc::clone(&state);
+        let writer = BlockingWriter {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        };
+        let handle = thread::spawn(move || {
+            let input = File::open(&payload_path).expect("open payload");
+            copy_wrapper_output(input, writer, &thread_state);
+        });
+
+        while !entered.load(Ordering::Acquire) {
+            thread::sleep(Duration::from_millis(5));
+        }
+
+        let release_gate = Arc::clone(&release);
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(80));
+            let (lock, cvar) = &*release_gate;
+            let mut released = lock.lock().expect("release mutex");
+            *released = true;
+            cvar.notify_all();
+        });
+
+        let start = Instant::now();
+        drain_wrapper_forwarder_with_timeouts(
+            handle,
+            &state,
+            Duration::from_millis(20),
+            Duration::from_millis(200),
+            Duration::from_millis(5),
+        );
+
+        let elapsed = start.elapsed();
+        let finished_before_release = state.done.load(Ordering::Acquire);
+        releaser.join().expect("releaser thread should not panic");
+        assert!(
+            finished_before_release,
+            "drain should keep waiting while a write is in progress and finishes before max_wait"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(60),
+            "drain should not treat an in-flight write as idle"
+        );
+    }
+
+    #[test]
     fn copy_wrapper_output_flushes_after_each_chunk() {
         let tmp = tempdir().expect("tempdir");
         let payload_path = tmp.path().join("payload.bin");
@@ -2585,6 +2649,31 @@ mod tests {
         assert!(
             resolved.is_ok(),
             "prepared SID should remain valid after a declared absolute writable root is created"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn prepared_capability_sid_survives_late_created_absolute_writable_root_with_case_change() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+
+        let late_root = PathBuf::from(
+            tmp.path()
+                .join("late-root")
+                .to_string_lossy()
+                .to_ascii_lowercase(),
+        );
+        let policy = workspace_policy(vec![late_root.clone()], false, false);
+        let prepared_sid = stable_cap_sid_string(&policy, &cwd);
+
+        std::fs::create_dir_all(&late_root).expect("late root dir");
+
+        let resolved = resolve_launch_capability_sids(&policy, &cwd, Some(&prepared_sid));
+        assert!(
+            resolved.is_ok(),
+            "prepared SID should remain valid after case-only path normalization changes"
         );
     }
 
