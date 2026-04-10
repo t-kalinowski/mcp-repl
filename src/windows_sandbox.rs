@@ -1,5 +1,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
+#[cfg(test)]
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -58,6 +60,7 @@ use windows_sys::Win32::Security::CopySid;
 use windows_sys::Win32::Security::CreateRestrictedToken;
 use windows_sys::Win32::Security::CreateWellKnownSid;
 use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+use windows_sys::Win32::Security::DeleteAce;
 use windows_sys::Win32::Security::EqualSid;
 use windows_sys::Win32::Security::GetAce;
 use windows_sys::Win32::Security::GetAclInformation;
@@ -130,6 +133,18 @@ const WRAPPER_STDIO_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
 struct AllowDenyPaths {
     allow: HashSet<PathBuf>,
     deny: HashSet<PathBuf>,
+}
+
+#[derive(Clone, Copy)]
+enum CapabilityAclKind {
+    Allow,
+    Deny,
+}
+
+struct CapabilityAclGuard {
+    path: PathBuf,
+    sid: *mut c_void,
+    kind: CapabilityAclKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -236,29 +251,25 @@ pub(crate) fn prepare_sandbox_launch_test_mutex() -> &'static Mutex<()> {
 }
 
 #[cfg(test)]
-fn prepare_sandbox_launch_test_error() -> &'static Mutex<Option<String>> {
-    static TEST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-    TEST_ERROR.get_or_init(|| Mutex::new(None))
-}
-
-#[cfg(test)]
 pub(crate) fn set_prepare_sandbox_launch_test_error(error: Option<String>) {
-    *prepare_sandbox_launch_test_error()
-        .lock()
-        .expect("prepare sandbox launch test error mutex poisoned") = error;
-}
-
-#[cfg(test)]
-fn apply_prepared_launch_acl_state_test_error() -> &'static Mutex<Option<String>> {
-    static TEST_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
-    TEST_ERROR.get_or_init(|| Mutex::new(None))
+    PREPARE_SANDBOX_LAUNCH_TEST_ERROR.with(|slot| *slot.borrow_mut() = error);
 }
 
 #[cfg(test)]
 pub(crate) fn set_apply_prepared_launch_acl_state_test_error(error: Option<String>) {
-    *apply_prepared_launch_acl_state_test_error()
-        .lock()
-        .expect("apply prepared launch ACL state test error mutex poisoned") = error;
+    APPLY_PREPARED_LAUNCH_ACL_STATE_TEST_ERROR.with(|slot| *slot.borrow_mut() = error);
+}
+
+#[cfg(test)]
+pub(crate) fn set_add_deny_write_ace_test_error(error: Option<(usize, String)>) {
+    ADD_DENY_WRITE_ACE_TEST_ERROR.with(|slot| *slot.borrow_mut() = error);
+}
+
+#[cfg(test)]
+thread_local! {
+    static PREPARE_SANDBOX_LAUNCH_TEST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+    static APPLY_PREPARED_LAUNCH_ACL_STATE_TEST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+    static ADD_DENY_WRITE_ACE_TEST_ERROR: RefCell<Option<(usize, String)>> = const { RefCell::new(None) };
 }
 
 fn should_apply_network_block(policy: &SandboxPolicy) -> bool {
@@ -583,20 +594,22 @@ unsafe fn apply_prepared_launch_acl_state(
     action: &str,
 ) -> Result<(), String> {
     #[cfg(test)]
-    if let Some(error) = apply_prepared_launch_acl_state_test_error()
-        .lock()
-        .expect("apply prepared launch ACL state test error mutex poisoned")
-        .clone()
+    if let Some(error) =
+        APPLY_PREPARED_LAUNCH_ACL_STATE_TEST_ERROR.with(|slot| slot.borrow().clone())
     {
         return Err(error);
     }
 
     let paths = prepared_launch_acl_paths(launch);
-    let mut acl_guards: Vec<(PathBuf, *mut c_void)> = Vec::new();
+    let mut acl_guards: Vec<CapabilityAclGuard> = Vec::new();
 
     for path in &paths.allow {
         match add_allow_ace(path, sid) {
-            Ok(true) => acl_guards.push((path.clone(), sid)),
+            Ok(true) => acl_guards.push(CapabilityAclGuard {
+                path: path.clone(),
+                sid,
+                kind: CapabilityAclKind::Allow,
+            }),
             Ok(false) => {}
             Err(err) => {
                 cleanup_capability_acl_state(&acl_guards, sid, false);
@@ -611,7 +624,11 @@ unsafe fn apply_prepared_launch_acl_state(
     if matches!(launch.policy, SandboxPolicy::WorkspaceWrite { .. }) {
         for path in &paths.deny {
             match add_deny_write_ace(path, sid) {
-                Ok(true) => acl_guards.push((path.clone(), sid)),
+                Ok(true) => acl_guards.push(CapabilityAclGuard {
+                    path: path.clone(),
+                    sid,
+                    kind: CapabilityAclKind::Deny,
+                }),
                 Ok(false) => {}
                 Err(err) => {
                     cleanup_capability_acl_state(&acl_guards, sid, false);
@@ -650,11 +667,7 @@ pub fn prepare_sandbox_launch(
     session_temp_dir: &Path,
 ) -> Result<PreparedSandboxLaunch, String> {
     #[cfg(test)]
-    if let Some(error) = prepare_sandbox_launch_test_error()
-        .lock()
-        .expect("prepare sandbox launch test error mutex poisoned")
-        .clone()
-    {
+    if let Some(error) = PREPARE_SANDBOX_LAUNCH_TEST_ERROR.with(|slot| slot.borrow().clone()) {
         return Err(error);
     }
 
@@ -768,7 +781,7 @@ fn run_sandboxed_command_with_env_map(
 
         let null_device_ace_applied = allow_null_device(psid_launch);
 
-        let mut acl_guards: Vec<(PathBuf, *mut c_void)> = Vec::new();
+        let mut acl_guards: Vec<CapabilityAclGuard> = Vec::new();
         if let Some(prepared_capability_sid) = prepared_capability_sid {
             let refresh_result = refresh_runtime_prepared_launch_acl_state(
                 policy,
@@ -790,7 +803,11 @@ fn run_sandboxed_command_with_env_map(
             }
             if let Some(session_temp_dir) = session_temp_dir.as_deref() {
                 match add_allow_ace(session_temp_dir, psid_launch) {
-                    Ok(true) => acl_guards.push((session_temp_dir.to_path_buf(), psid_launch)),
+                    Ok(true) => acl_guards.push(CapabilityAclGuard {
+                        path: session_temp_dir.to_path_buf(),
+                        sid: psid_launch,
+                        kind: CapabilityAclKind::Allow,
+                    }),
                     Ok(false) => {}
                     Err(err) => {
                         cleanup_capability_acl_state(
@@ -825,7 +842,11 @@ fn run_sandboxed_command_with_env_map(
             ));
             for path in &paths.allow {
                 match add_allow_ace(path, psid_capability) {
-                    Ok(true) => acl_guards.push((path.clone(), psid_capability)),
+                    Ok(true) => acl_guards.push(CapabilityAclGuard {
+                        path: path.clone(),
+                        sid: psid_capability,
+                        kind: CapabilityAclKind::Allow,
+                    }),
                     Ok(false) => {}
                     Err(err) => {
                         cleanup_capability_acl_state(
@@ -849,7 +870,11 @@ fn run_sandboxed_command_with_env_map(
             if matches!(policy, SandboxPolicy::WorkspaceWrite { .. }) {
                 for path in &paths.deny {
                     match add_deny_write_ace(path, psid_capability) {
-                        Ok(true) => acl_guards.push((path.clone(), psid_capability)),
+                        Ok(true) => acl_guards.push(CapabilityAclGuard {
+                            path: path.clone(),
+                            sid: psid_capability,
+                            kind: CapabilityAclKind::Deny,
+                        }),
                         Ok(false) => {}
                         Err(err) => {
                             cleanup_capability_acl_state(
@@ -1009,12 +1034,15 @@ fn run_sandboxed_command_with_env_map(
 }
 
 unsafe fn cleanup_capability_acl_state(
-    acl_guards: &[(PathBuf, *mut c_void)],
+    acl_guards: &[CapabilityAclGuard],
     capability_sid: *mut c_void,
     null_device_ace_applied: bool,
 ) {
-    for (path, sid) in acl_guards {
-        revoke_ace(path, *sid);
+    for guard in acl_guards {
+        match guard.kind {
+            CapabilityAclKind::Allow => revoke_ace(&guard.path, guard.sid),
+            CapabilityAclKind::Deny => revoke_deny_write_ace(&guard.path, guard.sid),
+        }
     }
     if null_device_ace_applied {
         revoke_null_device_ace(capability_sid);
@@ -1497,6 +1525,24 @@ unsafe fn add_allow_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
 }
 
 unsafe fn add_deny_write_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
+    #[cfg(test)]
+    {
+        let injected_error =
+            ADD_DENY_WRITE_ACE_TEST_ERROR.with(|slot| match slot.borrow_mut().as_mut() {
+                Some((remaining_successes, error)) if *remaining_successes == 0 => {
+                    Some(Err(error.clone()))
+                }
+                Some((remaining_successes, _)) => {
+                    *remaining_successes -= 1;
+                    Some(Ok(()))
+                }
+                None => None,
+            });
+        if let Some(Err(error)) = injected_error {
+            return Err(error);
+        }
+    }
+
     let mut security_descriptor: *mut c_void = std::ptr::null_mut();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let code = GetNamedSecurityInfoW(
@@ -1687,6 +1733,67 @@ unsafe fn revoke_ace(path: &Path, sid: *mut c_void) {
         if !new_dacl.is_null() {
             LocalFree(new_dacl as HLOCAL);
         }
+    }
+    if !security_descriptor.is_null() {
+        LocalFree(security_descriptor as HLOCAL);
+    }
+}
+
+unsafe fn revoke_deny_write_ace(path: &Path, sid: *mut c_void) {
+    let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let code = GetNamedSecurityInfoW(
+        to_wide(path).as_ptr(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &mut dacl,
+        std::ptr::null_mut(),
+        &mut security_descriptor,
+    );
+    if code != ERROR_SUCCESS {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return;
+    }
+
+    let Some(info) = dacl_size_info(dacl) else {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return;
+    };
+
+    let mut changed = false;
+    for index in (0..info.AceCount).rev() {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+            continue;
+        }
+        let header = &*(ace as *const ACE_HEADER);
+        if header.AceType != 1 {
+            continue;
+        }
+        if EqualSid(ace_sid_ptr(ace), sid) == 0 {
+            continue;
+        }
+        if DeleteAce(dacl, index) != 0 {
+            changed = true;
+        }
+    }
+
+    if changed {
+        let _ = SetNamedSecurityInfoW(
+            to_wide(path).as_ptr() as *mut u16,
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        );
     }
     if !security_descriptor.is_null() {
         LocalFree(security_descriptor as HLOCAL);
@@ -3304,6 +3411,53 @@ mod tests {
                 prepared.capability_sid(),
                 &[cwd.as_path(), git_dir.as_path(), session_temp_dir.as_path()],
             );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_refresh_rolls_back_added_deny_acls_after_failure() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let git_dir = cwd.join(".git");
+        let codex_dir = cwd.join(".codex");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        std::fs::create_dir_all(&git_dir).expect("create git dir after prepare");
+        std::fs::create_dir_all(&codex_dir).expect("create codex dir after prepare");
+        set_add_deny_write_ace_test_error(Some((1, "injected deny ACL failure".to_string())));
+
+        let result = refresh_prepared_sandbox_launch_acl_state(&prepared);
+
+        set_add_deny_write_ace_test_error(None);
+
+        assert!(
+            matches!(result, Err(ref err) if err.contains("injected deny ACL failure")),
+            "expected injected deny ACL failure, got: {result:?}"
+        );
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            assert!(
+                !path_has_write_deny_ace(&git_dir, sid),
+                "failed refresh should roll back deny ACEs added earlier in the same pass"
+            );
+            assert!(
+                !path_has_write_deny_ace(&codex_dir, sid),
+                "failed refresh should not leave a deny ACE on the failing path"
+            );
+            LocalFree(sid as HLOCAL);
         }
     }
 
