@@ -26,7 +26,7 @@ fn suite_server_lock_name_is_scoped_to_checkout() {
 }
 
 #[test]
-fn suite_server_lock_allows_reentrant_acquire_within_process() -> TestResult<()> {
+fn suite_server_lock_blocks_parallel_acquire_within_process() -> TestResult<()> {
     let first = common::acquire_suite_server_lock_for_tests()?;
     let started = Arc::new(AtomicBool::new(false));
     let acquired = Arc::new(AtomicBool::new(false));
@@ -45,17 +45,18 @@ fn suite_server_lock_allows_reentrant_acquire_within_process() -> TestResult<()>
     while !started.load(Ordering::SeqCst) {
         thread::sleep(Duration::from_millis(5));
     }
-    let reentrant = rx.recv_timeout(Duration::from_millis(200)).is_ok();
+    assert!(
+        rx.recv_timeout(Duration::from_millis(200)).is_err(),
+        "parallel suite lock acquisition should block while another test session holds the lock"
+    );
 
     drop(first);
-    if !reentrant {
-        rx.recv_timeout(Duration::from_secs(2))
-            .expect("second lock should acquire after the first is released");
-    }
+    rx.recv_timeout(Duration::from_secs(2))
+        .expect("second lock should acquire after the first is released");
     waiter.join().expect("waiter thread should join");
     assert!(
-        acquired.load(Ordering::SeqCst) && reentrant,
-        "same-process suite lock acquisition should not block behind an existing token"
+        acquired.load(Ordering::SeqCst),
+        "waiter should acquire the suite lock after the original holder releases it"
     );
     Ok(())
 }

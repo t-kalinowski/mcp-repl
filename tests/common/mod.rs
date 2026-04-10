@@ -6,8 +6,6 @@ use std::pin::Pin;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 #[cfg(windows)]
-use std::sync::{Mutex, OnceLock};
-#[cfg(windows)]
 use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
 
 use regex_lite::Regex;
@@ -40,13 +38,6 @@ const WINDOWS_TEST_SERVER_MUTEX_NAME: &str = "Local\\mcp_repl_test_server_mutex"
 struct WindowsSuiteServerMutexOwner {
     release_tx: std::sync::mpsc::Sender<()>,
     join_handle: std::thread::JoinHandle<()>,
-}
-
-#[cfg(windows)]
-#[derive(Default)]
-struct WindowsSuiteServerLockState {
-    local_refcount: usize,
-    owner: Option<WindowsSuiteServerMutexOwner>,
 }
 
 #[cfg(windows)]
@@ -177,33 +168,18 @@ pub(crate) fn close_suite_server_lock_handle_for_tests(handle: usize) {
 }
 
 #[cfg(windows)]
-fn windows_suite_server_lock_state() -> &'static Mutex<WindowsSuiteServerLockState> {
-    static STATE: OnceLock<Mutex<WindowsSuiteServerLockState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(WindowsSuiteServerLockState::default()))
+pub(crate) struct SuiteServerLockToken {
+    owner: Option<WindowsSuiteServerMutexOwner>,
 }
-
-#[cfg(windows)]
-pub(crate) struct SuiteServerLockToken;
 
 #[cfg(not(windows))]
 pub(crate) struct SuiteServerLockToken;
 
 #[cfg(windows)]
 fn acquire_suite_server_lock() -> TestResult<SuiteServerLockToken> {
-    let mut owner_to_release = None;
-    let mut state = windows_suite_server_lock_state()
-        .lock()
-        .map_err(|_| std::io::Error::other("windows suite server lock mutex poisoned"))?;
-    if state.local_refcount == 0 {
-        owner_to_release = state.owner.take();
-        state.owner = Some(WindowsSuiteServerMutexOwner::start()?);
-    }
-    state.local_refcount += 1;
-    drop(state);
-    if let Some(owner) = owner_to_release {
-        owner.release();
-    }
-    Ok(SuiteServerLockToken)
+    Ok(SuiteServerLockToken {
+        owner: Some(WindowsSuiteServerMutexOwner::start()?),
+    })
 }
 
 #[cfg(not(windows))]
@@ -219,21 +195,7 @@ pub(crate) fn acquire_suite_server_lock_for_tests() -> TestResult<SuiteServerLoc
 #[cfg(windows)]
 impl Drop for SuiteServerLockToken {
     fn drop(&mut self) {
-        let owner = {
-            let mut state = windows_suite_server_lock_state()
-                .lock()
-                .expect("windows suite server lock mutex poisoned");
-            if state.local_refcount == 0 {
-                return;
-            }
-            state.local_refcount -= 1;
-            if state.local_refcount == 0 {
-                state.owner.take()
-            } else {
-                None
-            }
-        };
-        if let Some(owner) = owner {
+        if let Some(owner) = self.owner.take() {
             owner.release();
         }
     }
