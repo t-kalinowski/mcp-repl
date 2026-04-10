@@ -112,6 +112,7 @@ fn ci_workflow_defines_dev_release_contract() {
         "gh release upload dev dist/* --clobber",
         "group: publish-dev",
         "gh release create \"${GITHUB_REF_NAME}\" dist/*",
+        "!contains(github.ref_name, '-')",
     ] {
         assert!(
             workflow.contains(required),

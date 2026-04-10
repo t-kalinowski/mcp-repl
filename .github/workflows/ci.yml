@@ -259,7 +259,7 @@ jobs:
 
   publish-stable:
     name: publish-stable
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-')
     needs: checks
     runs-on: ubuntu-22.04
     permissions:
