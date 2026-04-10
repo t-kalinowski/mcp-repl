@@ -145,6 +145,12 @@ enum CapabilityAclKind {
     Deny,
 }
 
+#[derive(Clone, Copy)]
+enum PreparedLaunchAllowScope {
+    Recursive,
+    RootsOnly,
+}
+
 struct CapabilityAclGuard {
     path: PathBuf,
     sid: *mut c_void,
@@ -295,6 +301,17 @@ pub(crate) fn set_prepared_launch_allow_targets_read_dir_test_error(
 }
 
 #[cfg(test)]
+pub(crate) fn clear_prepared_launch_allow_targets_read_dir_calls() {
+    PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_CALLS.with(|slot| slot.borrow_mut().clear());
+}
+
+#[cfg(test)]
+pub(crate) fn take_prepared_launch_allow_targets_read_dir_calls() -> Vec<PathBuf> {
+    PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_CALLS
+        .with(|slot| std::mem::take(&mut *slot.borrow_mut()))
+}
+
+#[cfg(test)]
 pub(crate) fn set_prepared_launch_allow_target_pre_apply_delete(target: Option<PathBuf>) {
     PREPARED_LAUNCH_ALLOW_TARGET_PRE_APPLY_DELETE.with(|slot| *slot.borrow_mut() = target);
 }
@@ -306,6 +323,8 @@ thread_local! {
     static ADD_DENY_WRITE_ACE_TEST_ERROR: RefCell<Option<(usize, String)>> = const { RefCell::new(None) };
     static PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_TEST_ERROR: RefCell<Option<(PathBuf, String)>> =
         const { RefCell::new(None) };
+    static PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_CALLS: RefCell<Vec<PathBuf>> =
+        const { RefCell::new(Vec::new()) };
     static PREPARED_LAUNCH_ALLOW_TARGET_PRE_APPLY_DELETE: RefCell<Option<PathBuf>> =
         const { RefCell::new(None) };
 }
@@ -670,6 +689,7 @@ unsafe fn apply_prepared_launch_acl_state(
     launch: &PreparedSandboxLaunch,
     sid: *mut c_void,
     action: &str,
+    allow_scope: PreparedLaunchAllowScope,
 ) -> Result<(), String> {
     #[cfg(test)]
     if let Some(error) =
@@ -683,7 +703,7 @@ unsafe fn apply_prepared_launch_acl_state(
     let denied_roots = canonicalized_paths(&paths.deny);
 
     for path in &paths.allow {
-        for target in prepared_launch_allow_targets(path, &denied_roots)? {
+        for target in prepared_launch_allow_targets(path, &denied_roots, allow_scope)? {
             #[cfg(test)]
             PREPARED_LAUNCH_ALLOW_TARGET_PRE_APPLY_DELETE.with(|slot| {
                 if slot.borrow().as_ref().is_some_and(|expected| {
@@ -768,6 +788,11 @@ fn path_is_within_any_root(path: &Path, roots: &[PathBuf]) -> bool {
 
 fn prepared_launch_allow_targets_read_dir(path: &Path) -> std::io::Result<std::fs::ReadDir> {
     #[cfg(test)]
+    PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_CALLS.with(|slot| {
+        slot.borrow_mut().push(canonicalize_or_identity(path));
+    });
+
+    #[cfg(test)]
     if let Some((expected_path, error)) =
         PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_TEST_ERROR.with(|slot| slot.borrow().clone())
         && canonicalize_or_identity(path) == canonicalize_or_identity(&expected_path)
@@ -784,6 +809,7 @@ fn prepared_launch_allow_targets_read_dir(path: &Path) -> std::io::Result<std::f
 fn prepared_launch_allow_targets(
     root: &Path,
     denied_roots: &[PathBuf],
+    scope: PreparedLaunchAllowScope,
 ) -> Result<Vec<PathBuf>, String> {
     let mut targets = Vec::new();
     let root_canonical = canonicalize_or_identity(root);
@@ -802,6 +828,9 @@ fn prepared_launch_allow_targets(
         }
 
         targets.push(path.clone());
+        if matches!(scope, PreparedLaunchAllowScope::RootsOnly) {
+            continue;
+        }
 
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -847,7 +876,7 @@ unsafe fn refresh_runtime_prepared_launch_acl_state(
         prepared_capability_sid,
     );
     let _acl_lock = acquire_prepared_launch_acl_lock(prepared_capability_sid)?;
-    apply_prepared_launch_acl_state(&launch, sid, "refresh")?;
+    apply_prepared_launch_acl_state(&launch, sid, "refresh", PreparedLaunchAllowScope::RootsOnly)?;
     Ok(launch)
 }
 
@@ -871,7 +900,12 @@ pub fn prepare_sandbox_launch(
     unsafe {
         let psid_capability = convert_string_sid_to_sid(launch.capability_sid())
             .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
-        let apply_result = apply_prepared_launch_acl_state(&launch, psid_capability, "prepare");
+        let apply_result = apply_prepared_launch_acl_state(
+            &launch,
+            psid_capability,
+            "prepare",
+            PreparedLaunchAllowScope::Recursive,
+        );
         LocalFree(psid_capability as HLOCAL);
         apply_result?;
     }
@@ -879,14 +913,20 @@ pub fn prepare_sandbox_launch(
     Ok(launch)
 }
 
-pub fn refresh_prepared_sandbox_launch_acl_state(
+#[cfg(test)]
+pub(crate) fn refresh_prepared_sandbox_launch_acl_state(
     launch: &PreparedSandboxLaunch,
 ) -> Result<(), String> {
     let _acl_lock = acquire_prepared_launch_acl_lock(launch.capability_sid())?;
     unsafe {
         let psid_capability = convert_string_sid_to_sid(launch.capability_sid())
             .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
-        let refresh_result = apply_prepared_launch_acl_state(launch, psid_capability, "refresh");
+        let refresh_result = apply_prepared_launch_acl_state(
+            launch,
+            psid_capability,
+            "refresh",
+            PreparedLaunchAllowScope::Recursive,
+        );
         LocalFree(psid_capability as HLOCAL);
         refresh_result
     }
@@ -4467,5 +4507,55 @@ mod tests {
             ),
             "prepared runtime should refresh stable ACL state before spawning the child, got: {result:?}"
         );
+    }
+
+    #[test]
+    fn prepared_launch_runtime_refresh_does_not_walk_writable_root_descendants() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let nested = cwd.join("nested");
+        let session_temp_dir = tmp.path().join("session-temp");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared_sid = stable_cap_sid_string(&policy, &cwd);
+        clear_prepared_launch_allow_targets_read_dir_calls();
+
+        let result = unsafe {
+            let sid = convert_string_sid_to_sid(&prepared_sid)
+                .expect("prepared capability SID should convert");
+            let result = refresh_runtime_prepared_launch_acl_state(
+                &policy,
+                &cwd,
+                &session_temp_dir,
+                &prepared_sid,
+                sid,
+            );
+            LocalFree(sid as HLOCAL);
+            result
+        };
+
+        let read_dir_calls = take_prepared_launch_allow_targets_read_dir_calls();
+
+        assert!(
+            result.is_ok(),
+            "runtime refresh should succeed for an existing writable root, got: {result:?}"
+        );
+        assert!(
+            read_dir_calls.is_empty(),
+            "runtime refresh should not walk writable-root descendants on a cache hit, got: {read_dir_calls:?}"
+        );
+
+        unsafe {
+            revoke_capability_sid_paths(
+                &prepared_sid,
+                &[cwd.as_path(), nested.as_path(), session_temp_dir.as_path()],
+            );
+        }
     }
 }

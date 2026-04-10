@@ -14,13 +14,20 @@ use crate::worker_protocol::WORKER_MODE_ARG;
 struct WorkerState {
     busy: AtomicBool,
     shutting_down: AtomicBool,
+    stdin_read_in_progress: AtomicBool,
     stdin_wait: Mutex<()>,
     stdin_wait_cvar: Condvar,
 }
 
 impl WorkerState {
     fn try_mark_busy(&self) -> bool {
-        let _guard = self.stdin_wait.lock().unwrap();
+        let mut guard = self.stdin_wait.lock().unwrap();
+        while self.stdin_read_in_progress.load(Ordering::SeqCst) && !self.is_shutting_down() {
+            guard = self.stdin_wait_cvar.wait(guard).unwrap();
+        }
+        if self.is_shutting_down() {
+            return false;
+        }
         self.busy
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
@@ -44,10 +51,23 @@ impl WorkerState {
 
     fn wait_until_stdin_read_allowed(&self) -> bool {
         let mut guard = self.stdin_wait.lock().unwrap();
-        while self.busy.load(Ordering::SeqCst) && !self.is_shutting_down() {
+        while (self.busy.load(Ordering::SeqCst)
+            || self.stdin_read_in_progress.load(Ordering::SeqCst))
+            && !self.is_shutting_down()
+        {
             guard = self.stdin_wait_cvar.wait(guard).unwrap();
         }
-        !self.is_shutting_down()
+        if self.is_shutting_down() {
+            return false;
+        }
+        self.stdin_read_in_progress.store(true, Ordering::SeqCst);
+        true
+    }
+
+    fn finish_stdin_read(&self) {
+        let _guard = self.stdin_wait.lock().unwrap();
+        self.stdin_read_in_progress.store(false, Ordering::SeqCst);
+        self.stdin_wait_cvar.notify_all();
     }
 
     #[cfg(test)]
@@ -57,14 +77,21 @@ impl WorkerState {
     {
         let mut guard = self.stdin_wait.lock().unwrap();
         let mut hook_ran = false;
-        while self.busy.load(Ordering::SeqCst) && !self.is_shutting_down() {
+        while (self.busy.load(Ordering::SeqCst)
+            || self.stdin_read_in_progress.load(Ordering::SeqCst))
+            && !self.is_shutting_down()
+        {
             if !hook_ran {
                 hook_ran = true;
                 before_wait();
             }
             guard = self.stdin_wait_cvar.wait(guard).unwrap();
         }
-        !self.is_shutting_down()
+        if self.is_shutting_down() {
+            return false;
+        }
+        self.stdin_read_in_progress.store(true, Ordering::SeqCst);
+        true
     }
 }
 
@@ -73,6 +100,7 @@ impl Default for WorkerState {
         Self {
             busy: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
+            stdin_read_in_progress: AtomicBool::new(false),
             stdin_wait: Mutex::new(()),
             stdin_wait_cvar: Condvar::new(),
         }
@@ -181,7 +209,9 @@ fn stdin_loop(
             break;
         }
         line.clear();
-        let bytes = reader.read_line(&mut line)?;
+        let bytes = reader.read_line(&mut line);
+        state.finish_stdin_read();
+        let bytes = bytes?;
         if bytes == 0 {
             state.begin_shutdown();
             if !crate::r_session::request_shutdown() {
@@ -419,5 +449,59 @@ mod tests {
             "busy transition should succeed once the stdin gate lock is released"
         );
         marker.join().expect("marker thread should join");
+    }
+
+    #[test]
+    fn stdin_read_gate_keeps_busy_transition_blocked_until_read_completes() {
+        let state = Arc::new(WorkerState::default());
+        let (reader_ready_tx, reader_ready_rx) = mpsc::channel();
+        let (release_read_tx, release_read_rx) = mpsc::channel();
+
+        let reader_state = Arc::clone(&state);
+        let reader = thread::spawn(move || {
+            let allowed = reader_state.wait_until_stdin_read_allowed();
+            reader_ready_tx
+                .send(allowed)
+                .expect("stdin-read readiness should be reported");
+            release_read_rx
+                .recv()
+                .expect("stdin-read release signal should arrive");
+            reader_state.finish_stdin_read();
+        });
+
+        assert!(
+            reader_ready_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("stdin-read thread should pass the wait gate"),
+            "stdin read should be allowed while the worker is idle"
+        );
+
+        let marker_state = Arc::clone(&state);
+        let (marked_tx, marked_rx) = mpsc::channel();
+        let marker = thread::spawn(move || {
+            let marked = marker_state.try_mark_busy();
+            marked_tx
+                .send(marked)
+                .expect("busy-mark result should be reported");
+        });
+
+        assert!(
+            marked_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "busy transition should stay blocked until the permitted stdin read completes"
+        );
+
+        release_read_tx
+            .send(())
+            .expect("stdin-read release signal should send");
+        assert!(
+            marked_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("busy transition should finish after the read completes"),
+            "busy transition should succeed once the permitted stdin read completes"
+        );
+
+        marker.join().expect("marker thread should join");
+        state.mark_idle();
+        reader.join().expect("reader thread should join");
     }
 }
