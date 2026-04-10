@@ -2382,14 +2382,16 @@ mod tests {
             std::env::set_var(LINUX_BWRAP_ENABLED_ENV, "1");
         }
 
-        let mut state = SandboxState::default();
-        state.sandbox_policy = SandboxPolicy::WorkspaceWrite {
-            writable_roots: Vec::new(),
-            network_access: false,
-            exclude_tmpdir_env_var: false,
-            exclude_slash_tmp: false,
+        let state = SandboxState {
+            sandbox_policy: SandboxPolicy::WorkspaceWrite {
+                writable_roots: Vec::new(),
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            },
+            use_linux_sandbox_bwrap: false,
+            ..SandboxState::default()
         };
-        state.use_linux_sandbox_bwrap = false;
 
         let prepared =
             prepare_worker_command(Path::new("/bin/echo"), vec!["ok".to_string()], &state)
