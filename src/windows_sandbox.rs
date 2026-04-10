@@ -40,7 +40,9 @@ use windows_sys::Win32::Foundation::HLOCAL;
 use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
 use windows_sys::Win32::Foundation::LUID;
 use windows_sys::Win32::Foundation::SetHandleInformation;
+use windows_sys::Win32::Foundation::WAIT_ABANDONED;
 use windows_sys::Win32::Foundation::WAIT_FAILED;
+use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
 use windows_sys::Win32::Security::ACCESS_ALLOWED_ACE;
 use windows_sys::Win32::Security::ACE_HEADER;
@@ -103,12 +105,14 @@ use windows_sys::Win32::System::Pipes::CreatePipe;
 #[cfg(test)]
 use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 use windows_sys::Win32::System::Threading::CREATE_UNICODE_ENVIRONMENT;
+use windows_sys::Win32::System::Threading::CreateMutexW;
 use windows_sys::Win32::System::Threading::CreateProcessAsUserW;
 use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::GetExitCodeProcess;
 use windows_sys::Win32::System::Threading::INFINITE;
 use windows_sys::Win32::System::Threading::OpenProcessToken;
 use windows_sys::Win32::System::Threading::PROCESS_INFORMATION;
+use windows_sys::Win32::System::Threading::ReleaseMutex;
 use windows_sys::Win32::System::Threading::STARTF_USESTDHANDLES;
 use windows_sys::Win32::System::Threading::STARTUPINFOW;
 use windows_sys::Win32::System::Threading::WaitForSingleObject;
@@ -180,6 +184,10 @@ struct LaunchCapabilitySids {
     launch_sid: String,
 }
 
+struct PreparedLaunchAclLock {
+    handle: HANDLE,
+}
+
 struct WrapperChildStdio {
     stdin_write: File,
     stdout_read: File,
@@ -241,6 +249,15 @@ struct WrapperWriteGuard<'a> {
 impl Drop for WrapperWriteGuard<'_> {
     fn drop(&mut self) {
         self.write_in_progress.store(false, Ordering::Release);
+    }
+}
+
+impl Drop for PreparedLaunchAclLock {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = ReleaseMutex(self.handle);
+            let _ = CloseHandle(self.handle);
+        }
     }
 }
 
@@ -507,6 +524,46 @@ fn resolve_launch_capability_sids(
     }
 }
 
+fn default_dacl_capability_sid_strings(capability_sids: &LaunchCapabilitySids) -> Vec<&str> {
+    if capability_sids.launch_sid == capability_sids.filesystem_sid {
+        vec![capability_sids.filesystem_sid.as_str()]
+    } else {
+        vec![capability_sids.launch_sid.as_str()]
+    }
+}
+
+fn prepared_launch_acl_lock_name(capability_sid: &str) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in capability_sid.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("Local\\mcp_repl_prepared_launch_acl_{hash:016x}")
+}
+
+fn acquire_prepared_launch_acl_lock(capability_sid: &str) -> Result<PreparedLaunchAclLock, String> {
+    unsafe {
+        let name = to_wide(prepared_launch_acl_lock_name(capability_sid));
+        let handle = CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr());
+        if handle.is_null() {
+            return Err(format!(
+                "CreateMutexW failed for prepared launch ACL lock: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let wait = WaitForSingleObject(handle, INFINITE);
+        if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+            CloseHandle(handle);
+            return Err(format!(
+                "WaitForSingleObject failed for prepared launch ACL lock: {wait}"
+            ));
+        }
+
+        Ok(PreparedLaunchAclLock { handle })
+    }
+}
+
 fn build_prepared_sandbox_launch(
     policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
@@ -657,6 +714,7 @@ unsafe fn refresh_runtime_prepared_launch_acl_state(
         session_temp_dir,
         prepared_capability_sid,
     );
+    let _acl_lock = acquire_prepared_launch_acl_lock(prepared_capability_sid)?;
     apply_prepared_launch_acl_state(&launch, sid, "refresh")?;
     Ok(launch)
 }
@@ -676,6 +734,7 @@ pub fn prepare_sandbox_launch(
     let cap_sid = stable_cap_sid_string(policy, sandbox_policy_cwd);
     let launch =
         build_prepared_sandbox_launch(policy, sandbox_policy_cwd, session_temp_dir, &cap_sid);
+    let _acl_lock = acquire_prepared_launch_acl_lock(launch.capability_sid())?;
 
     unsafe {
         let psid_capability = convert_string_sid_to_sid(launch.capability_sid())
@@ -691,6 +750,7 @@ pub fn prepare_sandbox_launch(
 pub fn refresh_prepared_sandbox_launch_acl_state(
     launch: &PreparedSandboxLaunch,
 ) -> Result<(), String> {
+    let _acl_lock = acquire_prepared_launch_acl_lock(launch.capability_sid())?;
     unsafe {
         let psid_capability = convert_string_sid_to_sid(launch.capability_sid())
             .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
@@ -765,8 +825,21 @@ fn run_sandboxed_command_with_env_map(
         if launch_sid_is_distinct {
             restricted_capability_sids.push(psid_launch);
         }
-        let token_result =
-            create_restricted_token_for_policy(base_token, &restricted_capability_sids);
+        let mut default_dacl_capability_sids: Vec<*mut c_void> = Vec::new();
+        for sid in default_dacl_capability_sid_strings(&capability_sids) {
+            if sid == capability_sids.filesystem_sid.as_str() {
+                default_dacl_capability_sids.push(psid_capability);
+                continue;
+            }
+            if sid == capability_sids.launch_sid.as_str() {
+                default_dacl_capability_sids.push(psid_launch);
+            }
+        }
+        let token_result = create_restricted_token_for_policy(
+            base_token,
+            &restricted_capability_sids,
+            &default_dacl_capability_sids,
+        );
         CloseHandle(base_token);
         let restricted_token = match token_result {
             Ok(token) => token,
@@ -1072,6 +1145,7 @@ unsafe fn create_job_kill_on_close() -> Result<HANDLE, String> {
 unsafe fn create_restricted_token_for_policy(
     base_token: HANDLE,
     capability_sids: &[*mut c_void],
+    default_dacl_capability_sids: &[*mut c_void],
 ) -> Result<HANDLE, String> {
     if capability_sids.is_empty() {
         return Err("no capability SIDs provided".to_string());
@@ -1120,10 +1194,10 @@ unsafe fn create_restricted_token_for_policy(
         return Err(format!("CreateRestrictedToken failed: {}", GetLastError()));
     }
 
-    let mut dacl_sids = Vec::with_capacity(capability_sids.len() + 2);
+    let mut dacl_sids = Vec::with_capacity(default_dacl_capability_sids.len() + 2);
     dacl_sids.push(psid_logon);
     dacl_sids.push(psid_everyone);
-    dacl_sids.extend_from_slice(capability_sids);
+    dacl_sids.extend_from_slice(default_dacl_capability_sids);
     set_default_dacl(new_token, &dacl_sids)?;
     enable_single_privilege(new_token, "SeChangeNotifyPrivilege")?;
     Ok(new_token)
@@ -3136,6 +3210,63 @@ mod tests {
             probe.is_file(),
             "expected sandboxed command to recreate probe file after tempdir reset"
         );
+    }
+
+    #[test]
+    fn prepared_launch_default_dacl_uses_only_launch_sid() {
+        let capability_sids = LaunchCapabilitySids {
+            filesystem_sid: "S-1-5-21-1-2-3-4".to_string(),
+            launch_sid: "S-1-5-21-5-6-7-8".to_string(),
+        };
+
+        assert_eq!(
+            default_dacl_capability_sid_strings(&capability_sids),
+            vec!["S-1-5-21-5-6-7-8"],
+            "prepared launches should keep the shared filesystem SID out of the token default DACL",
+        );
+    }
+
+    #[test]
+    fn inline_launch_default_dacl_keeps_single_capability_sid() {
+        let capability_sids = LaunchCapabilitySids {
+            filesystem_sid: "S-1-5-21-1-2-3-4".to_string(),
+            launch_sid: "S-1-5-21-1-2-3-4".to_string(),
+        };
+
+        assert_eq!(
+            default_dacl_capability_sid_strings(&capability_sids),
+            vec!["S-1-5-21-1-2-3-4"],
+            "inline launches should keep using their single capability SID in the default DACL",
+        );
+    }
+
+    #[test]
+    fn prepared_launch_acl_lock_blocks_same_sid_until_release() {
+        let first = acquire_prepared_launch_acl_lock("S-1-5-21-1-2-3-4")
+            .expect("first prepared launch ACL lock");
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+
+        let waiter = thread::spawn(move || {
+            let second = acquire_prepared_launch_acl_lock("S-1-5-21-1-2-3-4")
+                .expect("second prepared launch ACL lock");
+            acquired_tx
+                .send(())
+                .expect("lock acquisition should be reported");
+            drop(second);
+        });
+
+        assert!(
+            acquired_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "same-SID prepared launch ACL work should serialize behind the first lock holder"
+        );
+
+        drop(first);
+        acquired_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("waiter should acquire once the first lock is released");
+        waiter.join().expect("waiter should join");
     }
 
     #[cfg(target_os = "windows")]
