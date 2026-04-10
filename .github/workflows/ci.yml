@@ -269,6 +269,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Download packaged artifacts
         uses: actions/download-artifact@v4
@@ -305,13 +307,40 @@ jobs:
               > SHA256SUMS.txt
           )
 
+      - name: Decide whether this tag should be latest
+        id: latest_guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          newest_final_tag="$(git tag --list 'v*' | grep -v '-' | sort -V | tail -n 1)"
+          if [ "$newest_final_tag" = "${GITHUB_REF_NAME}" ]; then
+            echo "is_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Create or update stable release
         shell: bash
         run: |
           set -euo pipefail
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release edit "${GITHUB_REF_NAME}" --title "${GITHUB_REF_NAME}" --latest
+            release_id="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq .id)"
+            latest_flag=false
+            if [ "${{ steps.latest_guard.outputs.is_latest }}" = "true" ]; then
+              latest_flag=true
+            fi
+            gh api \
+              --method PATCH \
+              -H "Accept: application/vnd.github+json" \
+              "repos/${GITHUB_REPOSITORY}/releases/${release_id}" \
+              -F name="${GITHUB_REF_NAME}" \
+              -F make_latest="${latest_flag}" \
+              >/dev/null
             gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
           else
-            gh release create "${GITHUB_REF_NAME}" dist/* --title "${GITHUB_REF_NAME}" --generate-notes --latest
+            latest_args=("--latest=false")
+            if [ "${{ steps.latest_guard.outputs.is_latest }}" = "true" ]; then
+              latest_args=("--latest")
+            fi
+            gh release create "${GITHUB_REF_NAME}" dist/* --title "${GITHUB_REF_NAME}" --generate-notes "${latest_args[@]}"
           fi

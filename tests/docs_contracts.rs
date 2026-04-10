@@ -113,6 +113,8 @@ fn ci_workflow_defines_dev_release_contract() {
         "group: publish-dev",
         "gh release create \"${GITHUB_REF_NAME}\" dist/*",
         "!contains(github.ref_name, '-')",
+        "sort -V | tail -n 1",
+        "make_latest=\"${latest_flag}\"",
     ] {
         assert!(
             workflow.contains(required),
