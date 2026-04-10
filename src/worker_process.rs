@@ -891,7 +891,7 @@ impl WorkerManager {
 
         if self.pager.is_active() {
             let trimmed = text.trim();
-            if trimmed.starts_with(':') {
+            if trimmed.is_empty() || trimmed.starts_with(':') {
                 if let Some(reply) = self.handle_pager_command(&text) {
                     let reply = self.finalize_reply(reply);
                     self.maybe_reset_after_session_end();

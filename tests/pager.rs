@@ -386,6 +386,65 @@ async fn pager_windows_smoke() -> TestResult<()> {
 }
 
 #[cfg(windows)]
+async fn assert_blank_pager_input_advances_page(input: &str) -> TestResult<()> {
+    let mut session = common::spawn_server_with_pager_page_chars(80).await?;
+
+    let result = session
+        .write_stdin_raw_with("for (i in 1:80) cat(sprintf(\"L%04d\\n\", i))", Some(120.0))
+        .await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("L0001"),
+        "expected first page output, got: {text:?}"
+    );
+    assert!(
+        text.contains("--More--"),
+        "expected pager footer, got: {text:?}"
+    );
+
+    let result = session.write_stdin_raw_with(input, Some(60.0)).await?;
+    let result = wait_until_not_busy(&mut session, result).await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("pager backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("L0002")
+            || text.contains("L0003")
+            || text.contains("L0010")
+            || text.contains("L0014"),
+        "expected blank pager input to advance to the next page, got: {text:?}"
+    );
+    assert!(
+        text.contains("--More--") || text.contains("(END"),
+        "expected pager output after blank pager input, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_whitespace_only_input_advances_page() -> TestResult<()> {
+    assert_blank_pager_input_advances_page("   ").await
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_empty_input_advances_page() -> TestResult<()> {
+    assert_blank_pager_input_advances_page("").await
+}
+
+#[cfg(windows)]
 #[tokio::test(flavor = "multi_thread")]
 async fn empty_poll_while_busy_preserves_busy_pager_state() -> TestResult<()> {
     let mut session = common::spawn_server_with_pager_page_chars(80).await?;
