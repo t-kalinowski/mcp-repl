@@ -28,11 +28,6 @@ fn prompt_only_reticulate_output_is_skipped() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn reticulate_py_help_is_rendered() -> TestResult<()> {
-    // Known Windows failure tracked in docs/futurework/stdin-transport-single-owner.md.
-    if cfg!(target_os = "windows") {
-        return Ok(());
-    }
-
     let mut session = common::spawn_server_with_files().await?;
 
     let result = session

@@ -1,6 +1,6 @@
 use std::io::{BufRead, Read};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -14,15 +14,8 @@ use crate::worker_protocol::WORKER_MODE_ARG;
 struct WorkerState {
     busy: AtomicBool,
     shutting_down: AtomicBool,
-}
-
-impl Default for WorkerState {
-    fn default() -> Self {
-        Self {
-            busy: AtomicBool::new(false),
-            shutting_down: AtomicBool::new(false),
-        }
-    }
+    stdin_wait: Mutex<()>,
+    stdin_wait_cvar: Condvar,
 }
 
 impl WorkerState {
@@ -34,14 +27,42 @@ impl WorkerState {
 
     fn mark_idle(&self) {
         self.busy.store(false, Ordering::SeqCst);
+        self.stdin_wait_cvar.notify_all();
     }
 
     fn begin_shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
+        self.stdin_wait_cvar.notify_all();
     }
 
     fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::SeqCst)
+    }
+
+    fn wait_until_stdin_read_allowed(&self) -> bool {
+        if self.is_shutting_down() {
+            return false;
+        }
+        if !self.busy.load(Ordering::SeqCst) {
+            return true;
+        }
+
+        let mut guard = self.stdin_wait.lock().unwrap();
+        while self.busy.load(Ordering::SeqCst) && !self.is_shutting_down() {
+            guard = self.stdin_wait_cvar.wait(guard).unwrap();
+        }
+        !self.is_shutting_down()
+    }
+}
+
+impl Default for WorkerState {
+    fn default() -> Self {
+        Self {
+            busy: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            stdin_wait: Mutex::new(()),
+            stdin_wait_cvar: Condvar::new(),
+        }
     }
 }
 
@@ -141,6 +162,11 @@ fn stdin_loop(
     let mut reader = std::io::BufReader::new(stdin);
     let mut line = String::new();
     loop {
+        // On Windows, leaving another thread blocked on fd 0 during an active request can hang
+        // embedded runtimes such as CPython when they probe stdin during initialization.
+        if !state.wait_until_stdin_read_allowed() {
+            break;
+        }
         line.clear();
         let bytes = reader.read_line(&mut line)?;
         if bytes == 0 {
@@ -236,4 +262,67 @@ fn write_stdin_request(text: String) -> Result<(), WorkerExecError> {
 
 fn emit_stderr_message(message: &str) {
     crate::output_stream::write_stderr_bytes(message.as_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn stdin_wait_blocks_while_request_is_busy() {
+        let state = Arc::new(WorkerState::default());
+        assert!(
+            state.try_mark_busy(),
+            "expected first busy transition to succeed"
+        );
+
+        let entered_wait = Arc::new(AtomicBool::new(false));
+        let wait_finished = Arc::new(AtomicBool::new(false));
+        let thread_state = Arc::clone(&state);
+        let thread_entered_wait = Arc::clone(&entered_wait);
+        let thread_wait_finished = Arc::clone(&wait_finished);
+        let waiter = thread::spawn(move || {
+            thread_entered_wait.store(true, Ordering::SeqCst);
+            let allowed = thread_state.wait_until_stdin_read_allowed();
+            thread_wait_finished.store(allowed, Ordering::SeqCst);
+        });
+
+        while !entered_wait.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        thread::sleep(Duration::from_millis(20));
+        assert!(
+            !wait_finished.load(Ordering::SeqCst),
+            "stdin wait should stay blocked until the active request finishes"
+        );
+
+        state.mark_idle();
+        waiter.join().expect("waiter thread should join");
+        assert!(
+            wait_finished.load(Ordering::SeqCst),
+            "stdin wait should resume once the request becomes idle"
+        );
+    }
+
+    #[test]
+    fn stdin_wait_exits_when_shutdown_begins() {
+        let state = Arc::new(WorkerState::default());
+        assert!(
+            state.try_mark_busy(),
+            "expected first busy transition to succeed"
+        );
+
+        let thread_state = Arc::clone(&state);
+        let waiter = thread::spawn(move || thread_state.wait_until_stdin_read_allowed());
+
+        thread::sleep(Duration::from_millis(20));
+        state.begin_shutdown();
+
+        let allowed = waiter.join().expect("waiter thread should join");
+        assert!(
+            !allowed,
+            "stdin wait should stop instead of blocking forever once shutdown begins"
+        );
+    }
 }

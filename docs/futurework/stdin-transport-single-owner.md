@@ -4,18 +4,18 @@
 
 A Windows bug exposed a broader design issue in the embedded worker model: stdin should have a single owner inside the worker process.
 
-The immediate failure was Windows-specific. Embedded Python can hang during `Py_InitializeEx()` when the process has a live stdin pipe and another thread is already blocked reading that same pipe. But the follow-up refactor should not be Windows-specific. The goal is to tighten the general stdin transport model so future interpreters fit the same design cleanly.
+The immediate Windows hang is now mitigated by pausing the worker's background stdin reader while a request is active. The remaining follow-up is broader than that point fix: tighten the general stdin transport model so future interpreters fit the same design cleanly.
 
 ## Why This Matters
 
-- `reticulate::py_config()` and `reticulate::py_help()` can hang in the embedded R worker on Windows.
-- The problem is not "piped stdin is always broken". The hang only shows up when another thread is already blocked on the same stdin pipe.
-- This affects future embedded interpreters too, not just `reticulate`.
-- The current embedded R stdin path has implementation drift from the intended worker/server contract.
+- The Windows `reticulate` hang was a concrete symptom of stdin ownership problems in the worker model.
+- The problem is not "piped stdin is always broken". The hang showed up when another thread was already blocked on the same stdin pipe.
+- Future embedded interpreters can run into similar issues if worker stdin ownership drifts again.
+- The current embedded R stdin path still has implementation drift from the intended worker/server contract.
 
 ## Current Scope
 
-This repo's current sandbox PR intentionally does not change the general worker/server transport model. We want to keep stdin as the primary request channel for worker payloads and address stdin ownership in a dedicated follow-up refactor.
+This repo now avoids the immediate Windows deadlock by stopping the background stdin reader from blocking on fd `0` while a request is running. We still want to keep stdin as the primary request channel for worker payloads and address the broader stdin ownership / transport shape in a dedicated follow-up refactor.
 
 ## Intended Transport Model
 
