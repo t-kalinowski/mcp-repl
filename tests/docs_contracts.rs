@@ -63,8 +63,68 @@ fn plans_layout_exists() {
         "docs/plans/active",
         "docs/plans/completed",
         "docs/plans/tech-debt.md",
+        "scripts/install.sh",
+        "scripts/install.ps1",
     ] {
         assert_exists(&root.join(required));
+    }
+}
+
+#[test]
+fn readme_documents_dev_binary_download_contract() {
+    let readme = read(&repo_root().join("README.md"));
+
+    for required in [
+        "https://raw.githubusercontent.com/posit-dev/mcp-repl/main/scripts/install.sh",
+        "https://raw.githubusercontent.com/posit-dev/mcp-repl/main/scripts/install.ps1",
+        "https://github.com/posit-dev/mcp-repl/releases/latest",
+        "https://github.com/posit-dev/mcp-repl/releases/latest/download/mcp-repl-x86_64-unknown-linux-gnu.tar.gz",
+        "https://github.com/posit-dev/mcp-repl/releases/latest/download/mcp-repl-aarch64-apple-darwin.tar.gz",
+        "https://github.com/posit-dev/mcp-repl/releases/latest/download/mcp-repl-x86_64-pc-windows-msvc.zip",
+        "Download prebuilt dev binaries",
+        "https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-x86_64-unknown-linux-gnu.tar.gz",
+        "https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-aarch64-apple-darwin.tar.gz",
+        "https://github.com/posit-dev/mcp-repl/releases/download/dev/mcp-repl-x86_64-pc-windows-msvc.zip",
+        "binaries do not bundle R or Python",
+        "glibc build produced on Ubuntu 22.04",
+        "**Windows**: experimental",
+    ] {
+        assert!(readme.contains(required), "missing {required} in README.md");
+    }
+}
+
+#[test]
+fn ci_workflow_defines_dev_release_contract() {
+    let workflow = read(&repo_root().join(".github/workflows/ci.yml"));
+
+    for required in [
+        "publish-dev:",
+        "publish-stable:",
+        "workflow_dispatch:",
+        "stable_tag:",
+        "backfill-stable:",
+        "tags:",
+        "- 'v*'",
+        "ubuntu-22.04",
+        "macos-15",
+        "windows-2022",
+        "mcp-repl-x86_64-unknown-linux-gnu.tar.gz",
+        "mcp-repl-aarch64-apple-darwin.tar.gz",
+        "mcp-repl-x86_64-pc-windows-msvc.zip",
+        "SHA256SUMS.txt",
+        "gh release upload dev dist/* --clobber",
+        "group: publish-dev",
+        "gh release create \"${RELEASE_TAG}\" dist/*",
+        "!contains(github.ref_name, '-')",
+        "sort -V | tail -n 1",
+        "make_latest=\"${latest_flag}\"",
+        "ref: ${{ inputs.stable_tag }}",
+        "git rev-parse \"refs/tags/${{ inputs.stable_tag }}\" >/dev/null",
+    ] {
+        assert!(
+            workflow.contains(required),
+            "missing {required} in .github/workflows/ci.yml"
+        );
     }
 }
 
