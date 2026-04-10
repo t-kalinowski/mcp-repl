@@ -162,6 +162,7 @@ struct CapabilityAclGuard {
 struct PreparedLaunchAclRestore {
     path: PathBuf,
     dacl: Option<Vec<u8>>,
+    materialized_dirs: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,6 +320,11 @@ pub(crate) fn set_prepared_launch_allow_target_pre_apply_delete(target: Option<P
 }
 
 #[cfg(test)]
+pub(crate) fn set_prepared_launch_deny_target_pre_apply_delete(target: Option<PathBuf>) {
+    PREPARED_LAUNCH_DENY_TARGET_PRE_APPLY_DELETE.with(|slot| *slot.borrow_mut() = target);
+}
+
+#[cfg(test)]
 thread_local! {
     static PREPARE_SANDBOX_LAUNCH_TEST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
     static APPLY_PREPARED_LAUNCH_ACL_STATE_TEST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -328,6 +334,8 @@ thread_local! {
     static PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_CALLS: RefCell<Vec<PathBuf>> =
         const { RefCell::new(Vec::new()) };
     static PREPARED_LAUNCH_ALLOW_TARGET_PRE_APPLY_DELETE: RefCell<Option<PathBuf>> =
+        const { RefCell::new(None) };
+    static PREPARED_LAUNCH_DENY_TARGET_PRE_APPLY_DELETE: RefCell<Option<PathBuf>> =
         const { RefCell::new(None) };
 }
 
@@ -731,8 +739,11 @@ unsafe fn apply_prepared_launch_acl_state(
                 }
             };
             match add_allow_ace_with_missing_policy(&target, sid, target == *path) {
-                Ok(true) => acl_restores.push(restore),
-                Ok(false) => {}
+                Ok(changed) => {
+                    if changed || !restore.materialized_dirs.is_empty() {
+                        acl_restores.push(restore);
+                    }
+                }
                 Err(err) => {
                     cleanup_prepared_launch_acl_state(&acl_restores);
                     return Err(format!(
@@ -773,6 +784,15 @@ unsafe fn apply_prepared_launch_acl_state(
                 if target == *path {
                     continue;
                 }
+                #[cfg(test)]
+                PREPARED_LAUNCH_DENY_TARGET_PRE_APPLY_DELETE.with(|slot| {
+                    if slot.borrow().as_ref().is_some_and(|expected| {
+                        canonicalize_or_identity(expected) == canonicalize_or_identity(&target)
+                    }) {
+                        let _ = std::fs::remove_file(&target);
+                        *slot.borrow_mut() = None;
+                    }
+                });
                 let restore = match capture_prepared_launch_acl_restore_with_missing_policy(
                     &target,
                     CapabilityAclKind::Deny,
@@ -1366,6 +1386,25 @@ unsafe fn cleanup_capability_acl_state(
     }
 }
 
+fn materialized_directory_chain(path: &Path) -> Vec<PathBuf> {
+    let mut materialized = Vec::new();
+    let mut current = Some(path);
+    while let Some(dir) = current {
+        if dir.exists() {
+            break;
+        }
+        materialized.push(dir.to_path_buf());
+        current = dir.parent();
+    }
+    materialized
+}
+
+fn cleanup_materialized_dirs(dirs: &[PathBuf]) {
+    for dir in dirs {
+        let _ = std::fs::remove_dir(dir);
+    }
+}
+
 unsafe fn capture_prepared_launch_acl_restore(
     path: &Path,
     kind: CapabilityAclKind,
@@ -1378,10 +1417,12 @@ unsafe fn capture_prepared_launch_acl_restore_with_missing_policy(
     kind: CapabilityAclKind,
     materialize_missing_directory: bool,
 ) -> Result<Option<PreparedLaunchAclRestore>, String> {
+    let mut materialized_dirs = Vec::new();
     if matches!(kind, CapabilityAclKind::Allow) && !path.exists() {
         if !materialize_missing_directory {
             return Ok(None);
         }
+        materialized_dirs = materialized_directory_chain(path);
         std::fs::create_dir_all(path)
             .map_err(|err| format!("create_dir_all failed for '{}': {err}", path.display()))?;
     }
@@ -1399,6 +1440,16 @@ unsafe fn capture_prepared_launch_acl_restore_with_missing_policy(
         &mut security_descriptor,
     );
     if code != ERROR_SUCCESS {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        if (code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND)
+            && !materialize_missing_directory
+        {
+            cleanup_materialized_dirs(&materialized_dirs);
+            return Ok(None);
+        }
+        cleanup_materialized_dirs(&materialized_dirs);
         return Err(format!("GetNamedSecurityInfoW failed: {code}"));
     }
 
@@ -1415,6 +1466,7 @@ unsafe fn capture_prepared_launch_acl_restore_with_missing_policy(
     Ok(Some(PreparedLaunchAclRestore {
         path: path.to_path_buf(),
         dacl: snapshot,
+        materialized_dirs,
     }))
 }
 
@@ -1433,6 +1485,7 @@ unsafe fn cleanup_prepared_launch_acl_state(acl_restores: &[PreparedLaunchAclRes
             dacl,
             std::ptr::null_mut(),
         );
+        cleanup_materialized_dirs(&restore.materialized_dirs);
     }
 }
 
@@ -4438,6 +4491,52 @@ mod tests {
     }
 
     #[test]
+    fn prepared_launch_refresh_skips_vanished_protected_descendant() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let git_dir = cwd.join(".git");
+        let session_temp_dir = session_root.path().join("session-temp");
+        let artifact = git_dir.join("index.lock");
+        std::fs::create_dir_all(&git_dir).expect("git dir");
+        std::fs::write(&artifact, b"lock").expect("artifact file");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        set_prepared_launch_deny_target_pre_apply_delete(Some(artifact.clone()));
+        let result = refresh_prepared_sandbox_launch_acl_state(&prepared);
+        set_prepared_launch_deny_target_pre_apply_delete(None);
+
+        assert!(
+            result.is_ok(),
+            "refresh should ignore protected descendants that vanish before ACL snapshot: {result:?}"
+        );
+        assert!(
+            !artifact.exists(),
+            "test setup should delete the transient protected descendant before ACL snapshot"
+        );
+
+        unsafe {
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    git_dir.as_path(),
+                    artifact.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
     fn prepared_launch_refresh_rolls_back_added_deny_acls_after_failure() {
         let _guard = prepare_sandbox_launch_test_mutex()
             .lock()
@@ -4482,6 +4581,38 @@ mod tests {
             );
             LocalFree(sid as HLOCAL);
         }
+    }
+
+    #[test]
+    fn prepare_sandbox_launch_removes_materialized_missing_writable_root_after_failure() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let git_dir = cwd.join(".git");
+        let missing_root = cwd.join("generated").join("missing-root");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&git_dir).expect("git dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(vec![missing_root.clone()], false, false);
+        set_add_deny_write_ace_test_error(Some((0, "injected deny ACL failure".to_string())));
+
+        let result = prepare_sandbox_launch(&policy, &cwd, &session_temp_dir);
+
+        set_add_deny_write_ace_test_error(None);
+
+        assert!(
+            matches!(result, Err(ref err) if err.contains("injected deny ACL failure")),
+            "expected injected deny ACL failure, got: {result:?}"
+        );
+        assert!(
+            !missing_root.exists(),
+            "failed prepare should remove writable roots it had to materialize before the error"
+        );
     }
 
     #[test]
