@@ -295,11 +295,18 @@ pub(crate) fn set_prepared_launch_allow_targets_read_dir_test_error(
 }
 
 #[cfg(test)]
+pub(crate) fn set_prepared_launch_allow_target_pre_apply_delete(target: Option<PathBuf>) {
+    PREPARED_LAUNCH_ALLOW_TARGET_PRE_APPLY_DELETE.with(|slot| *slot.borrow_mut() = target);
+}
+
+#[cfg(test)]
 thread_local! {
     static PREPARE_SANDBOX_LAUNCH_TEST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
     static APPLY_PREPARED_LAUNCH_ACL_STATE_TEST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
     static ADD_DENY_WRITE_ACE_TEST_ERROR: RefCell<Option<(usize, String)>> = const { RefCell::new(None) };
     static PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_TEST_ERROR: RefCell<Option<(PathBuf, String)>> =
+        const { RefCell::new(None) };
+    static PREPARED_LAUNCH_ALLOW_TARGET_PRE_APPLY_DELETE: RefCell<Option<PathBuf>> =
         const { RefCell::new(None) };
 }
 
@@ -677,18 +684,31 @@ unsafe fn apply_prepared_launch_acl_state(
 
     for path in &paths.allow {
         for target in prepared_launch_allow_targets(path, &denied_roots)? {
-            let restore =
-                match capture_prepared_launch_acl_restore(&target, CapabilityAclKind::Allow) {
-                    Ok(restore) => restore,
-                    Err(err) => {
-                        cleanup_prepared_launch_acl_state(&acl_restores);
-                        return Err(format!(
-                            "failed to {action} writable ACL on '{}': {err}",
-                            target.display()
-                        ));
-                    }
-                };
-            match add_allow_ace(&target, sid) {
+            #[cfg(test)]
+            PREPARED_LAUNCH_ALLOW_TARGET_PRE_APPLY_DELETE.with(|slot| {
+                if slot.borrow().as_ref().is_some_and(|expected| {
+                    canonicalize_or_identity(expected) == canonicalize_or_identity(&target)
+                }) {
+                    let _ = std::fs::remove_file(&target);
+                    *slot.borrow_mut() = None;
+                }
+            });
+            let restore = match capture_prepared_launch_acl_restore_with_missing_policy(
+                &target,
+                CapabilityAclKind::Allow,
+                target == *path,
+            ) {
+                Ok(Some(restore)) => restore,
+                Ok(None) => continue,
+                Err(err) => {
+                    cleanup_prepared_launch_acl_state(&acl_restores);
+                    return Err(format!(
+                        "failed to {action} writable ACL on '{}': {err}",
+                        target.display()
+                    ));
+                }
+            };
+            match add_allow_ace_with_missing_policy(&target, sid, target == *path) {
                 Ok(true) => acl_restores.push(restore),
                 Ok(false) => {}
                 Err(err) => {
@@ -705,7 +725,8 @@ unsafe fn apply_prepared_launch_acl_state(
     if matches!(launch.policy, SandboxPolicy::WorkspaceWrite { .. }) {
         for path in &paths.deny {
             let restore = match capture_prepared_launch_acl_restore(path, CapabilityAclKind::Deny) {
-                Ok(restore) => restore,
+                Ok(Some(restore)) => restore,
+                Ok(None) => continue,
                 Err(err) => {
                     cleanup_prepared_launch_acl_state(&acl_restores);
                     return Err(format!(
@@ -1236,8 +1257,19 @@ unsafe fn cleanup_capability_acl_state(
 unsafe fn capture_prepared_launch_acl_restore(
     path: &Path,
     kind: CapabilityAclKind,
-) -> Result<PreparedLaunchAclRestore, String> {
+) -> Result<Option<PreparedLaunchAclRestore>, String> {
+    capture_prepared_launch_acl_restore_with_missing_policy(path, kind, true)
+}
+
+unsafe fn capture_prepared_launch_acl_restore_with_missing_policy(
+    path: &Path,
+    kind: CapabilityAclKind,
+    materialize_missing_directory: bool,
+) -> Result<Option<PreparedLaunchAclRestore>, String> {
     if matches!(kind, CapabilityAclKind::Allow) && !path.exists() {
+        if !materialize_missing_directory {
+            return Ok(None);
+        }
         std::fs::create_dir_all(path)
             .map_err(|err| format!("create_dir_all failed for '{}': {err}", path.display()))?;
     }
@@ -1268,10 +1300,10 @@ unsafe fn capture_prepared_launch_acl_restore(
         LocalFree(security_descriptor as HLOCAL);
     }
 
-    Ok(PreparedLaunchAclRestore {
+    Ok(Some(PreparedLaunchAclRestore {
         path: path.to_path_buf(),
         dacl: snapshot,
-    })
+    }))
 }
 
 unsafe fn cleanup_prepared_launch_acl_state(acl_restores: &[PreparedLaunchAclRestore]) {
@@ -1698,7 +1730,18 @@ fn quote_windows_arg(arg: &str) -> String {
 }
 
 unsafe fn add_allow_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
+    add_allow_ace_with_missing_policy(path, sid, true)
+}
+
+unsafe fn add_allow_ace_with_missing_policy(
+    path: &Path,
+    sid: *mut c_void,
+    materialize_missing_directory: bool,
+) -> Result<bool, String> {
     if !path.exists() {
+        if !materialize_missing_directory {
+            return Ok(false);
+        }
         std::fs::create_dir_all(path)
             .map_err(|err| format!("create_dir_all failed for '{}': {err}", path.display()))?;
     }
@@ -4158,6 +4201,52 @@ mod tests {
                     cwd.as_path(),
                     nested.as_path(),
                     moved_file.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_refresh_does_not_recreate_deleted_file_as_directory() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let nested = cwd.join("nested");
+        let session_temp_dir = session_root.path().join("session-temp");
+        let artifact = nested.join("artifact.txt");
+        std::fs::create_dir_all(&nested).expect("nested dir");
+        std::fs::write(&artifact, b"artifact").expect("artifact file");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        set_prepared_launch_allow_target_pre_apply_delete(Some(artifact.clone()));
+        refresh_prepared_sandbox_launch_acl_state(&prepared)
+            .expect("refresh prepared launch ACL state");
+
+        assert!(
+            !artifact.exists(),
+            "refresh should not recreate a disappeared file path"
+        );
+        assert!(
+            !artifact.is_dir(),
+            "refresh should not recreate a disappeared file path as a directory"
+        );
+
+        unsafe {
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    nested.as_path(),
+                    artifact.as_path(),
                     session_temp_dir.as_path(),
                 ],
             );

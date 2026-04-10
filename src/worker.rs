@@ -20,6 +20,7 @@ struct WorkerState {
 
 impl WorkerState {
     fn try_mark_busy(&self) -> bool {
+        let _guard = self.stdin_wait.lock().unwrap();
         self.busy
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
@@ -378,5 +379,45 @@ mod tests {
             allowed,
             "stdin wait should resume promptly when idle is signaled during the wait handoff"
         );
+    }
+
+    #[test]
+    fn try_mark_busy_waits_for_stdin_gate_lock() {
+        let state = Arc::new(WorkerState::default());
+        let (lock_held_tx, lock_held_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        let holder_state = Arc::clone(&state);
+        let holder = thread::spawn(move || {
+            let _guard = holder_state.stdin_wait.lock().expect("stdin gate lock");
+            lock_held_tx.send(()).expect("lock-held signal");
+            release_rx.recv().expect("release signal");
+        });
+
+        lock_held_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("holder should acquire stdin gate lock");
+
+        let marker_state = Arc::clone(&state);
+        let (marked_tx, marked_rx) = mpsc::channel();
+        let marker = thread::spawn(move || {
+            let marked = marker_state.try_mark_busy();
+            marked_tx.send(marked).expect("busy-mark result");
+        });
+
+        assert!(
+            marked_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "busy transition should block while the stdin gate lock is held"
+        );
+
+        release_tx.send(()).expect("release holder");
+        holder.join().expect("holder thread should join");
+        assert!(
+            marked_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("busy mark should finish after the gate lock is released"),
+            "busy transition should succeed once the stdin gate lock is released"
+        );
+        marker.join().expect("marker thread should join");
     }
 }
