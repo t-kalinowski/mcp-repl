@@ -1295,6 +1295,29 @@ fn windows_home_dir() -> Option<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
+fn windows_sandbox_backend_unavailable(text: &str) -> bool {
+    text.contains("CreateRestrictedToken failed: 87")
+        || text.contains("worker exited before IPC named pipe connection")
+        || text.contains("timed out waiting for IPC named pipe client connection")
+}
+
+#[cfg(target_os = "windows")]
+fn powershell_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+#[cfg(target_os = "windows")]
+fn cleanup_restricted_file(path: &std::path::Path) {
+    let script = format!(
+        "$path = {}; if (Test-Path -LiteralPath $path) {{ icacls $path /reset | Out-Null; Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }}",
+        powershell_literal(&path.to_string_lossy())
+    );
+    let _ = std::process::Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", &script])
+        .status();
+}
+
+#[cfg(target_os = "windows")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_denials_windows() -> TestResult<()> {
     let Some(home) = windows_home_dir() else {
@@ -1328,10 +1351,7 @@ tryCatch({{
     let result = session.write_stdin_raw_with(&code, Some(10.0)).await?;
     let text = collect_text(&result);
     let _ = std::fs::remove_file(&forbidden);
-    if text.contains("CreateRestrictedToken failed: 87")
-        || text.contains("worker exited before IPC named pipe connection")
-        || text.contains("timed out waiting for IPC named pipe client connection")
-    {
+    if windows_sandbox_backend_unavailable(&text) {
         eprintln!("windows restricted token setup unavailable; skipping");
         session.cancel().await?;
         return Ok(());
@@ -1346,5 +1366,115 @@ tryCatch({{
         "write unexpectedly succeeded under workspace-write: {text}"
     );
     session.cancel().await?;
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_workspace_write_restart_blocks_moved_file_inside_git_dir() -> TestResult<()> {
+    let repo_root = std::env::current_dir()?;
+    let git_dir = repo_root.join(".git");
+    if !git_dir.is_dir() {
+        eprintln!(".git directory unavailable; skipping");
+        return Ok(());
+    }
+    let source = repo_root.join(format!(
+        "mcp-repl-sandbox-protected-source-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let target = git_dir.join(format!(
+        "mcp-repl-sandbox-protected-target-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let source_r = r_string(&source.to_string_lossy());
+    let target_r = r_string(&target.to_string_lossy());
+    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
+
+    let setup_code = format!(
+        r#"
+source <- {source_r}
+writeLines("before restart", source)
+cat("WRITE_OK=", file.exists(source), "\n", sep = "")
+cat("READ_BEFORE_MOVE=", paste(readLines(source, warn = FALSE), collapse = "|"), "\n", sep = "")
+"#
+    );
+    let setup = session.write_stdin_raw_with(setup_code, Some(10.0)).await?;
+    let setup_text = collect_text(&setup);
+    if windows_sandbox_backend_unavailable(&setup_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session.cancel().await?;
+        cleanup_restricted_file(&source);
+        cleanup_restricted_file(&target);
+        return Ok(());
+    }
+
+    assert!(
+        setup_text.contains("WRITE_OK=TRUE"),
+        "expected sandboxed workspace write to succeed before moving into .git, got: {setup_text}"
+    );
+    assert!(
+        setup_text.contains("READ_BEFORE_MOVE=before restart"),
+        "expected sandboxed workspace file to be readable before moving into .git, got: {setup_text}"
+    );
+
+    std::fs::rename(&source, &target)?;
+
+    let restart = session.write_stdin_raw_with("\u{4}", Some(10.0)).await?;
+    let restart_text = collect_text(&restart);
+    if windows_sandbox_backend_unavailable(&restart_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session.cancel().await?;
+        cleanup_restricted_file(&source);
+        cleanup_restricted_file(&target);
+        return Ok(());
+    }
+    assert!(
+        restart_text.contains("new session started"),
+        "expected worker restart notice, got: {restart_text}"
+    );
+
+    let follow_up_code = format!(
+        r#"
+target <- {target_r}
+tryCatch({{
+  cat("READ_AFTER=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+}}, error = function(e) {{
+  message("READ_AFTER_ERROR:", conditionMessage(e))
+}})
+tryCatch({{
+  writeLines("after restart", target)
+  cat("WRITE_AFTER_OK\n")
+}}, error = function(e) {{
+  message("WRITE_AFTER_ERROR:", conditionMessage(e))
+}})
+"#
+    );
+    let follow_up = session
+        .write_stdin_raw_with(follow_up_code, Some(10.0))
+        .await?;
+    let follow_up_text = collect_text(&follow_up);
+
+    cleanup_restricted_file(&source);
+    cleanup_restricted_file(&target);
+    session.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("READ_AFTER=before restart"),
+        "expected moved file contents to remain readable after restart, got: {follow_up_text}"
+    );
+    assert!(
+        follow_up_text.contains("WRITE_AFTER_ERROR:"),
+        "expected file moved into .git to reject writes after worker restart, got: {follow_up_text}"
+    );
+    assert!(
+        !follow_up_text.contains("WRITE_AFTER_OK"),
+        "file moved into .git stayed writable after worker restart, got: {follow_up_text}"
+    );
     Ok(())
 }

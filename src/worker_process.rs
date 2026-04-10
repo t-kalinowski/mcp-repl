@@ -2672,6 +2672,12 @@ impl WorkerManager {
             )
         });
         if launch_matches {
+            crate::windows_sandbox::refresh_prepared_sandbox_launch_acl_state(
+                self.windows_sandbox_launch
+                    .as_ref()
+                    .expect("matching launch must exist"),
+            )
+            .map_err(WorkerError::Sandbox)?;
             return Ok(self.windows_sandbox_launch.clone());
         }
 
@@ -6780,7 +6786,7 @@ mod tests {
 
     #[cfg(target_family = "windows")]
     #[test]
-    fn windows_sandbox_cache_hit_reuses_prepared_launch_without_refreshing_acl_state() {
+    fn windows_sandbox_cache_hit_refreshes_prepared_launch_acl_state_before_reuse() {
         let _guard = crate::windows_sandbox::prepare_sandbox_launch_test_mutex()
             .lock()
             .expect("windows sandbox test mutex");
@@ -6801,7 +6807,7 @@ mod tests {
         );
 
         crate::windows_sandbox::set_apply_prepared_launch_acl_state_test_error(Some(
-            "cache hit should not refresh ACL state".to_string(),
+            "cache hit should refresh ACL state".to_string(),
         ));
 
         let second = manager.ensure_windows_sandbox_launch();
@@ -6809,13 +6815,16 @@ mod tests {
         crate::windows_sandbox::set_apply_prepared_launch_acl_state_test_error(None);
 
         assert!(
-            second.is_ok(),
-            "cache hits should reuse the prepared launch without re-running ACL refresh, got: {second:?}"
+            matches!(
+                second,
+                Err(WorkerError::Sandbox(ref err))
+                    if err.contains("cache hit should refresh ACL state")
+            ),
+            "cache hits should refresh ACL state before reusing the prepared launch, got: {second:?}"
         );
         assert_eq!(
-            second.expect("cache hit should succeed"),
-            first,
-            "cache hits should return the cached prepared launch"
+            manager.windows_sandbox_launch, first,
+            "cache-hit refresh failures should preserve the cached launch for later retries"
         );
     }
 }

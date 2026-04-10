@@ -43,7 +43,9 @@ use windows_sys::Win32::Foundation::SetHandleInformation;
 use windows_sys::Win32::Foundation::WAIT_ABANDONED;
 use windows_sys::Win32::Foundation::WAIT_FAILED;
 use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
-use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+use windows_sys::Win32::Foundation::{
+    ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND, ERROR_SUCCESS, LocalFree,
+};
 use windows_sys::Win32::Security::ACCESS_ALLOWED_ACE;
 use windows_sys::Win32::Security::ACE_HEADER;
 use windows_sys::Win32::Security::ACL;
@@ -766,6 +768,38 @@ unsafe fn apply_prepared_launch_acl_state(
                     ));
                 }
             }
+
+            for target in prepared_launch_existing_targets(path)? {
+                if target == *path {
+                    continue;
+                }
+                let restore = match capture_prepared_launch_acl_restore_with_missing_policy(
+                    &target,
+                    CapabilityAclKind::Deny,
+                    false,
+                ) {
+                    Ok(Some(restore)) => restore,
+                    Ok(None) => continue,
+                    Err(err) => {
+                        cleanup_prepared_launch_acl_state(&acl_restores);
+                        return Err(format!(
+                            "failed to {action} protected descendant deny ACL on '{}': {err}",
+                            target.display()
+                        ));
+                    }
+                };
+                match add_deny_write_ace(&target, sid) {
+                    Ok(true) => acl_restores.push(restore),
+                    Ok(false) => {}
+                    Err(err) => {
+                        cleanup_prepared_launch_acl_state(&acl_restores);
+                        return Err(format!(
+                            "failed to {action} protected descendant deny ACL on '{}': {err}",
+                            target.display()
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -862,6 +896,45 @@ fn prepared_launch_allow_targets(
     Ok(targets)
 }
 
+fn prepared_launch_existing_targets(root: &Path) -> Result<Vec<PathBuf>, String> {
+    let root_canonical = canonicalize_or_identity(root);
+    let mut targets = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    let mut visited = HashSet::new();
+
+    while let Some(path) = stack.pop() {
+        let canonical = canonicalize_or_identity(&path);
+        if !canonical.starts_with(&root_canonical) || !visited.insert(canonical) {
+            continue;
+        }
+
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => continue,
+        };
+
+        targets.push(path.clone());
+        if !metadata.is_dir() {
+            continue;
+        }
+
+        let entries = match prepared_launch_allow_targets_read_dir(&path) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(_) => continue,
+            };
+            stack.push(entry.path());
+        }
+    }
+
+    Ok(targets)
+}
+
 unsafe fn refresh_runtime_prepared_launch_acl_state(
     policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
@@ -913,8 +986,7 @@ pub fn prepare_sandbox_launch(
     Ok(launch)
 }
 
-#[cfg(test)]
-pub(crate) fn refresh_prepared_sandbox_launch_acl_state(
+pub fn refresh_prepared_sandbox_launch_acl_state(
     launch: &PreparedSandboxLaunch,
 ) -> Result<(), String> {
     let _acl_lock = acquire_prepared_launch_acl_lock(launch.capability_sid())?;
@@ -2035,6 +2107,10 @@ unsafe fn dacl_has_write_deny_for_sid(dacl: *mut ACL, sid: *mut c_void) -> bool 
 }
 
 unsafe fn revoke_ace(path: &Path, sid: *mut c_void) {
+    let _ = revoke_ace_with_result(path, sid);
+}
+
+unsafe fn revoke_ace_with_result(path: &Path, sid: *mut c_void) -> Result<bool, String> {
     let mut security_descriptor: *mut c_void = std::ptr::null_mut();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let code = GetNamedSecurityInfoW(
@@ -2051,41 +2127,59 @@ unsafe fn revoke_ace(path: &Path, sid: *mut c_void) {
         if !security_descriptor.is_null() {
             LocalFree(security_descriptor as HLOCAL);
         }
-        return;
+        if code == ERROR_FILE_NOT_FOUND || code == ERROR_PATH_NOT_FOUND {
+            return Ok(false);
+        }
+        return Err(format!("GetNamedSecurityInfoW failed: {code}"));
     }
 
-    let trustee = TRUSTEE_W {
-        pMultipleTrustee: std::ptr::null_mut(),
-        MultipleTrusteeOperation: 0,
-        TrusteeForm: TRUSTEE_IS_SID,
-        TrusteeType: TRUSTEE_IS_UNKNOWN,
-        ptstrName: sid as *mut u16,
+    let Some(info) = dacl_size_info(dacl) else {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return Ok(false);
     };
-    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
-    explicit.grfAccessPermissions = 0;
-    explicit.grfAccessMode = REVOKE_ACCESS;
-    explicit.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
-    explicit.Trustee = trustee;
 
-    let mut new_dacl: *mut ACL = std::ptr::null_mut();
-    let set_acl_code = SetEntriesInAclW(1, &explicit, dacl, &mut new_dacl);
-    if set_acl_code == ERROR_SUCCESS {
-        let _ = SetNamedSecurityInfoW(
-            to_wide(path).as_ptr() as *mut u16,
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            new_dacl,
-            std::ptr::null_mut(),
-        );
-        if !new_dacl.is_null() {
-            LocalFree(new_dacl as HLOCAL);
+    let mut changed = false;
+    for index in (0..info.AceCount).rev() {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+            continue;
+        }
+        let header = &*(ace as *const ACE_HEADER);
+        if header.AceType != 0 {
+            continue;
+        }
+        if EqualSid(ace_sid_ptr(ace), sid) == 0 {
+            continue;
+        }
+        if DeleteAce(dacl, index) != 0 {
+            changed = true;
         }
     }
     if !security_descriptor.is_null() {
         LocalFree(security_descriptor as HLOCAL);
     }
+    if !changed {
+        return Ok(false);
+    }
+
+    let set_security_code = SetNamedSecurityInfoW(
+        to_wide(path).as_ptr() as *mut u16,
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        dacl,
+        std::ptr::null_mut(),
+    );
+    if set_security_code != ERROR_SUCCESS {
+        if set_security_code == ERROR_FILE_NOT_FOUND || set_security_code == ERROR_PATH_NOT_FOUND {
+            return Ok(false);
+        }
+        return Err(format!("SetNamedSecurityInfoW failed: {set_security_code}"));
+    }
+    Ok(true)
 }
 
 unsafe fn revoke_deny_write_ace(path: &Path, sid: *mut c_void) {
@@ -4115,6 +4209,56 @@ mod tests {
             revoke_capability_sid_paths(
                 prepared.capability_sid(),
                 &[cwd.as_path(), git_dir.as_path(), session_temp_dir.as_path()],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_refresh_applies_deny_acl_to_existing_file_under_protected_dir() {
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let git_dir = cwd.join(".git");
+        let session_temp_dir = session_root.path().join("session-temp");
+        let source_file = cwd.join("artifact.txt");
+        let moved_file = git_dir.join("artifact.txt");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        std::fs::create_dir_all(&git_dir).expect("create git dir after prepare");
+        std::fs::write(&source_file, b"artifact").expect("workspace artifact file");
+        std::fs::rename(&source_file, &moved_file).expect("move artifact into protected dir");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            assert!(
+                path_has_allow_ace(&moved_file, sid),
+                "test setup should preserve the stable allow ACE on a file moved under .git"
+            );
+
+            refresh_prepared_sandbox_launch_acl_state(&prepared)
+                .expect("refresh prepared launch ACL state");
+
+            assert!(
+                path_has_write_deny_ace(&moved_file, sid),
+                "refresh should apply deny ACEs to existing protected descendants"
+            );
+
+            LocalFree(sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    git_dir.as_path(),
+                    moved_file.as_path(),
+                    session_temp_dir.as_path(),
+                ],
             );
         }
     }
