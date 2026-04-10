@@ -28,6 +28,7 @@ checked-in execution plans without relying on stale notes.
 - `docs/notes/`: ideas and sketches that may lead to later work.
 - `docs/futurework/`: candidate follow-on designs that are not current repository contract.
 - `docs/futurework/per-turn-history-bundles.md`: design brief for always-materialized per-turn REPL history bundles.
+- `docs/futurework/repl-interaction-rough-edges.md`: candidate UX polish items observed during live REPL use.
 
 ## Maintenance Rules
 
