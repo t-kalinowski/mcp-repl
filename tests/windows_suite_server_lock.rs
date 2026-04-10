@@ -44,3 +44,48 @@ fn suite_server_lock_allows_reentrant_acquire_within_process() -> TestResult<()>
     );
     Ok(())
 }
+
+#[test]
+fn suite_server_lock_recovers_after_abandoned_owner() -> TestResult<()> {
+    let (abandoned_tx, abandoned_rx) = mpsc::channel();
+    let abandoner = thread::spawn(move || {
+        let handle =
+            common::acquire_suite_server_lock_handle_for_tests().expect("raw suite lock handle");
+        abandoned_tx
+            .send(handle)
+            .expect("abandoned handle should be reported");
+    });
+    let abandoned_handle = abandoned_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("abandoner should acquire the suite lock");
+    abandoner.join().expect("abandoner thread should join");
+
+    let (acquired_tx, acquired_rx) = mpsc::channel();
+    let waiter = thread::spawn(move || {
+        let token = common::acquire_suite_server_lock_for_tests()
+            .expect("suite lock should recover after an abandoned owner");
+        acquired_tx
+            .send(token)
+            .expect("recovered token should be reported");
+    });
+
+    let token = match acquired_rx.recv_timeout(Duration::from_millis(250)) {
+        Ok(token) => {
+            common::close_suite_server_lock_handle_for_tests(abandoned_handle);
+            token
+        }
+        Err(_) => {
+            common::release_suite_server_lock_handle_for_tests(abandoned_handle);
+            let token = acquired_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("cleanup should unblock the waiter");
+            drop(token);
+            waiter.join().expect("waiter thread should join");
+            return Err("suite lock did not recover promptly after an abandoned owner".into());
+        }
+    };
+
+    drop(token);
+    waiter.join().expect("waiter thread should join");
+    Ok(())
+}

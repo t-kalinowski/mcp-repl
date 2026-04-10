@@ -26,11 +26,13 @@ impl WorkerState {
     }
 
     fn mark_idle(&self) {
+        let _guard = self.stdin_wait.lock().unwrap();
         self.busy.store(false, Ordering::SeqCst);
         self.stdin_wait_cvar.notify_all();
     }
 
     fn begin_shutdown(&self) {
+        let _guard = self.stdin_wait.lock().unwrap();
         self.shutting_down.store(true, Ordering::SeqCst);
         self.stdin_wait_cvar.notify_all();
     }
@@ -40,15 +42,25 @@ impl WorkerState {
     }
 
     fn wait_until_stdin_read_allowed(&self) -> bool {
-        if self.is_shutting_down() {
-            return false;
-        }
-        if !self.busy.load(Ordering::SeqCst) {
-            return true;
-        }
-
         let mut guard = self.stdin_wait.lock().unwrap();
         while self.busy.load(Ordering::SeqCst) && !self.is_shutting_down() {
+            guard = self.stdin_wait_cvar.wait(guard).unwrap();
+        }
+        !self.is_shutting_down()
+    }
+
+    #[cfg(test)]
+    fn wait_until_stdin_read_allowed_with_pre_wait_hook<F>(&self, mut before_wait: F) -> bool
+    where
+        F: FnMut(),
+    {
+        let mut guard = self.stdin_wait.lock().unwrap();
+        let mut hook_ran = false;
+        while self.busy.load(Ordering::SeqCst) && !self.is_shutting_down() {
+            if !hook_ran {
+                hook_ran = true;
+                before_wait();
+            }
             guard = self.stdin_wait_cvar.wait(guard).unwrap();
         }
         !self.is_shutting_down()
@@ -268,6 +280,8 @@ fn emit_stderr_message(message: &str) {
 mod tests {
     use super::*;
     use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::time::Instant;
 
     #[test]
     fn stdin_wait_blocks_while_request_is_busy() {
@@ -323,6 +337,46 @@ mod tests {
         assert!(
             !allowed,
             "stdin wait should stop instead of blocking forever once shutdown begins"
+        );
+    }
+
+    #[test]
+    fn stdin_wait_does_not_miss_idle_notification_during_wait_handoff() {
+        let state = Arc::new(WorkerState::default());
+        assert!(
+            state.try_mark_busy(),
+            "expected first busy transition to succeed"
+        );
+
+        let (result_tx, result_rx) = mpsc::channel();
+        let waiter_state = Arc::clone(&state);
+        let notifier_state = Arc::clone(&state);
+        let waiter = thread::spawn(move || {
+            let allowed = waiter_state.wait_until_stdin_read_allowed_with_pre_wait_hook(|| {
+                let notifier_state = Arc::clone(&notifier_state);
+                let _notifier = thread::spawn(move || notifier_state.mark_idle());
+                let deadline = Instant::now() + Duration::from_millis(50);
+                while Instant::now() < deadline {
+                    thread::yield_now();
+                }
+            });
+            result_tx
+                .send(allowed)
+                .expect("wait result should be reported");
+        });
+
+        let timely_result = result_rx.recv_timeout(Duration::from_millis(200));
+        if timely_result.is_err() {
+            state.begin_shutdown();
+        }
+        let allowed = timely_result
+            .or_else(|_| result_rx.recv_timeout(Duration::from_secs(1)))
+            .expect("waiter should eventually unblock");
+        waiter.join().expect("waiter thread should join");
+
+        assert!(
+            allowed,
+            "stdin wait should resume promptly when idle is signaled during the wait handoff"
         );
     }
 }

@@ -24,8 +24,8 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 #[cfg(windows)]
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, WAIT_OBJECT_0},
-    System::Threading::{CreateSemaphoreW, INFINITE, ReleaseSemaphore, WaitForSingleObject},
+    Foundation::{CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0},
+    System::Threading::{CreateMutexW, INFINITE, ReleaseMutex, WaitForSingleObject},
 };
 
 pub type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -34,63 +34,122 @@ const TEST_PAGER_PAGE_CHARS: u64 = 300;
 #[cfg(windows)]
 const WINDOWS_TEST_TIMEOUT_CAP_SECS: f64 = 60.0;
 #[cfg(windows)]
-const WINDOWS_TEST_SERVER_SEMAPHORE_NAME: &str = "Local\\mcp_repl_test_server_semaphore";
+const WINDOWS_TEST_SERVER_MUTEX_NAME: &str = "Local\\mcp_repl_test_server_mutex";
 
 #[cfg(windows)]
-struct WindowsSuiteServerSemaphore {
-    handle: usize,
+struct WindowsSuiteServerMutexOwner {
+    release_tx: std::sync::mpsc::Sender<()>,
+    join_handle: std::thread::JoinHandle<()>,
 }
 
 #[cfg(windows)]
 #[derive(Default)]
 struct WindowsSuiteServerLockState {
     local_refcount: usize,
-    semaphore: Option<WindowsSuiteServerSemaphore>,
+    owner: Option<WindowsSuiteServerMutexOwner>,
 }
 
 #[cfg(windows)]
-impl WindowsSuiteServerSemaphore {
-    fn acquire() -> TestResult<Self> {
-        let mut name: Vec<u16> = OsStr::new(WINDOWS_TEST_SERVER_SEMAPHORE_NAME)
-            .encode_wide()
-            .collect();
-        name.push(0);
+fn windows_suite_server_mutex_name_wide() -> Vec<u16> {
+    let mut name: Vec<u16> = OsStr::new(WINDOWS_TEST_SERVER_MUTEX_NAME)
+        .encode_wide()
+        .collect();
+    name.push(0);
+    name
+}
 
-        let handle = unsafe { CreateSemaphoreW(std::ptr::null(), 1, 1, name.as_ptr()) };
-        if handle.is_null() {
-            return Err(std::io::Error::last_os_error().into());
+#[cfg(windows)]
+fn acquire_windows_suite_server_mutex_handle() -> TestResult<usize> {
+    let name = windows_suite_server_mutex_name_wide();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    if handle.is_null() {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+    if wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED {
+        unsafe {
+            CloseHandle(handle);
         }
+        return Err(std::io::Error::other(format!("unexpected mutex wait result: {wait}")).into());
+    }
 
-        let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
-        if wait != WAIT_OBJECT_0 {
-            unsafe {
-                CloseHandle(handle);
+    Ok(handle as usize)
+}
+
+#[cfg(windows)]
+fn release_windows_suite_server_mutex_handle(handle: usize) {
+    let handle = handle as *mut std::ffi::c_void;
+    unsafe {
+        let _ = ReleaseMutex(handle);
+        let _ = CloseHandle(handle);
+    }
+}
+
+#[cfg(windows)]
+fn close_windows_suite_server_mutex_handle(handle: usize) {
+    let handle = handle as *mut std::ffi::c_void;
+    unsafe {
+        let _ = CloseHandle(handle);
+    }
+}
+
+#[cfg(windows)]
+impl WindowsSuiteServerMutexOwner {
+    fn start() -> TestResult<Self> {
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let join_handle = std::thread::spawn(move || {
+            let handle = match acquire_windows_suite_server_mutex_handle() {
+                Ok(handle) => handle,
+                Err(err) => {
+                    let _ = ready_tx.send(Err(err));
+                    return;
+                }
+            };
+            if ready_tx.send(Ok(())).is_err() {
+                release_windows_suite_server_mutex_handle(handle);
+                return;
             }
-            return Err(
-                std::io::Error::other(format!("unexpected semaphore wait result: {wait}")).into(),
-            );
-        }
+            let _ = release_rx.recv();
+            release_windows_suite_server_mutex_handle(handle);
+        });
+
+        ready_rx.recv().map_err(|_| {
+            std::io::Error::other("suite lock owner thread exited before acquiring")
+        })??;
+
         Ok(Self {
-            handle: handle as usize,
+            release_tx,
+            join_handle,
         })
     }
+
+    fn release(self) {
+        let _ = self.release_tx.send(());
+        let _ = self.join_handle.join();
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn acquire_suite_server_lock_handle_for_tests() -> TestResult<usize> {
+    acquire_windows_suite_server_mutex_handle()
+}
+
+#[cfg(windows)]
+pub(crate) fn release_suite_server_lock_handle_for_tests(handle: usize) {
+    release_windows_suite_server_mutex_handle(handle);
+}
+
+#[cfg(windows)]
+pub(crate) fn close_suite_server_lock_handle_for_tests(handle: usize) {
+    close_windows_suite_server_mutex_handle(handle);
 }
 
 #[cfg(windows)]
 fn windows_suite_server_lock_state() -> &'static Mutex<WindowsSuiteServerLockState> {
     static STATE: OnceLock<Mutex<WindowsSuiteServerLockState>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(WindowsSuiteServerLockState::default()))
-}
-
-#[cfg(windows)]
-impl Drop for WindowsSuiteServerSemaphore {
-    fn drop(&mut self) {
-        let handle = self.handle as *mut std::ffi::c_void;
-        unsafe {
-            let _ = ReleaseSemaphore(handle, 1, std::ptr::null_mut());
-            let _ = CloseHandle(handle);
-        }
-    }
 }
 
 #[cfg(windows)]
@@ -101,13 +160,19 @@ pub(crate) struct SuiteServerLockToken;
 
 #[cfg(windows)]
 fn acquire_suite_server_lock() -> TestResult<SuiteServerLockToken> {
+    let mut owner_to_release = None;
     let mut state = windows_suite_server_lock_state()
         .lock()
         .map_err(|_| std::io::Error::other("windows suite server lock mutex poisoned"))?;
     if state.local_refcount == 0 {
-        state.semaphore = Some(WindowsSuiteServerSemaphore::acquire()?);
+        owner_to_release = state.owner.take();
+        state.owner = Some(WindowsSuiteServerMutexOwner::start()?);
     }
     state.local_refcount += 1;
+    drop(state);
+    if let Some(owner) = owner_to_release {
+        owner.release();
+    }
     Ok(SuiteServerLockToken)
 }
 
@@ -124,7 +189,7 @@ pub(crate) fn acquire_suite_server_lock_for_tests() -> TestResult<SuiteServerLoc
 #[cfg(windows)]
 impl Drop for SuiteServerLockToken {
     fn drop(&mut self) {
-        let semaphore = {
+        let owner = {
             let mut state = windows_suite_server_lock_state()
                 .lock()
                 .expect("windows suite server lock mutex poisoned");
@@ -133,12 +198,14 @@ impl Drop for SuiteServerLockToken {
             }
             state.local_refcount -= 1;
             if state.local_refcount == 0 {
-                state.semaphore.take()
+                state.owner.take()
             } else {
                 None
             }
         };
-        drop(semaphore);
+        if let Some(owner) = owner {
+            owner.release();
+        }
     }
 }
 
