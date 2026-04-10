@@ -195,8 +195,6 @@ fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) {
 }
 
 const REQUEST_END_FALLBACK_WAIT: Duration = Duration::from_millis(20);
-const PRIMARY_REPL_PROMPTS: &[&str] = &["> ", ">>> "];
-
 fn driver_wait_for_completion(
     timeout: Duration,
     ipc: ServerIpcConnection,
@@ -221,9 +219,6 @@ fn driver_wait_for_completion(
                 if ipc.waiting_for_next_input(REQUEST_END_FALLBACK_WAIT)
                     && ipc.try_take_request_end()
                 {
-                    return Ok(completion_info_from_ipc(&ipc, false));
-                }
-                if ipc.waiting_for_primary_prompt(REQUEST_END_FALLBACK_WAIT, PRIMARY_REPL_PROMPTS) {
                     return Ok(completion_info_from_ipc(&ipc, false));
                 }
                 continue;
@@ -5728,27 +5723,37 @@ mod tests {
     }
 
     #[test]
-    fn completion_falls_back_to_primary_prompt_when_request_end_is_missing() {
+    fn completion_waits_for_request_end_when_primary_prompt_reappears() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
-        driver_on_input_start("1+1", &server);
+        driver_on_input_start("value <- readline(prompt = \"> \")", &server);
         let prompt = "> ".to_string();
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
             prompt: prompt.clone(),
-            line: "1+1\n".to_string(),
+            line: "value <- readline(prompt = \"> \")\n".to_string(),
         });
         let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
             prompt: prompt.clone(),
         });
 
+        let result = driver_wait_for_completion(Duration::from_millis(75), server.clone());
+        assert!(
+            matches!(result, Err(WorkerError::Timeout(_))),
+            "expected timeout before request-end when a nested prompt reuses the primary prompt text"
+        );
+
+        let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
         let completion = driver_wait_for_completion(Duration::from_millis(200), server)
-            .expect("expected completion after the primary prompt fallback");
+            .expect("expected completion after request-end");
         assert_eq!(completion.prompt.as_deref(), Some("> "));
         assert_eq!(completion.echo_events.len(), 1);
         assert_eq!(completion.echo_events[0].prompt, "> ");
-        assert_eq!(completion.echo_events[0].line, "1+1\n");
+        assert_eq!(
+            completion.echo_events[0].line,
+            "value <- readline(prompt = \"> \")\n"
+        );
     }
 
     #[test]

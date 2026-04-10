@@ -391,25 +391,6 @@ impl ServerIpcConnection {
         since.elapsed() >= min_wait
     }
 
-    pub fn waiting_for_primary_prompt(&self, min_wait: Duration, primary_prompts: &[&str]) -> bool {
-        let guard = self.inbox.lock().unwrap();
-        if guard.readline_result_count == 0 || guard.readline_unmatched_starts == 0 {
-            return false;
-        }
-        let Some(since) = guard.readline_unmatched_since else {
-            return false;
-        };
-        if since.elapsed() < min_wait {
-            return false;
-        }
-
-        guard
-            .last_prompt
-            .as_deref()
-            .or_else(|| guard.prompt_history.back().map(String::as_str))
-            .is_some_and(|prompt| primary_prompts.contains(&prompt))
-    }
-
     pub fn take_prompt_history(&self) -> Vec<String> {
         let mut guard = self.inbox.lock().unwrap();
         guard.prompt_history.drain(..).collect()

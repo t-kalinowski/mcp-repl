@@ -6,11 +6,7 @@ use std::pin::Pin;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
 #[cfg(windows)]
-use std::{
-    ffi::OsStr,
-    os::windows::ffi::OsStrExt,
-    sync::{Mutex, OnceLock},
-};
+use std::{ffi::OsStr, os::windows::ffi::OsStrExt};
 
 use regex_lite::Regex;
 use rmcp::ServiceExt;
@@ -83,59 +79,29 @@ impl Drop for WindowsSuiteServerSemaphore {
 }
 
 #[cfg(windows)]
-#[derive(Default)]
-struct WindowsSuiteServerSemaphoreState {
-    refs: usize,
-    guard: Option<WindowsSuiteServerSemaphore>,
-}
-
-#[cfg(windows)]
-fn windows_suite_server_semaphore_state() -> &'static Mutex<WindowsSuiteServerSemaphoreState> {
-    static STATE: OnceLock<Mutex<WindowsSuiteServerSemaphoreState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(WindowsSuiteServerSemaphoreState::default()))
-}
-
-#[cfg(windows)]
-struct SuiteServerLockToken;
+pub(crate) struct SuiteServerLockToken(WindowsSuiteServerSemaphore);
 
 #[cfg(not(windows))]
-struct SuiteServerLockToken;
+pub(crate) struct SuiteServerLockToken;
 
 #[cfg(windows)]
 fn acquire_suite_server_lock() -> TestResult<SuiteServerLockToken> {
-    let state = windows_suite_server_semaphore_state();
-    let mut guard = match state.lock() {
-        Ok(guard) => guard,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if guard.refs == 0 {
-        guard.guard = Some(WindowsSuiteServerSemaphore::acquire()?);
-    }
-    guard.refs = guard.refs.saturating_add(1);
-    Ok(SuiteServerLockToken)
+    WindowsSuiteServerSemaphore::acquire().map(SuiteServerLockToken)
 }
 
 #[cfg(not(windows))]
 fn acquire_suite_server_lock() -> TestResult<SuiteServerLockToken> {
     Ok(SuiteServerLockToken)
+}
+
+#[cfg(windows)]
+pub(crate) fn acquire_suite_server_lock_for_tests() -> TestResult<SuiteServerLockToken> {
+    acquire_suite_server_lock()
 }
 
 #[cfg(windows)]
 impl Drop for SuiteServerLockToken {
-    fn drop(&mut self) {
-        let state = windows_suite_server_semaphore_state();
-        let mut guard = match state.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if guard.refs == 0 {
-            return;
-        }
-        guard.refs -= 1;
-        if guard.refs == 0 {
-            guard.guard = None;
-        }
-    }
+    fn drop(&mut self) {}
 }
 
 #[cfg(not(windows))]
