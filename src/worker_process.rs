@@ -195,6 +195,7 @@ fn driver_on_input_start(_text: &str, ipc: &ServerIpcConnection) {
 }
 
 const REQUEST_END_FALLBACK_WAIT: Duration = Duration::from_millis(20);
+const PRIMARY_REPL_PROMPTS: &[&str] = &["> ", ">>> "];
 
 fn driver_wait_for_completion(
     timeout: Duration,
@@ -220,6 +221,9 @@ fn driver_wait_for_completion(
                 if ipc.waiting_for_next_input(REQUEST_END_FALLBACK_WAIT)
                     && ipc.try_take_request_end()
                 {
+                    return Ok(completion_info_from_ipc(&ipc, false));
+                }
+                if ipc.waiting_for_primary_prompt(REQUEST_END_FALLBACK_WAIT, PRIMARY_REPL_PROMPTS) {
                     return Ok(completion_info_from_ipc(&ipc, false));
                 }
                 continue;
@@ -5724,7 +5728,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_waits_for_request_end_event() {
+    fn completion_falls_back_to_primary_prompt_when_request_end_is_missing() {
         let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
         driver_on_input_start("1+1", &server);
         let prompt = "> ".to_string();
@@ -5739,16 +5743,39 @@ mod tests {
             prompt: prompt.clone(),
         });
 
+        let completion = driver_wait_for_completion(Duration::from_millis(200), server)
+            .expect("expected completion after the primary prompt fallback");
+        assert_eq!(completion.prompt.as_deref(), Some("> "));
+        assert_eq!(completion.echo_events.len(), 1);
+        assert_eq!(completion.echo_events[0].prompt, "> ");
+        assert_eq!(completion.echo_events[0].line, "1+1\n");
+    }
+
+    #[test]
+    fn completion_still_waits_when_only_continuation_prompt_arrives() {
+        let (server, worker) = crate::ipc::test_connection_pair().expect("ipc pair");
+        driver_on_input_start("1+\n1", &server);
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "> ".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineResult {
+            prompt: "> ".to_string(),
+            line: "1+\n".to_string(),
+        });
+        let _ = worker.send(WorkerToServerIpcMessage::ReadlineStart {
+            prompt: "+ ".to_string(),
+        });
+
         let result = driver_wait_for_completion(Duration::from_millis(75), server.clone());
         assert!(
             matches!(result, Err(WorkerError::Timeout(_))),
-            "expected timeout before request-end"
+            "expected timeout before request-end when only a continuation prompt is visible"
         );
 
         let _ = worker.send(WorkerToServerIpcMessage::RequestEnd);
         let completion = driver_wait_for_completion(Duration::from_millis(200), server)
             .expect("expected completion after request-end");
-        assert_eq!(completion.prompt.as_deref(), Some("> "));
+        assert_eq!(completion.prompt.as_deref(), Some("+ "));
     }
 
     #[test]

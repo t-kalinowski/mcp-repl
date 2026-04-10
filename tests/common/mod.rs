@@ -5,6 +5,12 @@ use std::path::PathBuf;
 use std::pin::Pin;
 #[cfg(target_os = "macos")]
 use std::sync::OnceLock;
+#[cfg(windows)]
+use std::{
+    ffi::OsStr,
+    os::windows::ffi::OsStrExt,
+    sync::{Mutex, OnceLock},
+};
 
 use regex_lite::Regex;
 use rmcp::ServiceExt;
@@ -18,12 +24,124 @@ use rmcp::transport::{ConfigureCommandExt, TokioChildProcess};
 use serde::Serialize;
 use serde_json::{Value, json};
 use tokio::process::Command;
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{CloseHandle, WAIT_OBJECT_0},
+    System::Threading::{CreateSemaphoreW, INFINITE, ReleaseSemaphore, WaitForSingleObject},
+};
 
 pub type TestResult<T> = Result<T, Box<dyn Error + Send + Sync>>;
 
 const TEST_PAGER_PAGE_CHARS: u64 = 300;
 #[cfg(windows)]
 const WINDOWS_TEST_TIMEOUT_CAP_SECS: f64 = 60.0;
+#[cfg(windows)]
+const WINDOWS_TEST_SERVER_SEMAPHORE_NAME: &str = "Local\\mcp_repl_test_server_semaphore";
+
+#[cfg(windows)]
+struct WindowsSuiteServerSemaphore {
+    handle: usize,
+}
+
+#[cfg(windows)]
+impl WindowsSuiteServerSemaphore {
+    fn acquire() -> TestResult<Self> {
+        let mut name: Vec<u16> = OsStr::new(WINDOWS_TEST_SERVER_SEMAPHORE_NAME)
+            .encode_wide()
+            .collect();
+        name.push(0);
+
+        let handle = unsafe { CreateSemaphoreW(std::ptr::null(), 1, 1, name.as_ptr()) };
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error().into());
+        }
+
+        let wait = unsafe { WaitForSingleObject(handle, INFINITE) };
+        if wait != WAIT_OBJECT_0 {
+            unsafe {
+                CloseHandle(handle);
+            }
+            return Err(
+                std::io::Error::other(format!("unexpected semaphore wait result: {wait}")).into(),
+            );
+        }
+        Ok(Self {
+            handle: handle as usize,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsSuiteServerSemaphore {
+    fn drop(&mut self) {
+        let handle = self.handle as *mut std::ffi::c_void;
+        unsafe {
+            let _ = ReleaseSemaphore(handle, 1, std::ptr::null_mut());
+            let _ = CloseHandle(handle);
+        }
+    }
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct WindowsSuiteServerSemaphoreState {
+    refs: usize,
+    guard: Option<WindowsSuiteServerSemaphore>,
+}
+
+#[cfg(windows)]
+fn windows_suite_server_semaphore_state() -> &'static Mutex<WindowsSuiteServerSemaphoreState> {
+    static STATE: OnceLock<Mutex<WindowsSuiteServerSemaphoreState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(WindowsSuiteServerSemaphoreState::default()))
+}
+
+#[cfg(windows)]
+struct SuiteServerLockToken;
+
+#[cfg(not(windows))]
+struct SuiteServerLockToken;
+
+#[cfg(windows)]
+fn acquire_suite_server_lock() -> TestResult<SuiteServerLockToken> {
+    let state = windows_suite_server_semaphore_state();
+    let mut guard = match state.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard.refs == 0 {
+        guard.guard = Some(WindowsSuiteServerSemaphore::acquire()?);
+    }
+    guard.refs = guard.refs.saturating_add(1);
+    Ok(SuiteServerLockToken)
+}
+
+#[cfg(not(windows))]
+fn acquire_suite_server_lock() -> TestResult<SuiteServerLockToken> {
+    Ok(SuiteServerLockToken)
+}
+
+#[cfg(windows)]
+impl Drop for SuiteServerLockToken {
+    fn drop(&mut self) {
+        let state = windows_suite_server_semaphore_state();
+        let mut guard = match state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if guard.refs == 0 {
+            return;
+        }
+        guard.refs -= 1;
+        if guard.refs == 0 {
+            guard.guard = None;
+        }
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for SuiteServerLockToken {
+    fn drop(&mut self) {}
+}
 
 #[cfg(target_os = "macos")]
 pub fn sandbox_exec_available() -> bool {
@@ -326,6 +444,7 @@ pub struct McpTestSession {
     steps: Vec<SnapshotStep>,
     server_pid: Option<u32>,
     backend: TestBackend,
+    _suite_lock: SuiteServerLockToken,
 }
 
 impl McpTestSession {
@@ -1032,6 +1151,7 @@ pub async fn spawn_server_with_args_env(
     args: Vec<String>,
     env_vars: Vec<(String, String)>,
 ) -> TestResult<McpTestSession> {
+    let suite_lock = acquire_suite_server_lock()?;
     let exe = resolve_server_path()?;
     let env_vars = env_vars.clone();
     let backend = parse_backend_from_args(&args);
@@ -1063,6 +1183,7 @@ pub async fn spawn_server_with_args_env(
         steps: Vec::new(),
         server_pid,
         backend,
+        _suite_lock: suite_lock,
     })
 }
 
