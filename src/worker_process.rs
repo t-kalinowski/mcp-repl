@@ -4070,6 +4070,19 @@ fn prefix_worker_reply(prefix: WorkerReply, suffix: WorkerReply) -> WorkerReply 
     if let Some(prompt_text) = prompt.as_deref() {
         strip_trailing_prompt(&mut contents, prompt_text);
     }
+    if let Some(WorkerContent::ContentText {
+        text: prefix_text, ..
+    }) = contents.last_mut()
+        && let Some(WorkerContent::ContentText {
+            text: suffix_text, ..
+        }) = suffix_contents.first()
+        && !prefix_text.is_empty()
+        && !suffix_text.is_empty()
+        && !prefix_text.ends_with('\n')
+        && !suffix_text.starts_with('\n')
+    {
+        prefix_text.push('\n');
+    }
     contents.extend(suffix_contents);
     WorkerReply::Output {
         contents,

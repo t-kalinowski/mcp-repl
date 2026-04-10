@@ -286,3 +286,30 @@ async fn pager_ctrl_d_prefix_preserves_restart_notice() -> TestResult<()> {
     session.cancel().await?;
     Ok(())
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ctrl_d_prefix_in_files_mode_separates_restart_notice_from_output() -> TestResult<()> {
+    let mut session = common::spawn_server_with_files().await?;
+
+    let result = session
+        .write_stdin_raw_with("\u{4}cat('AFTER_RESET\\n')", Some(10.0))
+        .await?;
+    let text = result_text(&result);
+    if backend_unavailable(&text) {
+        eprintln!("interrupt test backend unavailable in this environment; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    if is_busy_response(&text) || text.contains("worker exited with status") {
+        eprintln!("restart prefix in files mode did not complete in time; skipping");
+        session.cancel().await?;
+        return Ok(());
+    }
+    assert!(
+        text.contains("[repl] new session started\nAFTER_RESET"),
+        "expected ctrl-d files reply to preserve a newline between restart notice and output, got: {text:?}"
+    );
+
+    session.cancel().await?;
+    Ok(())
+}
