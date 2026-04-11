@@ -4,6 +4,8 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::collections::HashSet;
+#[cfg(test)]
+use std::convert::Infallible;
 use std::ffi::OsStr;
 use std::ffi::c_void;
 use std::fs::File;
@@ -260,6 +262,16 @@ struct WrapperWriteGuard<'a> {
     write_in_progress: &'a AtomicBool,
 }
 
+#[cfg(test)]
+pub(crate) struct SandboxLaunchTestMutex {
+    inner: Mutex<()>,
+}
+
+#[cfg(test)]
+pub(crate) struct SandboxLaunchTestMutexGuard<'a> {
+    _guard: std::sync::MutexGuard<'a, ()>,
+}
+
 impl Drop for WrapperWriteGuard<'_> {
     fn drop(&mut self) {
         self.write_in_progress.store(false, Ordering::Release);
@@ -276,9 +288,47 @@ impl Drop for PreparedLaunchAclLock {
 }
 
 #[cfg(test)]
-pub(crate) fn prepare_sandbox_launch_test_mutex() -> &'static Mutex<()> {
-    static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
-    TEST_MUTEX.get_or_init(|| Mutex::new(()))
+fn clear_windows_sandbox_test_state() {
+    PREPARE_SANDBOX_LAUNCH_TEST_ERROR.with(|slot| *slot.borrow_mut() = None);
+    APPLY_PREPARED_LAUNCH_ACL_STATE_TEST_ERROR.with(|slot| *slot.borrow_mut() = None);
+    ADD_DENY_WRITE_ACE_TEST_ERROR.with(|slot| *slot.borrow_mut() = None);
+    PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_TEST_ERROR.with(|slot| *slot.borrow_mut() = None);
+    PREPARED_LAUNCH_ALLOW_TARGETS_READ_DIR_CALLS.with(|slot| slot.borrow_mut().clear());
+    PREPARED_LAUNCH_DENY_TARGET_PRE_APPLY_DELETE.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[cfg(test)]
+impl SandboxLaunchTestMutex {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(()),
+        }
+    }
+
+    pub(crate) fn lock(&self) -> Result<SandboxLaunchTestMutexGuard<'_>, Infallible> {
+        let guard = match self.inner.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                self.inner.clear_poison();
+                poisoned.into_inner()
+            }
+        };
+        clear_windows_sandbox_test_state();
+        Ok(SandboxLaunchTestMutexGuard { _guard: guard })
+    }
+}
+
+#[cfg(test)]
+impl Drop for SandboxLaunchTestMutexGuard<'_> {
+    fn drop(&mut self) {
+        clear_windows_sandbox_test_state();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn prepare_sandbox_launch_test_mutex() -> &'static SandboxLaunchTestMutex {
+    static TEST_MUTEX: OnceLock<SandboxLaunchTestMutex> = OnceLock::new();
+    TEST_MUTEX.get_or_init(SandboxLaunchTestMutex::new)
 }
 
 #[cfg(test)]
@@ -5472,6 +5522,57 @@ mod tests {
             revoke_capability_sid_paths(
                 &prepared_sid,
                 &[cwd.as_path(), nested.as_path(), session_temp_dir.as_path()],
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_launch_test_mutex_recovers_after_panic_and_clears_hook_state() {
+        let _ = std::panic::catch_unwind(|| {
+            let _guard = prepare_sandbox_launch_test_mutex()
+                .lock()
+                .expect("windows sandbox test mutex");
+            set_apply_prepared_launch_acl_state_test_error(Some(
+                "leaked test hook should be cleared after panic".to_string(),
+            ));
+            panic!("intentional panic to simulate an earlier test failure");
+        });
+
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex should recover after panic");
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let session_temp_dir = tmp.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared_sid = stable_cap_sid_string(&policy, &cwd);
+        let result = unsafe {
+            let sid = convert_string_sid_to_sid(&prepared_sid)
+                .expect("prepared capability SID should convert");
+            let result = refresh_runtime_prepared_launch_acl_state(
+                &policy,
+                &cwd,
+                &session_temp_dir,
+                &prepared_sid,
+                sid,
+            );
+            LocalFree(sid as HLOCAL);
+            result
+        };
+
+        assert!(
+            result.is_ok(),
+            "poison recovery should also clear leaked test hooks before the next test, got: {result:?}"
+        );
+
+        unsafe {
+            revoke_capability_sid_paths(
+                &prepared_sid,
+                &[cwd.as_path(), session_temp_dir.as_path()],
             );
         }
     }
