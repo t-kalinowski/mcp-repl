@@ -1417,6 +1417,66 @@ fn windows_canonicalize_or_identity(path: &std::path::Path) -> PathBuf {
 }
 
 #[cfg(target_os = "windows")]
+fn windows_lexically_normalize_path(path: &std::path::Path) -> PathBuf {
+    use std::ffi::OsString;
+    use std::path::Component;
+
+    let mut prefix: Option<OsString> = None;
+    let mut has_root = false;
+    let mut leading_parents: Vec<OsString> = Vec::new();
+    let mut segments: Vec<OsString> = Vec::new();
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(value) => prefix = Some(value.as_os_str().to_os_string()),
+            Component::RootDir => has_root = true,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !segments.is_empty() {
+                    segments.pop();
+                } else if !has_root {
+                    leading_parents.push(component.as_os_str().to_os_string());
+                }
+            }
+            Component::Normal(part) => segments.push(part.to_os_string()),
+        }
+    }
+
+    let mut normalized = PathBuf::new();
+    if let Some(prefix) = prefix {
+        normalized.push(prefix);
+    }
+    if has_root {
+        normalized.push(std::path::Path::new(r"\"));
+    }
+    for parent in leading_parents {
+        normalized.push(parent);
+    }
+    for segment in segments {
+        normalized.push(segment);
+    }
+    normalized
+}
+
+#[cfg(target_os = "windows")]
+fn windows_canonicalize_or_normalize_stable_sid_path(path: &std::path::Path) -> PathBuf {
+    let normalized = windows_lexically_normalize_path(path);
+    if let Ok(canonical) = std::fs::canonicalize(&normalized) {
+        return canonical;
+    }
+
+    for ancestor in normalized.ancestors().skip(1) {
+        if let Ok(canonical_ancestor) = std::fs::canonicalize(ancestor)
+            && let Ok(suffix) = normalized.strip_prefix(ancestor)
+        {
+            return canonical_ancestor.join(suffix);
+        }
+    }
+
+    normalized
+}
+
+#[cfg(target_os = "windows")]
 fn windows_stable_sid_seed_path_buf(path: PathBuf) -> String {
     let path = path.to_string_lossy();
     if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
@@ -1436,7 +1496,7 @@ fn windows_stable_sid_seed_path_buf(path: PathBuf) -> String {
 
 #[cfg(target_os = "windows")]
 fn windows_stable_sid_seed_path(path: &std::path::Path) -> String {
-    windows_stable_sid_seed_path_buf(windows_canonicalize_or_identity(path))
+    windows_stable_sid_seed_path_buf(windows_canonicalize_or_normalize_stable_sid_path(path))
 }
 
 #[cfg(target_os = "windows")]
@@ -2226,6 +2286,64 @@ cat("WRITE_OK=", file.exists(target), "\n", sep = "")
     assert!(
         before_cancel.contains(&expected_stable_sid),
         "expected a direct file created under a writable root to retain the stable prepared SID {expected_stable_sid}, got: {before_cancel:?}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_workspace_write_first_launch_accepts_missing_writable_root_parent_segment()
+-> TestResult<()> {
+    let writable_root_parent = tempfile::tempdir()?;
+    let actual_root = writable_root_parent.path().join("out");
+    let declared_root = writable_root_parent
+        .path()
+        .join("child")
+        .join("..")
+        .join("out");
+    let artifact = actual_root.join(format!(
+        "mcp-repl-sandbox-missing-parent-segment-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let artifact_r = r_string(&artifact.to_string_lossy());
+    scrub_unresolved_windows_sid_aces(writable_root_parent.path())?;
+    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write_with_roots(
+        false,
+        vec![declared_root],
+    ))
+    .await?;
+
+    let create_code = format!(
+        r#"
+target <- {artifact_r}
+tryCatch({{
+  writeLines("ok", target)
+  cat("WRITE_OK=", file.exists(target), "\n", sep = "")
+}}, error = function(e) {{
+  message("WRITE_ERROR:", conditionMessage(e))
+}})
+"#
+    );
+    let create = session
+        .write_stdin_raw_with(create_code, Some(10.0))
+        .await?;
+    let create_text = collect_text(&create);
+    if windows_sandbox_backend_unavailable(&create_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session.cancel().await?;
+        cleanup_restricted_file(&artifact);
+        return Ok(());
+    }
+
+    cleanup_restricted_file(&artifact);
+    session.cancel().await?;
+
+    assert!(
+        create_text.contains("WRITE_OK=TRUE"),
+        "expected first launch to accept a missing writable root spelled with parent segments, got: {create_text}"
     );
     Ok(())
 }

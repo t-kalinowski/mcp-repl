@@ -333,8 +333,68 @@ fn canonicalize_or_identity(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
+fn lexically_normalize_path(path: &Path) -> PathBuf {
+    use std::ffi::OsString;
+    use std::path::Component;
+
+    let mut prefix: Option<OsString> = None;
+    let mut has_root = false;
+    let mut leading_parents: Vec<OsString> = Vec::new();
+    let mut segments: Vec<OsString> = Vec::new();
+
+    for component in path.components() {
+        match component {
+            Component::Prefix(value) => prefix = Some(value.as_os_str().to_os_string()),
+            Component::RootDir => has_root = true,
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !segments.is_empty() {
+                    segments.pop();
+                } else if !has_root {
+                    leading_parents.push(component.as_os_str().to_os_string());
+                }
+            }
+            Component::Normal(part) => segments.push(part.to_os_string()),
+        }
+    }
+
+    let mut normalized = PathBuf::new();
+    if let Some(prefix) = prefix {
+        normalized.push(prefix);
+    }
+    if has_root {
+        normalized.push(Path::new(r"\"));
+    }
+    for parent in leading_parents {
+        normalized.push(parent);
+    }
+    for segment in segments {
+        normalized.push(segment);
+    }
+    normalized
+}
+
+// Canonicalize any existing prefix so junction targets still influence the SID even when the
+// leaf path has not been materialized yet.
+fn canonicalize_or_normalize_stable_sid_path(path: &Path) -> PathBuf {
+    let normalized = lexically_normalize_path(path);
+    if let Ok(canonical) = std::fs::canonicalize(&normalized) {
+        return canonical;
+    }
+
+    for ancestor in normalized.ancestors().skip(1) {
+        if let Ok(canonical_ancestor) = std::fs::canonicalize(ancestor)
+            && let Ok(suffix) = normalized.strip_prefix(ancestor)
+        {
+            return canonical_ancestor.join(suffix);
+        }
+    }
+
+    normalized
+}
+
 fn stable_sid_seed_path(path: &Path) -> String {
-    stable_sid_seed_path_buf(canonicalize_or_identity(path))
+    stable_sid_seed_path_buf(canonicalize_or_normalize_stable_sid_path(path))
 }
 
 fn stable_sid_seed_path_buf(path: PathBuf) -> String {
@@ -3867,6 +3927,26 @@ mod tests {
         assert!(
             resolved.is_ok(),
             "prepared SID should remain valid after a declared absolute writable root is created"
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn prepared_capability_sid_survives_late_created_absolute_writable_root_with_parent_segments() {
+        let tmp = tempdir().expect("tempdir");
+        let cwd = tmp.path().join("workspace");
+        let late_root = tmp.path().join("child").join("..").join("late-root");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+
+        let policy = workspace_policy(vec![late_root], false, false);
+        let prepared_sid = stable_cap_sid_string(&policy, &cwd);
+
+        std::fs::create_dir_all(tmp.path().join("late-root")).expect("late root dir");
+
+        let resolved = resolve_launch_capability_sids(&policy, &cwd, &prepared_sid);
+        assert!(
+            resolved.is_ok(),
+            "prepared SID should remain valid after parent-segment path normalization changes"
         );
     }
 
