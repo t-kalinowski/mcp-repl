@@ -9,7 +9,7 @@
 ## Status
 
 - State: active
-- Last updated: 2026-04-08
+- Last updated: 2026-04-11
 - Current phase: implementation
 
 ## Current Direction
@@ -71,3 +71,4 @@
 - 2026-04-11: The broader stdin ownership redesign remains tracked separately in `docs/futurework/stdin-transport-single-owner.md`. Keep that futurework item even when this branch intentionally avoids broader transport changes.
 - 2026-04-10: This branch stays Windows-only. Any friendlier cross-cutting launcher surface such as a `sandbox-exec` subcommand should be handled as a separate futurework item rather than folded into the Windows ACL refactor.
 - 2026-04-10: Keep the Windows fault-injection harness in a dedicated `src/windows_sandbox_test_support.rs` module so runtime ACL code and test-only state do not keep expanding the same file.
+- 2026-04-11: Prepared launches must keep the stable filesystem SID in the token default DACL and preserve a child-inheritance path for direct file creates under writable roots. Installing the root-local and inherit-only ACEs in one ACL update avoids Windows collapsing the root's direct allow ACE on newly materialized roots.

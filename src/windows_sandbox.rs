@@ -182,6 +182,14 @@ struct PreparedLaunchAclApply<'restores, 'guards> {
     acl_guards: &'guards mut Option<&'guards mut Vec<CapabilityAclGuard>>,
 }
 
+#[derive(Clone)]
+struct AllowAclTargetOptions {
+    scope: PreparedLaunchAllowScope,
+    inherit_children: bool,
+    add_inherit_only_allow_on_directories: bool,
+    skip_inherit_only_on_root: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedSandboxLaunch {
     policy: SandboxPolicy,
@@ -509,7 +517,10 @@ fn default_dacl_capability_sid_strings(capability_sids: &LaunchCapabilitySids) -
     if capability_sids.launch_sid == capability_sids.filesystem_sid {
         vec![capability_sids.filesystem_sid.as_str()]
     } else {
-        vec![capability_sids.launch_sid.as_str()]
+        vec![
+            capability_sids.filesystem_sid.as_str(),
+            capability_sids.launch_sid.as_str(),
+        ]
     }
 }
 
@@ -633,16 +644,16 @@ unsafe fn apply_allow_acl_targets(
     denied_roots: &[PathBuf],
     sid: *mut c_void,
     action: &str,
-    scope: PreparedLaunchAllowScope,
-    inherit_children: bool,
+    options: AllowAclTargetOptions,
     apply: &mut PreparedLaunchAclApply<'_, '_>,
 ) -> Result<(), String> {
     for path in allow_paths {
-        for target in prepared_launch_allow_targets(path, denied_roots, scope)? {
-            let track_dir_guard = apply.acl_guards.is_some()
-                && std::fs::symlink_metadata(&target)
-                    .map(|metadata| metadata.is_dir())
-                    .unwrap_or(false);
+        for target in prepared_launch_allow_targets(path, denied_roots, options.scope)? {
+            let add_inherit_only_companion = options.add_inherit_only_allow_on_directories
+                && options
+                    .skip_inherit_only_on_root
+                    .as_ref()
+                    .is_none_or(|skip_root| path != skip_root);
             let restore = match capture_prepared_launch_acl_restore_with_missing_policy(
                 &target,
                 CapabilityAclKind::Allow,
@@ -658,8 +669,18 @@ unsafe fn apply_allow_acl_targets(
                     ));
                 }
             };
-            match add_allow_ace_with_options(&target, sid, target == *path, inherit_children) {
+            match add_allow_ace_with_options_and_inherit_only_companion(
+                &target,
+                sid,
+                target == *path,
+                options.inherit_children,
+                add_inherit_only_companion,
+            ) {
                 Ok(changed) => {
+                    let target_is_dir = std::fs::symlink_metadata(&target)
+                        .map(|metadata| metadata.is_dir())
+                        .unwrap_or(false);
+                    let track_dir_guard = apply.acl_guards.is_some() && target_is_dir;
                     maybe_record_acl_guard(
                         apply.acl_guards,
                         changed,
@@ -814,8 +835,12 @@ unsafe fn apply_prepared_workspace_acl_state(
         &denied_roots,
         sid,
         action,
-        PreparedLaunchAllowScope::RootsOnly,
-        false,
+        AllowAclTargetOptions {
+            scope: PreparedLaunchAllowScope::RootsOnly,
+            inherit_children: false,
+            add_inherit_only_allow_on_directories: true,
+            skip_inherit_only_on_root: Some(canonicalize_or_identity(&launch.sandbox_policy_cwd)),
+        },
         &mut apply,
     )?;
     apply_deny_acl_targets(
@@ -848,8 +873,12 @@ unsafe fn apply_runtime_launch_acl_state(
         &denied_roots,
         sid,
         "apply launch",
-        PreparedLaunchAllowScope::Recursive,
-        true,
+        AllowAclTargetOptions {
+            scope: PreparedLaunchAllowScope::Recursive,
+            inherit_children: true,
+            add_inherit_only_allow_on_directories: false,
+            skip_inherit_only_on_root: None,
+        },
         &mut apply,
     )?;
     apply_deny_acl_targets(
@@ -1917,6 +1946,22 @@ unsafe fn add_allow_ace_with_options(
     materialize_missing_directory: bool,
     inherit_children: bool,
 ) -> Result<bool, String> {
+    add_allow_ace_with_options_and_inherit_only_companion(
+        path,
+        sid,
+        materialize_missing_directory,
+        inherit_children,
+        false,
+    )
+}
+
+unsafe fn add_allow_ace_with_options_and_inherit_only_companion(
+    path: &Path,
+    sid: *mut c_void,
+    materialize_missing_directory: bool,
+    inherit_children: bool,
+    add_inherit_only_companion: bool,
+) -> Result<bool, String> {
     if !path.exists() {
         if !materialize_missing_directory {
             return Ok(false);
@@ -1940,22 +1985,33 @@ unsafe fn add_allow_ace_with_options(
     if code != ERROR_SUCCESS {
         return Err(format!("GetNamedSecurityInfoW failed: {code}"));
     }
-    if dacl_has_allow_for_sid_with_inheritance(dacl, sid, inherit_children && path.is_dir()) {
+    let path_is_dir = path.is_dir();
+    let needs_direct_allow =
+        !dacl_has_allow_for_sid_with_inheritance(dacl, sid, inherit_children && path_is_dir);
+    let needs_inherit_only = add_inherit_only_companion
+        && path_is_dir
+        && !dacl_has_inherit_only_allow_for_sid(dacl, sid);
+    if !needs_direct_allow && !needs_inherit_only {
         if !security_descriptor.is_null() {
             LocalFree(security_descriptor as HLOCAL);
         }
         return Ok(false);
     }
-    if !inherit_children && path.is_dir() && dacl_has_allow_for_sid(dacl, sid, false) {
+    if needs_direct_allow
+        && !inherit_children
+        && path_is_dir
+        && dacl_has_allow_for_sid(dacl, sid, false)
+    {
         if !security_descriptor.is_null() {
             LocalFree(security_descriptor as HLOCAL);
         }
         revoke_ace_with_result(path, sid)?;
-        return add_allow_ace_with_options(
+        return add_allow_ace_with_options_and_inherit_only_companion(
             path,
             sid,
             materialize_missing_directory,
             inherit_children,
+            add_inherit_only_companion,
         );
     }
 
@@ -1966,18 +2022,34 @@ unsafe fn add_allow_ace_with_options(
         TrusteeType: TRUSTEE_IS_UNKNOWN,
         ptstrName: sid as *mut u16,
     };
-    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
-    explicit.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
-    explicit.grfAccessMode = GRANT_ACCESS;
-    explicit.grfInheritance = if inherit_children {
-        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
-    } else {
-        0
-    };
-    explicit.Trustee = trustee;
+    let mut entries: Vec<EXPLICIT_ACCESS_W> = Vec::new();
+    if needs_direct_allow {
+        let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+        explicit.grfAccessPermissions =
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+        explicit.grfAccessMode = GRANT_ACCESS;
+        explicit.grfInheritance = if inherit_children {
+            CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
+        } else {
+            0
+        };
+        explicit.Trustee = trustee;
+        entries.push(explicit);
+    }
+    if needs_inherit_only {
+        let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+        explicit.grfAccessPermissions =
+            FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+        explicit.grfAccessMode = GRANT_ACCESS;
+        explicit.grfInheritance =
+            CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE | u32::from(INHERIT_ONLY_ACE);
+        explicit.Trustee = trustee;
+        entries.push(explicit);
+    }
 
     let mut new_dacl: *mut ACL = std::ptr::null_mut();
-    let set_acl_code = SetEntriesInAclW(1, &explicit, dacl, &mut new_dacl);
+    let set_acl_code =
+        SetEntriesInAclW(entries.len() as u32, entries.as_ptr(), dacl, &mut new_dacl);
     if set_acl_code != ERROR_SUCCESS {
         if !security_descriptor.is_null() {
             LocalFree(security_descriptor as HLOCAL);
@@ -3906,7 +3978,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_launch_default_dacl_uses_only_launch_sid() {
+    fn prepared_launch_default_dacl_includes_filesystem_and_launch_sids() {
         let capability_sids = LaunchCapabilitySids {
             filesystem_sid: "S-1-5-21-1-2-3-4".to_string(),
             launch_sid: "S-1-5-21-5-6-7-8".to_string(),
@@ -3914,8 +3986,8 @@ mod tests {
 
         assert_eq!(
             default_dacl_capability_sid_strings(&capability_sids),
-            vec!["S-1-5-21-5-6-7-8"],
-            "prepared launches should keep the shared filesystem SID out of the token default DACL",
+            vec!["S-1-5-21-1-2-3-4", "S-1-5-21-5-6-7-8"],
+            "prepared launches should keep both the shared filesystem SID and per-launch SID in the token default DACL",
         );
     }
 
@@ -4494,6 +4566,10 @@ mod tests {
                 !path_has_inheritable_allow_ace(&extra_root, sid),
                 "stable refresh should restore writable roots with a non-inheriting allow ACE"
             );
+            assert!(
+                path_has_inherit_only_allow_ace(&extra_root, sid),
+                "stable refresh should restore writable roots with an inherit-only ACE for future children"
+            );
             LocalFree(sid as HLOCAL);
             revoke_capability_sid_paths(
                 prepared.capability_sid(),
@@ -4535,6 +4611,10 @@ mod tests {
             assert!(
                 !path_has_inheritable_allow_ace(&missing_root, sid),
                 "prepared writable roots should keep the stable allow ACE on the root only"
+            );
+            assert!(
+                path_has_inherit_only_allow_ace(&missing_root, sid),
+                "prepared writable roots should also add an inherit-only stable ACE for future children"
             );
             LocalFree(sid as HLOCAL);
             revoke_capability_sid_paths(
