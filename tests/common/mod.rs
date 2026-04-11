@@ -1198,6 +1198,15 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
     env_vars: Vec<(String, String)>,
     page_bytes: u64,
 ) -> TestResult<McpTestSession> {
+    spawn_server_with_args_env_and_cwd_and_pager_page_chars(args, env_vars, None, page_bytes).await
+}
+
+pub async fn spawn_server_with_args_env_and_cwd_and_pager_page_chars(
+    args: Vec<String>,
+    env_vars: Vec<(String, String)>,
+    cwd: Option<PathBuf>,
+    page_bytes: u64,
+) -> TestResult<McpTestSession> {
     let mut args = args;
     args.push("--oversized-output".to_string());
     args.push("pager".to_string());
@@ -1206,12 +1215,20 @@ pub async fn spawn_server_with_args_env_and_pager_page_chars(
         "MCP_REPL_PAGER_PAGE_CHARS".to_string(),
         page_bytes.to_string(),
     ));
-    spawn_server_with_args_env(args, env_vars).await
+    spawn_server_with_args_env_and_cwd(args, env_vars, cwd).await
 }
 
 pub async fn spawn_server_with_args_env(
     args: Vec<String>,
     env_vars: Vec<(String, String)>,
+) -> TestResult<McpTestSession> {
+    spawn_server_with_args_env_and_cwd(args, env_vars, None).await
+}
+
+pub async fn spawn_server_with_args_env_and_cwd(
+    args: Vec<String>,
+    env_vars: Vec<(String, String)>,
+    cwd: Option<PathBuf>,
 ) -> TestResult<McpTestSession> {
     let suite_lock = acquire_suite_server_lock()?;
     let exe = resolve_server_path()?;
@@ -1226,12 +1243,16 @@ pub async fn spawn_server_with_args_env(
         args.push("--sandbox".to_string());
         args.push("danger-full-access".to_string());
     }
+    let current_dir = cwd;
     let transport = TokioChildProcess::new(Command::new(exe).configure(|cmd| {
         cmd.env_remove("R_PROFILE_USER");
         cmd.env_remove("R_PROFILE_SITE");
         cmd.env_remove("R_ENVIRON");
         cmd.env_remove("R_ENVIRON_USER");
         cmd.env_remove("MCP_REPL_UPDATE_PLOT_IMAGES");
+        if let Some(cwd) = &current_dir {
+            cmd.current_dir(cwd);
+        }
         cmd.args(&args);
         for (key, value) in &env_vars {
             cmd.env(key, value);

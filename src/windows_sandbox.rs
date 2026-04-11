@@ -143,6 +143,7 @@ const REVOKE_ACCESS: i32 = 4;
 const CONTAINER_INHERIT_ACE: u32 = 0x2;
 const OBJECT_INHERIT_ACE: u32 = 0x1;
 const INHERIT_ONLY_ACE: u8 = 0x08;
+const INHERITED_ACE: u8 = 0x10;
 const WRAPPER_STDIO_DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const WRAPPER_STDIO_DRAIN_MAX_WAIT: Duration = Duration::from_secs(15);
 const WRAPPER_STDIO_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -163,6 +164,7 @@ enum CapabilityAclKind {
 enum PreparedLaunchAllowScope {
     Recursive,
     RootsOnly,
+    RootsAndDirectChildren,
 }
 
 struct CapabilityAclGuard {
@@ -820,6 +822,7 @@ unsafe fn apply_prepared_workspace_acl_state(
     launch: &PreparedSandboxLaunch,
     sid: *mut c_void,
     action: &str,
+    scope: PreparedLaunchAllowScope,
 ) -> Result<(), String> {
     maybe_fail_apply_prepared_launch_acl_state_test()?;
     let paths = prepared_launch_acl_paths(launch);
@@ -836,7 +839,7 @@ unsafe fn apply_prepared_workspace_acl_state(
         sid,
         action,
         AllowAclTargetOptions {
-            scope: PreparedLaunchAllowScope::RootsOnly,
+            scope,
             inherit_children: false,
             add_inherit_only_allow_on_directories: true,
             skip_inherit_only_on_root: Some(canonicalize_or_identity(&launch.sandbox_policy_cwd)),
@@ -929,10 +932,10 @@ fn prepared_launch_allow_targets(
 ) -> Result<Vec<PathBuf>, String> {
     let mut targets = Vec::new();
     let root_canonical = canonicalize_or_identity(root);
-    let mut stack = vec![root.to_path_buf()];
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
     let mut visited = HashSet::new();
 
-    while let Some(path) = stack.pop() {
+    while let Some((path, depth)) = stack.pop() {
         let canonical = canonicalize_or_identity(&path);
         if !canonical.starts_with(&root_canonical)
             || path_is_within_any_root(&canonical, denied_roots)
@@ -944,7 +947,9 @@ fn prepared_launch_allow_targets(
         }
 
         targets.push(path.clone());
-        if matches!(scope, PreparedLaunchAllowScope::RootsOnly) {
+        if matches!(scope, PreparedLaunchAllowScope::RootsOnly)
+            || matches!(scope, PreparedLaunchAllowScope::RootsAndDirectChildren if depth >= 1)
+        {
             continue;
         }
 
@@ -971,7 +976,7 @@ fn prepared_launch_allow_targets(
                 Ok(entry) => entry,
                 Err(_) => continue,
             };
-            stack.push(entry.path());
+            stack.push((entry.path(), depth + 1));
         }
     }
 
@@ -1031,7 +1036,12 @@ unsafe fn refresh_runtime_prepared_launch_acl_state(
         prepared_capability_sid,
     );
     let _acl_lock = acquire_prepared_launch_acl_lock(prepared_capability_sid)?;
-    apply_prepared_workspace_acl_state(&launch, sid, "refresh")?;
+    apply_prepared_workspace_acl_state(
+        &launch,
+        sid,
+        "refresh",
+        PreparedLaunchAllowScope::RootsAndDirectChildren,
+    )?;
     Ok(launch)
 }
 
@@ -1055,7 +1065,12 @@ pub fn prepare_sandbox_launch(
     unsafe {
         let psid_capability = convert_string_sid_to_sid(launch.capability_sid())
             .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
-        let apply_result = apply_prepared_workspace_acl_state(&launch, psid_capability, "prepare");
+        let apply_result = apply_prepared_workspace_acl_state(
+            &launch,
+            psid_capability,
+            "prepare",
+            PreparedLaunchAllowScope::RootsOnly,
+        );
         LocalFree(psid_capability as HLOCAL);
         apply_result?;
     }
@@ -1070,7 +1085,12 @@ pub fn refresh_prepared_sandbox_launch_acl_state(
     unsafe {
         let psid_capability = convert_string_sid_to_sid(launch.capability_sid())
             .ok_or_else(|| "ConvertStringSidToSidW failed for capability SID".to_string())?;
-        let refresh_result = apply_prepared_workspace_acl_state(launch, psid_capability, "refresh");
+        let refresh_result = apply_prepared_workspace_acl_state(
+            launch,
+            psid_capability,
+            "refresh",
+            PreparedLaunchAllowScope::RootsAndDirectChildren,
+        );
         LocalFree(psid_capability as HLOCAL);
         refresh_result
     }
@@ -2000,7 +2020,7 @@ unsafe fn add_allow_ace_with_options_and_inherit_only_companion(
     if needs_direct_allow
         && !inherit_children
         && path_is_dir
-        && dacl_has_allow_for_sid(dacl, sid, false)
+        && dacl_has_explicit_allow_for_sid(dacl, sid, false)
     {
         if !security_descriptor.is_null() {
             LocalFree(security_descriptor as HLOCAL);
@@ -2100,7 +2120,7 @@ unsafe fn add_inherit_only_allow_ace(path: &Path, sid: *mut c_void) -> Result<bo
         }
         return Ok(false);
     }
-    if dacl_has_allow_for_sid(dacl, sid, false) {
+    if dacl_has_explicit_allow_for_sid(dacl, sid, false) {
         if !security_descriptor.is_null() {
             LocalFree(security_descriptor as HLOCAL);
         }
@@ -2293,6 +2313,7 @@ fn ace_has_container_and_object_inheritance(ace_flags: u8) -> bool {
         && (ace_flags & (OBJECT_INHERIT_ACE as u8)) != 0
 }
 
+#[cfg(test)]
 unsafe fn dacl_has_allow_for_sid(
     dacl: *mut ACL,
     sid: *mut c_void,
@@ -2308,6 +2329,36 @@ unsafe fn dacl_has_allow_for_sid(
         }
         let header = &*(ace as *const ACE_HEADER);
         if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+            continue;
+        }
+        let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+        if EqualSid(ace_sid_ptr(ace), sid) != 0
+            && allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, require_inheritance)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn dacl_has_explicit_allow_for_sid(
+    dacl: *mut ACL,
+    sid: *mut c_void,
+    require_inheritance: bool,
+) -> bool {
+    let Some(info) = dacl_size_info(dacl) else {
+        return false;
+    };
+    for index in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+            continue;
+        }
+        let header = &*(ace as *const ACE_HEADER);
+        if header.AceType != 0
+            || (header.AceFlags & INHERIT_ONLY_ACE) != 0
+            || (header.AceFlags & INHERITED_ACE) != 0
+        {
             continue;
         }
         let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
@@ -4629,6 +4680,55 @@ mod tests {
     }
 
     #[test]
+    fn prepared_launch_refresh_reapplies_allow_acl_to_late_created_workspace_root_child() {
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let root_child = cwd.join("artifact.txt");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+        std::fs::write(&root_child, b"artifact").expect("late-created root child");
+        refresh_prepared_sandbox_launch_acl_state(&prepared)
+            .expect("refresh prepared launch ACL state");
+
+        unsafe {
+            let sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("capability SID should convert");
+            assert!(
+                path_has_any_allow_ace(&cwd, sid),
+                "prepare should apply allow ACEs to the primary workspace root"
+            );
+            assert!(
+                !path_has_inheritable_allow_ace(&cwd, sid),
+                "prepared workspace roots should keep the stable allow ACE on the root only"
+            );
+            assert!(
+                !path_has_inherit_only_allow_ace(&cwd, sid),
+                "workspace roots should avoid inheriting the stable allow ACE onto brand-new root children"
+            );
+            assert!(
+                path_has_allow_ace(&root_child, sid),
+                "refresh should reapply the stable allow ACE to late-created root children that remain in the workspace"
+            );
+            LocalFree(sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    root_child.as_path(),
+                    session_temp_dir.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
     fn prepared_launch_refresh_applies_deny_acl_to_late_created_protected_dir() {
         let workspace = prepared_launch_workspace_tempdir();
         let session_root = tempdir().expect("session temp root");
@@ -4670,7 +4770,7 @@ mod tests {
         let cwd = workspace.path().join("workspace");
         let git_dir = cwd.join(".git");
         let session_temp_dir = session_root.path().join("session-temp");
-        let source_file = cwd.join("artifact.txt");
+        let source_file = session_temp_dir.join("artifact.txt");
         let moved_file = git_dir.join("artifact.txt");
         std::fs::create_dir_all(&cwd).expect("workspace dir");
         crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
@@ -4681,7 +4781,7 @@ mod tests {
             prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
 
         std::fs::create_dir_all(&git_dir).expect("create git dir after prepare");
-        std::fs::write(&source_file, b"artifact").expect("workspace artifact file");
+        std::fs::write(&source_file, b"artifact").expect("temp artifact file");
         std::fs::rename(&source_file, &moved_file).expect("move artifact into protected dir");
 
         unsafe {
@@ -5341,7 +5441,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_launch_runtime_refresh_does_not_walk_writable_root_descendants() {
+    fn prepared_launch_runtime_refresh_scans_only_direct_writable_root_children() {
         let _guard = prepare_sandbox_launch_test_mutex()
             .lock()
             .expect("windows sandbox test mutex");
@@ -5377,9 +5477,10 @@ mod tests {
             result.is_ok(),
             "runtime refresh should succeed for an existing writable root, got: {result:?}"
         );
+        let expected_read_dir_calls = vec![canonicalize_or_identity(&cwd)];
         assert!(
-            read_dir_calls.is_empty(),
-            "runtime refresh should not walk writable-root descendants on a cache hit, got: {read_dir_calls:?}"
+            read_dir_calls == expected_read_dir_calls,
+            "runtime refresh should inspect only the writable root itself when looking for direct children, got: {read_dir_calls:?}"
         );
 
         unsafe {

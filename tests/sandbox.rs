@@ -1,7 +1,7 @@
 mod common;
 
 #[cfg(target_os = "windows")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "windows")]
 use std::process::Command;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -335,6 +335,33 @@ async fn spawn_server_with_sandbox_state(state: String) -> TestResult<common::Mc
         SANDBOX_PAGER_PAGE_CHARS,
     )
     .await
+}
+
+#[cfg(target_os = "windows")]
+async fn spawn_server_with_sandbox_state_in_cwd(
+    state: String,
+    cwd: &Path,
+) -> TestResult<common::McpTestSession> {
+    let args = sandbox_args_from_state(&state)?;
+    common::spawn_server_with_args_env_and_cwd_and_pager_page_chars(
+        args,
+        Vec::new(),
+        Some(cwd.to_path_buf()),
+        SANDBOX_PAGER_PAGE_CHARS,
+    )
+    .await
+}
+
+#[cfg(target_os = "windows")]
+fn temp_workspace_root() -> TestResult<tempfile::TempDir> {
+    Ok(tempfile::tempdir()?)
+}
+
+#[cfg(target_os = "windows")]
+fn temp_workspace_root_with_git_dir() -> TestResult<tempfile::TempDir> {
+    let workspace = temp_workspace_root()?;
+    std::fs::create_dir_all(workspace.path().join(".git"))?;
+    Ok(workspace)
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -1515,7 +1542,8 @@ async fn sandbox_workspace_write_restart_blocks_file_moved_outside_writable_root
         return Ok(());
     }
 
-    let repo_root = std::env::current_dir()?;
+    let workspace = temp_workspace_root()?;
+    let repo_root = workspace.path().to_path_buf();
     let source = repo_root.join(format!(
         "mcp-repl-sandbox-outbound-source-{}.txt",
         SystemTime::now()
@@ -1532,7 +1560,9 @@ async fn sandbox_workspace_write_restart_blocks_file_moved_outside_writable_root
     ));
     let source_r = r_string(&source.to_string_lossy());
     let target_r = r_string(&target.to_string_lossy());
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
+    let mut session =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
 
     let setup_code = format!(
         r#"
@@ -1611,12 +1641,9 @@ tryCatch({{
 #[cfg(target_os = "windows")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_restart_blocks_moved_file_inside_git_dir() -> TestResult<()> {
-    let repo_root = std::env::current_dir()?;
+    let workspace = temp_workspace_root_with_git_dir()?;
+    let repo_root = workspace.path().to_path_buf();
     let git_dir = repo_root.join(".git");
-    if !git_dir.is_dir() {
-        eprintln!(".git directory unavailable; skipping");
-        return Ok(());
-    }
     let source = repo_root.join(format!(
         "mcp-repl-sandbox-protected-source-{}.txt",
         SystemTime::now()
@@ -1633,7 +1660,9 @@ async fn sandbox_workspace_write_restart_blocks_moved_file_inside_git_dir() -> T
     ));
     let source_r = r_string(&source.to_string_lossy());
     let target_r = r_string(&target.to_string_lossy());
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
+    let mut session =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
 
     let setup_code = format!(
         r#"
@@ -1721,12 +1750,9 @@ tryCatch({{
 #[cfg(target_os = "windows")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_restart_unblocks_file_moved_out_of_git_dir() -> TestResult<()> {
-    let repo_root = std::env::current_dir()?;
+    let workspace = temp_workspace_root_with_git_dir()?;
+    let repo_root = workspace.path().to_path_buf();
     let git_dir = repo_root.join(".git");
-    if !git_dir.is_dir() {
-        eprintln!(".git directory unavailable; skipping");
-        return Ok(());
-    }
 
     let protected = git_dir.join(format!(
         "mcp-repl-sandbox-unblock-protected-{}.txt",
@@ -1744,7 +1770,9 @@ async fn sandbox_workspace_write_restart_unblocks_file_moved_out_of_git_dir() ->
     ));
     let protected_r = r_string(&protected.to_string_lossy());
     let restored_r = r_string(&restored.to_string_lossy());
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write(false)).await?;
+    let mut session =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
 
     let setup_code = format!(
         r#"
