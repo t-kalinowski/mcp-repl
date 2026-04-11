@@ -1510,8 +1510,11 @@ fn windows_stable_sid_word(bytes: &[u8], seed: u32) -> u32 {
 }
 
 #[cfg(target_os = "windows")]
-fn windows_workspace_write_prepared_sid(writable_roots: &[PathBuf]) -> TestResult<String> {
-    let cwd = windows_canonicalize_or_identity(&std::env::current_dir()?);
+fn windows_workspace_write_prepared_sid_for_cwd(
+    cwd: &std::path::Path,
+    writable_roots: &[PathBuf],
+) -> TestResult<String> {
+    let cwd = windows_canonicalize_or_identity(cwd);
     let stable_cwd = windows_stable_sid_seed_path_buf(cwd.clone());
     let mut canonical_roots = writable_roots
         .iter()
@@ -1535,6 +1538,11 @@ fn windows_workspace_write_prepared_sid(writable_roots: &[PathBuf]) -> TestResul
     let c = windows_stable_sid_word(seed.as_bytes(), 0x1319_8a2e);
     let d = windows_stable_sid_word(seed.as_bytes(), 0x0370_7344);
     Ok(format!("S-1-5-21-{a}-{b}-{c}-{d}"))
+}
+
+#[cfg(target_os = "windows")]
+fn windows_workspace_write_prepared_sid(writable_roots: &[PathBuf]) -> TestResult<String> {
+    windows_workspace_write_prepared_sid_for_cwd(&std::env::current_dir()?, writable_roots)
 }
 
 #[cfg(target_os = "windows")]
@@ -1928,6 +1936,138 @@ tryCatch({{
     assert!(
         !restored_text.contains("RESTORED_WRITE_ERROR:"),
         "file moved back out of .git stayed blocked after restart, got: {restored_text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_workspace_write_restart_allows_host_created_file_under_workspace_subdir()
+-> TestResult<()> {
+    let workspace = temp_workspace_root()?;
+    let repo_root = workspace.path().to_path_buf();
+    let nested_dir = repo_root.join("src");
+    let host_created = nested_dir.join(format!(
+        "mcp-repl-sandbox-host-created-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let host_created_r = r_string(&host_created.to_string_lossy());
+    std::fs::create_dir_all(&nested_dir)?;
+
+    let mut session =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
+
+    let ready = session
+        .write_stdin_raw_with("cat('SESSION_READY\\n')\n", Some(10.0))
+        .await?;
+    let ready_text = collect_text(&ready);
+    if windows_sandbox_backend_unavailable(&ready_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session.cancel().await?;
+        cleanup_restricted_file(&host_created);
+        return Ok(());
+    }
+    session.cancel().await?;
+
+    std::fs::write(&host_created, b"host before restart")?;
+
+    let mut restarted =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
+    let follow_up_code = format!(
+        r#"
+target <- {host_created_r}
+tryCatch({{
+  cat("READ_AFTER=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+  writeLines(c(readLines(target, warn = FALSE), "sandbox append"), target)
+  cat("WRITE_AFTER_OK\n")
+  cat("WRITE_AFTER=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+}}, error = function(e) {{
+  message("WRITE_AFTER_ERROR:", conditionMessage(e))
+}})
+"#
+    );
+    let follow_up = restarted
+        .write_stdin_raw_with(follow_up_code, Some(10.0))
+        .await?;
+    let follow_up_text = collect_text(&follow_up);
+
+    cleanup_restricted_file(&host_created);
+    restarted.cancel().await?;
+
+    assert!(
+        follow_up_text.contains("READ_AFTER=host before restart"),
+        "expected restarted worker to read the host-created nested workspace file, got: {follow_up_text}"
+    );
+    assert!(
+        follow_up_text.contains("WRITE_AFTER_OK"),
+        "expected restarted worker to write the host-created nested workspace file, got: {follow_up_text}"
+    );
+    assert!(
+        follow_up_text.contains("WRITE_AFTER=host before restart|sandbox append"),
+        "expected restarted worker to read back its write in the nested workspace file, got: {follow_up_text}"
+    );
+    assert!(
+        !follow_up_text.contains("WRITE_AFTER_ERROR:"),
+        "host-created files under direct workspace subdirectories should stay writable after restart, got: {follow_up_text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_workspace_write_nested_midrun_file_keeps_prepared_sid() -> TestResult<()> {
+    let workspace = temp_workspace_root()?;
+    let repo_root = workspace.path().to_path_buf();
+    let nested_dir = repo_root.join("src");
+    let artifact = nested_dir.join(format!(
+        "mcp-repl-sandbox-nested-midrun-acl-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let artifact_r = r_string(&artifact.to_string_lossy());
+    std::fs::create_dir_all(&nested_dir)?;
+    scrub_unresolved_windows_sid_aces(&repo_root)?;
+    let expected_stable_sid = windows_workspace_write_prepared_sid_for_cwd(&repo_root, &[])?;
+    let mut session =
+        spawn_server_with_sandbox_state_in_cwd(sandbox_state_workspace_write(false), &repo_root)
+            .await?;
+
+    let create_code = format!(
+        r#"
+target <- {artifact_r}
+writeLines("nested midrun", target)
+cat("WRITE_OK=", file.exists(target), "\n", sep = "")
+"#
+    );
+    let create = session
+        .write_stdin_raw_with(create_code, Some(10.0))
+        .await?;
+    let create_text = collect_text(&create);
+    if windows_sandbox_backend_unavailable(&create_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session.cancel().await?;
+        cleanup_restricted_file(&artifact);
+        return Ok(());
+    }
+    assert!(
+        create_text.contains("WRITE_OK=TRUE"),
+        "expected sandboxed worker to create the nested mid-run artifact, got: {create_text}"
+    );
+
+    let before_cancel = unresolved_windows_sid_acl_entries(&artifact)?;
+    cleanup_restricted_file(&artifact);
+    session.cancel().await?;
+
+    assert!(
+        before_cancel.contains(&expected_stable_sid),
+        "expected a nested file created under the workspace root to retain the stable prepared SID {expected_stable_sid}, got: {before_cancel:?}"
     );
     Ok(())
 }

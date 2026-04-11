@@ -715,7 +715,7 @@ unsafe fn apply_allow_acl_targets(
                 && options
                     .skip_inherit_only_on_root
                     .as_ref()
-                    .is_none_or(|skip_root| path != skip_root);
+                    .is_none_or(|skip_root| canonicalize_or_identity(&target) != *skip_root);
             let restore = match capture_prepared_launch_acl_restore_with_missing_policy(
                 &target,
                 CapabilityAclKind::Allow,
@@ -917,7 +917,16 @@ unsafe fn apply_prepared_workspace_acl_state(
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 unsafe fn apply_runtime_launch_acl_state(
+    launch: &PreparedSandboxLaunch,
+    sid: *mut c_void,
+) -> Result<Vec<CapabilityAclGuard>, String> {
+    let _acl_lock = acquire_prepared_launch_acl_lock(launch.capability_sid())?;
+    apply_runtime_launch_acl_state_unlocked(launch, sid)
+}
+
+unsafe fn apply_runtime_launch_acl_state_unlocked(
     launch: &PreparedSandboxLaunch,
     sid: *mut c_void,
 ) -> Result<Vec<CapabilityAclGuard>, String> {
@@ -1082,7 +1091,25 @@ fn prepared_launch_existing_targets(root: &Path) -> Result<Vec<PathBuf>, String>
     Ok(targets)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 unsafe fn refresh_runtime_prepared_launch_acl_state(
+    policy: &SandboxPolicy,
+    sandbox_policy_cwd: &Path,
+    session_temp_dir: &Path,
+    prepared_capability_sid: &str,
+    sid: *mut c_void,
+) -> Result<PreparedSandboxLaunch, String> {
+    let _acl_lock = acquire_prepared_launch_acl_lock(prepared_capability_sid)?;
+    refresh_runtime_prepared_launch_acl_state_unlocked(
+        policy,
+        sandbox_policy_cwd,
+        session_temp_dir,
+        prepared_capability_sid,
+        sid,
+    )
+}
+
+unsafe fn refresh_runtime_prepared_launch_acl_state_unlocked(
     policy: &SandboxPolicy,
     sandbox_policy_cwd: &Path,
     session_temp_dir: &Path,
@@ -1095,7 +1122,6 @@ unsafe fn refresh_runtime_prepared_launch_acl_state(
         session_temp_dir,
         prepared_capability_sid,
     );
-    let _acl_lock = acquire_prepared_launch_acl_lock(prepared_capability_sid)?;
     apply_prepared_workspace_acl_state(
         &launch,
         sid,
@@ -1248,37 +1274,41 @@ fn run_sandboxed_command_with_env_map(
         let null_device_ace_applied = allow_null_device(psid_launch);
 
         let mut acl_guards: Vec<CapabilityAclGuard> = Vec::new();
-        let refresh_result = refresh_runtime_prepared_launch_acl_state(
-            policy,
-            sandbox_policy_cwd,
-            &session_temp_dir,
-            prepared_capability_sid,
-            psid_capability,
-        );
-        let prepared_launch = match refresh_result {
-            Ok(launch) => launch,
-            Err(err) => {
-                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
-                CloseHandle(restricted_token);
-                if launch_sid_is_distinct {
-                    LocalFree(psid_launch as HLOCAL);
+        {
+            let _acl_lock = acquire_prepared_launch_acl_lock(prepared_capability_sid)?;
+            let refresh_result = refresh_runtime_prepared_launch_acl_state_unlocked(
+                policy,
+                sandbox_policy_cwd,
+                &session_temp_dir,
+                prepared_capability_sid,
+                psid_capability,
+            );
+            let prepared_launch = match refresh_result {
+                Ok(launch) => launch,
+                Err(err) => {
+                    cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                    CloseHandle(restricted_token);
+                    if launch_sid_is_distinct {
+                        LocalFree(psid_launch as HLOCAL);
+                    }
+                    LocalFree(psid_capability as HLOCAL);
+                    return Err(err);
                 }
-                LocalFree(psid_capability as HLOCAL);
-                return Err(err);
-            }
-        };
+            };
 
-        let launch_acl_result = apply_runtime_launch_acl_state(&prepared_launch, psid_launch);
-        match launch_acl_result {
-            Ok(mut launch_acl_guards) => acl_guards.append(&mut launch_acl_guards),
-            Err(err) => {
-                cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
-                CloseHandle(restricted_token);
-                if launch_sid_is_distinct {
-                    LocalFree(psid_launch as HLOCAL);
+            let launch_acl_result =
+                apply_runtime_launch_acl_state_unlocked(&prepared_launch, psid_launch);
+            match launch_acl_result {
+                Ok(mut launch_acl_guards) => acl_guards.append(&mut launch_acl_guards),
+                Err(err) => {
+                    cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                    CloseHandle(restricted_token);
+                    if launch_sid_is_distinct {
+                        LocalFree(psid_launch as HLOCAL);
+                    }
+                    LocalFree(psid_capability as HLOCAL);
+                    return Err(err);
                 }
-                LocalFree(psid_capability as HLOCAL);
-                return Err(err);
             }
         }
 
@@ -4163,6 +4193,57 @@ mod tests {
             .recv_timeout(Duration::from_secs(1))
             .expect("waiter should acquire once the first lock is released");
         waiter.join().expect("waiter should join");
+    }
+
+    #[test]
+    fn runtime_launch_acl_state_blocks_same_sid_until_release() {
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let session_temp_dir = session_root.path().join("session-temp");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir)
+            .expect("prepare session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+        let first = acquire_prepared_launch_acl_lock(prepared.capability_sid())
+            .expect("first prepared launch ACL lock");
+        let launch = prepared.clone();
+        let launch_sid_string = make_random_sid_string();
+        let (applied_tx, applied_rx) = std::sync::mpsc::channel();
+
+        let waiter = thread::spawn(move || unsafe {
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            let guards = apply_runtime_launch_acl_state(&launch, launch_sid)
+                .expect("apply runtime launch ACL state");
+            cleanup_capability_acl_state(&guards, launch_sid, false);
+            LocalFree(launch_sid as HLOCAL);
+            applied_tx.send(()).expect("launch ACL application signal");
+        });
+
+        assert!(
+            applied_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+            "runtime launch ACL writes should serialize behind the prepared launch ACL lock"
+        );
+
+        drop(first);
+        applied_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("runtime launch ACL work should continue once the lock is released");
+        waiter.join().expect("waiter should join");
+
+        unsafe {
+            let stable_sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("stable capability SID should convert");
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[cwd.as_path(), session_temp_dir.as_path()],
+            );
+            LocalFree(stable_sid as HLOCAL);
+        }
     }
 
     #[test]
