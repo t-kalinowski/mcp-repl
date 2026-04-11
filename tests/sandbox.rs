@@ -1949,6 +1949,110 @@ tryCatch({{
 
 #[cfg(target_os = "windows")]
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_workspace_write_concurrent_sessions_share_temp_renamed_workspace_file()
+-> TestResult<()> {
+    let writable_root = tempfile::tempdir()?;
+    let shared = writable_root.path().join(format!(
+        "mcp-repl-sandbox-temp-rename-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let shared_r = r_string(&shared.to_string_lossy());
+    scrub_unresolved_windows_sid_aces(writable_root.path())?;
+    let state =
+        sandbox_state_workspace_write_with_roots(false, vec![writable_root.path().to_path_buf()]);
+    let mut session_a = spawn_server_with_sandbox_state(state.clone()).await?;
+    let mut session_b = spawn_server_with_sandbox_state(state).await?;
+
+    let ready_a = session_a
+        .write_stdin_raw_with("cat('SESSION_A_READY\\n')\n", Some(10.0))
+        .await?;
+    let ready_a_text = collect_text(&ready_a);
+    if windows_sandbox_backend_unavailable(&ready_a_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session_a.cancel().await?;
+        session_b.cancel().await?;
+        cleanup_restricted_file(&shared);
+        return Ok(());
+    }
+    let ready_b = session_b
+        .write_stdin_raw_with("cat('SESSION_B_READY\\n')\n", Some(10.0))
+        .await?;
+    let ready_b_text = collect_text(&ready_b);
+    if windows_sandbox_backend_unavailable(&ready_b_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session_a.cancel().await?;
+        session_b.cancel().await?;
+        cleanup_restricted_file(&shared);
+        return Ok(());
+    }
+
+    let create_code = format!(
+        r#"
+target <- {shared_r}
+temp_target <- tempfile(pattern = "mcp-repl-temp-rename-", tmpdir = tempdir(), fileext = ".txt")
+writeLines("from session b temp", temp_target)
+renamed <- file.rename(temp_target, target)
+cat("SESSION_B_RENAMED=", renamed, "\n", sep = "")
+cat("SESSION_B_TARGET_EXISTS=", file.exists(target), "\n", sep = "")
+"#
+    );
+    let create = session_b
+        .write_stdin_raw_with(create_code, Some(10.0))
+        .await?;
+    let create_text = collect_text(&create);
+    assert!(
+        create_text.contains("SESSION_B_RENAMED=TRUE"),
+        "expected second live session to rename its temp artifact into the workspace, got: {create_text}"
+    );
+    assert!(
+        create_text.contains("SESSION_B_TARGET_EXISTS=TRUE"),
+        "expected renamed temp artifact to exist in the workspace, got: {create_text}"
+    );
+
+    let use_code = format!(
+        r#"
+target <- {shared_r}
+tryCatch({{
+  cat("SESSION_A_READ=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+  writeLines(c(readLines(target, warn = FALSE), "from session a"), target)
+  cat("SESSION_A_WRITE_OK\n")
+  cat("SESSION_A_AFTER=", paste(readLines(target, warn = FALSE), collapse = "|"), "\n", sep = "")
+}}, error = function(e) {{
+  message("SESSION_A_ACCESS_ERROR:", conditionMessage(e))
+}})
+"#
+    );
+    let use_result = session_a.write_stdin_raw_with(use_code, Some(10.0)).await?;
+    let use_text = collect_text(&use_result);
+
+    cleanup_restricted_file(&shared);
+    session_a.cancel().await?;
+    session_b.cancel().await?;
+
+    assert!(
+        use_text.contains("SESSION_A_READ=from session b temp"),
+        "expected older live session to read the temp-renamed workspace artifact, got: {use_text}"
+    );
+    assert!(
+        use_text.contains("SESSION_A_WRITE_OK"),
+        "expected older live session to write the temp-renamed workspace artifact, got: {use_text}"
+    );
+    assert!(
+        use_text.contains("SESSION_A_AFTER=from session b temp|from session a"),
+        "expected older live session to read back its write after the temp rename, got: {use_text}"
+    );
+    assert!(
+        !use_text.contains("SESSION_A_ACCESS_ERROR:"),
+        "temp-renamed workspace artifacts should stay shared across live same-checkout sessions, got: {use_text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_session_exit_removes_launch_acl_from_midrun_file() -> TestResult<()>
 {
     let writable_root = tempfile::tempdir()?;

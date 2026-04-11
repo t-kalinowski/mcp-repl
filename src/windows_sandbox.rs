@@ -1224,6 +1224,30 @@ fn run_sandboxed_command_with_env_map(
             }
 
             if let Some(session_temp_dir) = session_temp_dir.as_deref() {
+                match add_inherit_only_allow_ace(session_temp_dir, psid_capability) {
+                    Ok(true) => acl_guards.push(CapabilityAclGuard {
+                        path: session_temp_dir.to_path_buf(),
+                        sid: psid_capability,
+                        kind: CapabilityAclKind::Allow,
+                    }),
+                    Ok(false) => {}
+                    Err(err) => {
+                        cleanup_capability_acl_state(
+                            &acl_guards,
+                            psid_launch,
+                            null_device_ace_applied,
+                        );
+                        CloseHandle(restricted_token);
+                        if launch_sid_is_distinct {
+                            LocalFree(psid_launch as HLOCAL);
+                        }
+                        LocalFree(psid_capability as HLOCAL);
+                        return Err(format!(
+                            "failed to apply session temp inherit-only ACL to '{}': {err}",
+                            session_temp_dir.display()
+                        ));
+                    }
+                }
                 match add_allow_ace(session_temp_dir, psid_launch) {
                     Ok(true) => acl_guards.push(CapabilityAclGuard {
                         path: session_temp_dir.to_path_buf(),
@@ -2129,6 +2153,80 @@ unsafe fn add_allow_ace_with_options(
     Ok(true)
 }
 
+unsafe fn add_inherit_only_allow_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
+    let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let code = GetNamedSecurityInfoW(
+        to_wide(path).as_ptr(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        &mut dacl,
+        std::ptr::null_mut(),
+        &mut security_descriptor,
+    );
+    if code != ERROR_SUCCESS {
+        return Err(format!("GetNamedSecurityInfoW failed: {code}"));
+    }
+    if dacl_has_inherit_only_allow_for_sid(dacl, sid) {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return Ok(false);
+    }
+    if dacl_has_allow_for_sid(dacl, sid, false) {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        revoke_ace_with_result(path, sid)?;
+        return add_inherit_only_allow_ace(path, sid);
+    }
+
+    let trustee = TRUSTEE_W {
+        pMultipleTrustee: std::ptr::null_mut(),
+        MultipleTrusteeOperation: 0,
+        TrusteeForm: TRUSTEE_IS_SID,
+        TrusteeType: TRUSTEE_IS_UNKNOWN,
+        ptstrName: sid as *mut u16,
+    };
+    let mut explicit: EXPLICIT_ACCESS_W = std::mem::zeroed();
+    explicit.grfAccessPermissions = FILE_GENERIC_READ | FILE_GENERIC_WRITE | FILE_GENERIC_EXECUTE;
+    explicit.grfAccessMode = GRANT_ACCESS;
+    explicit.grfInheritance =
+        CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE | u32::from(INHERIT_ONLY_ACE);
+    explicit.Trustee = trustee;
+
+    let mut new_dacl: *mut ACL = std::ptr::null_mut();
+    let set_acl_code = SetEntriesInAclW(1, &explicit, dacl, &mut new_dacl);
+    if set_acl_code != ERROR_SUCCESS {
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        return Err(format!("SetEntriesInAclW failed: {set_acl_code}"));
+    }
+
+    let set_security_code = SetNamedSecurityInfoW(
+        to_wide(path).as_ptr() as *mut u16,
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        new_dacl,
+        std::ptr::null_mut(),
+    );
+    if !new_dacl.is_null() {
+        LocalFree(new_dacl as HLOCAL);
+    }
+    if !security_descriptor.is_null() {
+        LocalFree(security_descriptor as HLOCAL);
+    }
+    if set_security_code != ERROR_SUCCESS {
+        return Err(format!("SetNamedSecurityInfoW failed: {set_security_code}"));
+    }
+    Ok(true)
+}
+
 unsafe fn add_deny_write_ace(path: &Path, sid: *mut c_void) -> Result<bool, String> {
     add_deny_write_ace_with_options(path, sid, true)
 }
@@ -2338,6 +2436,29 @@ unsafe fn dacl_has_allow_for_sid_with_inheritance(
             continue;
         }
         if ace_has_container_and_object_inheritance(header.AceFlags) == inherit_children {
+            return true;
+        }
+    }
+    false
+}
+
+unsafe fn dacl_has_inherit_only_allow_for_sid(dacl: *mut ACL, sid: *mut c_void) -> bool {
+    let Some(info) = dacl_size_info(dacl) else {
+        return false;
+    };
+    for index in 0..info.AceCount {
+        let mut ace: *mut c_void = std::ptr::null_mut();
+        if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+            continue;
+        }
+        let header = &*(ace as *const ACE_HEADER);
+        if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) == 0 {
+            continue;
+        }
+        let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+        if EqualSid(ace_sid_ptr(ace), sid) != 0
+            && allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, true)
+        {
             return true;
         }
     }
@@ -3603,6 +3724,81 @@ mod tests {
     }
 
     #[test]
+    fn prepared_launch_runtime_reapplies_stable_sid_to_temp_file_renamed_into_workspace() {
+        let workspace = prepared_launch_workspace_tempdir();
+        let session_root = tempdir().expect("session temp root");
+        let cwd = workspace.path().join("workspace");
+        let session_temp_dir = session_root.path().join("session-temp");
+        let temp_file = session_temp_dir.join("artifact.txt");
+        let moved_file = cwd.join("artifact.txt");
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        crate::sandbox::prepare_session_temp_dir(&session_temp_dir).expect("session temp dir");
+
+        let policy = workspace_policy(Vec::new(), false, false);
+        let prepared =
+            prepare_sandbox_launch(&policy, &cwd, &session_temp_dir).expect("prepare launch");
+
+        unsafe {
+            let stable_sid = convert_string_sid_to_sid(prepared.capability_sid())
+                .expect("stable capability SID should convert");
+            let launch_sid_string = make_random_sid_string();
+            let launch_sid = convert_string_sid_to_sid(&launch_sid_string)
+                .expect("launch capability SID should convert");
+            assert!(
+                add_inherit_only_allow_ace(&session_temp_dir, stable_sid)
+                    .expect("apply inherit-only stable allow ACE to session temp dir"),
+                "runtime launch should add an inherit-only stable allow ACE to the session temp root"
+            );
+            assert!(
+                add_allow_ace(&session_temp_dir, launch_sid)
+                    .expect("apply launch allow ACE to session temp dir"),
+                "runtime launch should add the launch allow ACE to the session temp root"
+            );
+            let launch_guards = apply_runtime_launch_acl_state(&prepared, launch_sid)
+                .expect("apply runtime launch ACL state");
+
+            assert!(
+                path_has_inherit_only_allow_ace(&session_temp_dir, stable_sid),
+                "session temp root should retain the inherit-only stable allow ACE"
+            );
+            assert!(
+                !path_has_allow_ace(&session_temp_dir, stable_sid),
+                "session temp root itself should not get a direct stable allow ACE"
+            );
+
+            std::fs::write(&temp_file, b"artifact").expect("temp artifact");
+            assert!(
+                path_has_allow_ace(&temp_file, stable_sid),
+                "files created in the session temp dir should inherit the stable SID"
+            );
+
+            std::fs::rename(&temp_file, &moved_file).expect("move temp artifact into workspace");
+            assert!(
+                path_has_allow_ace(&moved_file, stable_sid),
+                "same-volume renames out of session temp should keep the stable SID on the artifact"
+            );
+            assert!(
+                path_has_allow_ace(&moved_file, launch_sid),
+                "same-volume renames out of session temp should keep the launch SID on the artifact"
+            );
+
+            cleanup_capability_acl_state(&launch_guards, launch_sid, false);
+            revoke_ace(&session_temp_dir, launch_sid);
+            LocalFree(launch_sid as HLOCAL);
+            LocalFree(stable_sid as HLOCAL);
+            revoke_capability_sid_paths(
+                prepared.capability_sid(),
+                &[
+                    cwd.as_path(),
+                    session_temp_dir.as_path(),
+                    temp_file.as_path(),
+                    moved_file.as_path(),
+                ],
+            );
+        }
+    }
+
+    #[test]
     fn stable_capability_sid_changes_when_workspace_write_policy_changes() {
         let tmp = tempdir().expect("tempdir");
         let cwd = tmp.path().join("workspace");
@@ -4162,6 +4358,50 @@ mod tests {
                 }
                 let header = &*(ace as *const ACE_HEADER);
                 if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) != 0 {
+                    continue;
+                }
+                let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+                if EqualSid(ace_sid_ptr(ace), sid) != 0
+                    && allow_ace_satisfies_requirements(allowed.Mask, header.AceFlags, true)
+                {
+                    has_ace = true;
+                    break;
+                }
+            }
+        }
+
+        if !security_descriptor.is_null() {
+            LocalFree(security_descriptor as HLOCAL);
+        }
+        has_ace
+    }
+
+    unsafe fn path_has_inherit_only_allow_ace(path: &Path, sid: *mut c_void) -> bool {
+        let mut security_descriptor: *mut c_void = std::ptr::null_mut();
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let code = GetNamedSecurityInfoW(
+            to_wide(path).as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut security_descriptor,
+        );
+        if code != ERROR_SUCCESS {
+            return false;
+        }
+
+        let mut has_ace = false;
+        if let Some(info) = dacl_size_info(dacl) {
+            for index in 0..info.AceCount {
+                let mut ace: *mut c_void = std::ptr::null_mut();
+                if GetAce(dacl as *const ACL, index, &mut ace) == 0 {
+                    continue;
+                }
+                let header = &*(ace as *const ACE_HEADER);
+                if header.AceType != 0 || (header.AceFlags & INHERIT_ONLY_ACE) == 0 {
                     continue;
                 }
                 let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
@@ -4752,6 +4992,9 @@ mod tests {
 
     #[test]
     fn cleanup_capability_acl_state_revokes_launch_sid_from_midrun_file_under_root_guard() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
         let tmp = tempdir().expect("tempdir");
         let writable_root = tmp.path().join("writable");
         let artifact = writable_root.join("artifact.txt");
@@ -4791,6 +5034,9 @@ mod tests {
 
     #[test]
     fn cleanup_capability_acl_state_revokes_inherited_launch_sid_from_midrun_file() {
+        let _guard = prepare_sandbox_launch_test_mutex()
+            .lock()
+            .expect("windows sandbox test mutex");
         let tmp = tempdir().expect("tempdir");
         let writable_root = tmp.path().join("writable");
         let artifact = writable_root.join("artifact.txt");
