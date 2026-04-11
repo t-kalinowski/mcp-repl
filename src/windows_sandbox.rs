@@ -164,6 +164,7 @@ enum CapabilityAclKind {
 enum PreparedLaunchAllowScope {
     Recursive,
     RootsOnly,
+    RootsAndDirectChildren,
 }
 
 struct CapabilityAclGuard {
@@ -228,6 +229,10 @@ struct PreparedLaunchAclLock {
     handle: HANDLE,
 }
 
+struct PreparedLaunchLiveMarker {
+    path: PathBuf,
+}
+
 struct WrapperChildStdio {
     stdin_write: File,
     stdout_read: File,
@@ -283,6 +288,15 @@ impl Drop for PreparedLaunchAclLock {
         unsafe {
             let _ = ReleaseMutex(self.handle);
             let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
+impl Drop for PreparedLaunchLiveMarker {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        if let Some(parent) = self.path.parent() {
+            let _ = std::fs::remove_dir(parent);
         }
     }
 }
@@ -585,13 +599,58 @@ fn default_dacl_capability_sid_strings(capability_sids: &LaunchCapabilitySids) -
     }
 }
 
-fn prepared_launch_acl_lock_name(capability_sid: &str) -> String {
+fn prepared_launch_capability_hash(capability_sid: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in capability_sid.bytes() {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
+    hash
+}
+
+fn prepared_launch_acl_lock_name(capability_sid: &str) -> String {
+    let hash = prepared_launch_capability_hash(capability_sid);
     format!("Local\\mcp_repl_prepared_launch_acl_{hash:016x}")
+}
+
+fn prepared_launch_live_marker_dir(capability_sid: &str) -> PathBuf {
+    let hash = prepared_launch_capability_hash(capability_sid);
+    std::env::temp_dir().join(format!("mcp-repl-prepared-launch-live-{hash:016x}"))
+}
+
+fn prepared_launch_live_marker_count(capability_sid: &str) -> usize {
+    std::fs::read_dir(prepared_launch_live_marker_dir(capability_sid))
+        .map(|entries| entries.filter_map(Result::ok).count())
+        .unwrap_or(0)
+}
+
+fn create_prepared_launch_live_marker(
+    capability_sid: &str,
+    launch_sid: &str,
+) -> Result<PreparedLaunchLiveMarker, String> {
+    let marker_dir = prepared_launch_live_marker_dir(capability_sid);
+    std::fs::create_dir_all(&marker_dir).map_err(|err| {
+        format!(
+            "create_dir_all failed for prepared launch live marker dir '{}': {err}",
+            marker_dir.display()
+        )
+    })?;
+    let marker_path = marker_dir.join(format!(
+        "{}-{:016x}.marker",
+        std::process::id(),
+        prepared_launch_capability_hash(launch_sid),
+    ));
+    std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&marker_path)
+        .map_err(|err| {
+            format!(
+                "failed to create prepared launch live marker '{}': {err}",
+                marker_path.display()
+            )
+        })?;
+    Ok(PreparedLaunchLiveMarker { path: marker_path })
 }
 
 fn acquire_prepared_launch_acl_lock(capability_sid: &str) -> Result<PreparedLaunchAclLock, String> {
@@ -881,11 +940,16 @@ unsafe fn apply_prepared_workspace_acl_state(
     launch: &PreparedSandboxLaunch,
     sid: *mut c_void,
     action: &str,
-    scope: PreparedLaunchAllowScope,
+    workspace_root_scope: PreparedLaunchAllowScope,
+    extra_root_scope: PreparedLaunchAllowScope,
 ) -> Result<(), String> {
     maybe_fail_apply_prepared_launch_acl_state_test()?;
     let paths = prepared_launch_acl_paths(launch);
     let denied_roots = canonicalized_paths(&paths.deny);
+    let (workspace_root_paths, extra_root_paths): (HashSet<PathBuf>, HashSet<PathBuf>) = paths
+        .allow
+        .into_iter()
+        .partition(|path| canonicalize_or_identity(path) == launch.sandbox_policy_cwd);
     let mut acl_restores: Vec<PreparedLaunchAclRestore> = Vec::new();
     let mut acl_guards = None;
     let mut apply = PreparedLaunchAclApply {
@@ -893,12 +957,25 @@ unsafe fn apply_prepared_workspace_acl_state(
         acl_guards: &mut acl_guards,
     };
     apply_allow_acl_targets(
-        &paths.allow,
+        &workspace_root_paths,
         &denied_roots,
         sid,
         action,
         AllowAclTargetOptions {
-            scope,
+            scope: workspace_root_scope,
+            inherit_children: false,
+            add_inherit_only_allow_on_directories: true,
+            skip_inherit_only_on_root: Some(canonicalize_or_identity(&launch.sandbox_policy_cwd)),
+        },
+        &mut apply,
+    )?;
+    apply_allow_acl_targets(
+        &extra_root_paths,
+        &denied_roots,
+        sid,
+        action,
+        AllowAclTargetOptions {
+            scope: extra_root_scope,
             inherit_children: false,
             add_inherit_only_allow_on_directories: true,
             skip_inherit_only_on_root: Some(canonicalize_or_identity(&launch.sandbox_policy_cwd)),
@@ -1015,7 +1092,9 @@ fn prepared_launch_allow_targets(
         }
 
         targets.push(path.clone());
-        if matches!(scope, PreparedLaunchAllowScope::RootsOnly) {
+        if matches!(scope, PreparedLaunchAllowScope::RootsOnly)
+            || matches!(scope, PreparedLaunchAllowScope::RootsAndDirectChildren if depth >= 1)
+        {
             continue;
         }
 
@@ -1095,6 +1174,8 @@ unsafe fn refresh_runtime_prepared_launch_acl_state(
     session_temp_dir: &Path,
     prepared_capability_sid: &str,
     sid: *mut c_void,
+    workspace_root_scope: PreparedLaunchAllowScope,
+    extra_root_scope: PreparedLaunchAllowScope,
 ) -> Result<PreparedSandboxLaunch, String> {
     let _acl_lock = acquire_prepared_launch_acl_lock(prepared_capability_sid)?;
     refresh_runtime_prepared_launch_acl_state_unlocked(
@@ -1103,6 +1184,8 @@ unsafe fn refresh_runtime_prepared_launch_acl_state(
         session_temp_dir,
         prepared_capability_sid,
         sid,
+        workspace_root_scope,
+        extra_root_scope,
     )
 }
 
@@ -1112,6 +1195,8 @@ unsafe fn refresh_runtime_prepared_launch_acl_state_unlocked(
     session_temp_dir: &Path,
     prepared_capability_sid: &str,
     sid: *mut c_void,
+    workspace_root_scope: PreparedLaunchAllowScope,
+    extra_root_scope: PreparedLaunchAllowScope,
 ) -> Result<PreparedSandboxLaunch, String> {
     let launch = build_prepared_sandbox_launch(
         policy,
@@ -1123,7 +1208,8 @@ unsafe fn refresh_runtime_prepared_launch_acl_state_unlocked(
         &launch,
         sid,
         "refresh",
-        PreparedLaunchAllowScope::Recursive,
+        workspace_root_scope,
+        extra_root_scope,
     )?;
     Ok(launch)
 }
@@ -1153,6 +1239,7 @@ pub fn prepare_sandbox_launch(
             psid_capability,
             "prepare",
             PreparedLaunchAllowScope::RootsOnly,
+            PreparedLaunchAllowScope::RootsOnly,
         );
         LocalFree(psid_capability as HLOCAL);
         apply_result?;
@@ -1172,7 +1259,8 @@ pub fn refresh_prepared_sandbox_launch_acl_state(
             launch,
             psid_capability,
             "refresh",
-            PreparedLaunchAllowScope::Recursive,
+            PreparedLaunchAllowScope::RootsAndDirectChildren,
+            PreparedLaunchAllowScope::RootsAndDirectChildren,
         );
         LocalFree(psid_capability as HLOCAL);
         refresh_result
@@ -1271,14 +1359,32 @@ fn run_sandboxed_command_with_env_map(
         let null_device_ace_applied = allow_null_device(psid_launch);
 
         let mut acl_guards: Vec<CapabilityAclGuard> = Vec::new();
-        {
+        let live_marker = {
             let _acl_lock = acquire_prepared_launch_acl_lock(prepared_capability_sid)?;
+            let has_other_live_session =
+                prepared_launch_live_marker_count(prepared_capability_sid) > 0;
+            let has_extra_writable_roots = matches!(
+                policy,
+                SandboxPolicy::WorkspaceWrite { writable_roots, .. } if !writable_roots.is_empty()
+            );
+            let workspace_root_scope = if has_other_live_session && !has_extra_writable_roots {
+                PreparedLaunchAllowScope::Recursive
+            } else {
+                PreparedLaunchAllowScope::RootsAndDirectChildren
+            };
+            let extra_root_scope = if has_other_live_session {
+                PreparedLaunchAllowScope::Recursive
+            } else {
+                PreparedLaunchAllowScope::RootsAndDirectChildren
+            };
             let refresh_result = refresh_runtime_prepared_launch_acl_state_unlocked(
                 policy,
                 sandbox_policy_cwd,
                 &session_temp_dir,
                 prepared_capability_sid,
                 psid_capability,
+                workspace_root_scope,
+                extra_root_scope,
             );
             let prepared_launch = match refresh_result {
                 Ok(launch) => launch,
@@ -1293,10 +1399,30 @@ fn run_sandboxed_command_with_env_map(
                 }
             };
 
+            let marker_result = create_prepared_launch_live_marker(
+                prepared_capability_sid,
+                &capability_sids.launch_sid,
+            );
+            let marker = match marker_result {
+                Ok(marker) => marker,
+                Err(err) => {
+                    cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+                    CloseHandle(restricted_token);
+                    if launch_sid_is_distinct {
+                        LocalFree(psid_launch as HLOCAL);
+                    }
+                    LocalFree(psid_capability as HLOCAL);
+                    return Err(err);
+                }
+            };
+
             let launch_acl_result =
                 apply_runtime_launch_acl_state_unlocked(&prepared_launch, psid_launch);
             match launch_acl_result {
-                Ok(mut launch_acl_guards) => acl_guards.append(&mut launch_acl_guards),
+                Ok(mut launch_acl_guards) => {
+                    acl_guards.append(&mut launch_acl_guards);
+                    Some(marker)
+                }
                 Err(err) => {
                     cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
                     CloseHandle(restricted_token);
@@ -1307,7 +1433,7 @@ fn run_sandboxed_command_with_env_map(
                     return Err(err);
                 }
             }
-        }
+        };
 
         match add_inherit_only_allow_ace(&session_temp_dir, psid_capability) {
             Ok(true) => acl_guards.push(CapabilityAclGuard {
@@ -1456,6 +1582,7 @@ fn run_sandboxed_command_with_env_map(
         drain_wrapper_forwarder(stdout_forwarder, &stdout_state);
         drain_wrapper_forwarder(stderr_forwarder, &stderr_state);
         cleanup_capability_acl_state(&acl_guards, psid_launch, null_device_ace_applied);
+        drop(live_marker);
         CloseHandle(proc_info.hThread);
         CloseHandle(proc_info.hProcess);
         CloseHandle(restricted_token);
@@ -4932,6 +5059,8 @@ mod tests {
                 &session_temp_dir,
                 &prepared_sid,
                 stable_sid,
+                PreparedLaunchAllowScope::Recursive,
+                PreparedLaunchAllowScope::Recursive,
             )
             .expect("runtime refresh prepared ACL state");
 
@@ -5708,6 +5837,8 @@ mod tests {
                 &session_temp_dir,
                 &prepared_sid,
                 sid,
+                PreparedLaunchAllowScope::Recursive,
+                PreparedLaunchAllowScope::Recursive,
             );
             LocalFree(sid as HLOCAL);
             result
@@ -5751,6 +5882,8 @@ mod tests {
                 &session_temp_dir,
                 &prepared_sid,
                 sid,
+                PreparedLaunchAllowScope::Recursive,
+                PreparedLaunchAllowScope::Recursive,
             );
             LocalFree(sid as HLOCAL);
             result
@@ -5818,6 +5951,8 @@ mod tests {
                 &session_temp_dir,
                 &prepared_sid,
                 sid,
+                PreparedLaunchAllowScope::Recursive,
+                PreparedLaunchAllowScope::Recursive,
             );
             LocalFree(sid as HLOCAL);
             result

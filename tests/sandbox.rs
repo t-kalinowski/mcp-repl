@@ -358,6 +358,17 @@ fn temp_workspace_root() -> TestResult<tempfile::TempDir> {
 }
 
 #[cfg(target_os = "windows")]
+async fn spawn_server_with_sandbox_state_in_temp_cwd(
+    state: String,
+) -> TestResult<(common::McpTestSession, tempfile::TempDir, PathBuf)> {
+    let workspace = temp_workspace_root()?;
+    let cwd = workspace.path().join("workspace");
+    std::fs::create_dir_all(&cwd)?;
+    let session = spawn_server_with_sandbox_state_in_cwd(state, &cwd).await?;
+    Ok((session, workspace, cwd))
+}
+
+#[cfg(target_os = "windows")]
 fn temp_workspace_root_with_git_dir() -> TestResult<tempfile::TempDir> {
     let workspace = temp_workspace_root()?;
     std::fs::create_dir_all(workspace.path().join(".git"))?;
@@ -1552,11 +1563,6 @@ fn windows_workspace_write_prepared_sid_for_cwd(
 }
 
 #[cfg(target_os = "windows")]
-fn windows_workspace_write_prepared_sid(writable_roots: &[PathBuf]) -> TestResult<String> {
-    windows_workspace_write_prepared_sid_for_cwd(&std::env::current_dir()?, writable_roots)
-}
-
-#[cfg(target_os = "windows")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_denials_windows() -> TestResult<()> {
     let Some(home) = windows_home_dir() else {
@@ -2087,6 +2093,8 @@ cat("WRITE_OK=", file.exists(target), "\n", sep = "")
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_concurrent_sessions_share_new_workspace_file() -> TestResult<()> {
     let writable_root = tempfile::tempdir()?;
+    let workspace = temp_workspace_root()?;
+    let cwd = workspace.path().join("workspace");
     let shared_dir = writable_root.path().join(format!(
         "mcp-repl-sandbox-concurrent-dir-{}",
         SystemTime::now()
@@ -2098,10 +2106,11 @@ async fn sandbox_workspace_write_concurrent_sessions_share_new_workspace_file() 
     let shared = shared_dir.join("from-session-b.txt");
     let shared_r = r_string(&shared.to_string_lossy());
     scrub_unresolved_windows_sid_aces(writable_root.path())?;
+    std::fs::create_dir_all(&cwd)?;
     let state =
         sandbox_state_workspace_write_with_roots(false, vec![writable_root.path().to_path_buf()]);
-    let mut session_a = spawn_server_with_sandbox_state(state.clone()).await?;
-    let mut session_b = spawn_server_with_sandbox_state(state).await?;
+    let mut session_a = spawn_server_with_sandbox_state_in_cwd(state.clone(), &cwd).await?;
+    let mut session_b = spawn_server_with_sandbox_state_in_cwd(state, &cwd).await?;
 
     let ready_a = session_a
         .write_stdin_raw_with("cat('SESSION_A_READY\\n')\n", Some(10.0))
@@ -2191,6 +2200,8 @@ tryCatch({{
 async fn sandbox_workspace_write_concurrent_sessions_share_temp_renamed_workspace_file()
 -> TestResult<()> {
     let writable_root = tempfile::tempdir()?;
+    let workspace = temp_workspace_root()?;
+    let cwd = workspace.path().join("workspace");
     let shared = writable_root.path().join(format!(
         "mcp-repl-sandbox-temp-rename-{}.txt",
         SystemTime::now()
@@ -2200,10 +2211,11 @@ async fn sandbox_workspace_write_concurrent_sessions_share_temp_renamed_workspac
     ));
     let shared_r = r_string(&shared.to_string_lossy());
     scrub_unresolved_windows_sid_aces(writable_root.path())?;
+    std::fs::create_dir_all(&cwd)?;
     let state =
         sandbox_state_workspace_write_with_roots(false, vec![writable_root.path().to_path_buf()]);
-    let mut session_a = spawn_server_with_sandbox_state(state.clone()).await?;
-    let mut session_b = spawn_server_with_sandbox_state(state).await?;
+    let mut session_a = spawn_server_with_sandbox_state_in_cwd(state.clone(), &cwd).await?;
+    let mut session_b = spawn_server_with_sandbox_state_in_cwd(state, &cwd).await?;
 
     let ready_a = session_a
         .write_stdin_raw_with("cat('SESSION_A_READY\\n')\n", Some(10.0))
@@ -2295,6 +2307,8 @@ tryCatch({{
 async fn sandbox_workspace_write_concurrent_sessions_share_direct_workspace_file() -> TestResult<()>
 {
     let writable_root = tempfile::tempdir()?;
+    let workspace = temp_workspace_root()?;
+    let cwd = workspace.path().join("workspace");
     let shared = writable_root.path().join(format!(
         "mcp-repl-sandbox-direct-write-{}.txt",
         SystemTime::now()
@@ -2304,10 +2318,11 @@ async fn sandbox_workspace_write_concurrent_sessions_share_direct_workspace_file
     ));
     let shared_r = r_string(&shared.to_string_lossy());
     scrub_unresolved_windows_sid_aces(writable_root.path())?;
+    std::fs::create_dir_all(&cwd)?;
     let state =
         sandbox_state_workspace_write_with_roots(false, vec![writable_root.path().to_path_buf()]);
-    let mut session_a = spawn_server_with_sandbox_state(state.clone()).await?;
-    let mut session_b = spawn_server_with_sandbox_state(state).await?;
+    let mut session_a = spawn_server_with_sandbox_state_in_cwd(state.clone(), &cwd).await?;
+    let mut session_b = spawn_server_with_sandbox_state_in_cwd(state, &cwd).await?;
 
     let ready_a = session_a
         .write_stdin_raw_with("cat('SESSION_A_READY\\n')\n", Some(10.0))
@@ -2695,6 +2710,7 @@ tryCatch({{
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
 #[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_concurrent_sessions_share_file_created_inside_host_renamed_nested_workspace_tree()
 -> TestResult<()> {
@@ -2814,13 +2830,11 @@ async fn sandbox_workspace_write_direct_midrun_file_keeps_prepared_sid() -> Test
     ));
     let artifact_r = r_string(&artifact.to_string_lossy());
     scrub_unresolved_windows_sid_aces(writable_root.path())?;
+    let state =
+        sandbox_state_workspace_write_with_roots(false, vec![writable_root.path().to_path_buf()]);
+    let (mut session, _workspace, cwd) = spawn_server_with_sandbox_state_in_temp_cwd(state).await?;
     let expected_stable_sid =
-        windows_workspace_write_prepared_sid(&[writable_root.path().to_path_buf()])?;
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write_with_roots(
-        false,
-        vec![writable_root.path().to_path_buf()],
-    ))
-    .await?;
+        windows_workspace_write_prepared_sid_for_cwd(&cwd, &[writable_root.path().to_path_buf()])?;
 
     let create_code = format!(
         r#"
@@ -3018,6 +3032,8 @@ cat("WRITE_OK=", file.exists(target), "\n", sep = "")
 async fn sandbox_workspace_write_first_launch_accepts_missing_writable_root_parent_segment()
 -> TestResult<()> {
     let writable_root_parent = tempfile::tempdir()?;
+    let workspace = temp_workspace_root()?;
+    let cwd = workspace.path().join("workspace");
     let actual_root = writable_root_parent.path().join("out");
     let declared_root = writable_root_parent
         .path()
@@ -3033,10 +3049,11 @@ async fn sandbox_workspace_write_first_launch_accepts_missing_writable_root_pare
     ));
     let artifact_r = r_string(&artifact.to_string_lossy());
     scrub_unresolved_windows_sid_aces(writable_root_parent.path())?;
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write_with_roots(
-        false,
-        vec![declared_root],
-    ))
+    std::fs::create_dir_all(&cwd)?;
+    let mut session = spawn_server_with_sandbox_state_in_cwd(
+        sandbox_state_workspace_write_with_roots(false, vec![declared_root]),
+        &cwd,
+    )
     .await?;
 
     let create_code = format!(
@@ -3076,6 +3093,8 @@ tryCatch({{
 async fn sandbox_workspace_write_session_exit_removes_launch_acl_from_midrun_file() -> TestResult<()>
 {
     let writable_root = tempfile::tempdir()?;
+    let workspace = temp_workspace_root()?;
+    let cwd = workspace.path().join("workspace");
     let artifact = writable_root.path().join(format!(
         "mcp-repl-sandbox-midrun-acl-{}.txt",
         SystemTime::now()
@@ -3085,12 +3104,13 @@ async fn sandbox_workspace_write_session_exit_removes_launch_acl_from_midrun_fil
     ));
     let artifact_r = r_string(&artifact.to_string_lossy());
     scrub_unresolved_windows_sid_aces(writable_root.path())?;
+    std::fs::create_dir_all(&cwd)?;
     let expected_stable_sid =
-        windows_workspace_write_prepared_sid(&[writable_root.path().to_path_buf()])?;
-    let mut session = spawn_server_with_sandbox_state(sandbox_state_workspace_write_with_roots(
-        false,
-        vec![writable_root.path().to_path_buf()],
-    ))
+        windows_workspace_write_prepared_sid_for_cwd(&cwd, &[writable_root.path().to_path_buf()])?;
+    let mut session = spawn_server_with_sandbox_state_in_cwd(
+        sandbox_state_workspace_write_with_roots(false, vec![writable_root.path().to_path_buf()]),
+        &cwd,
+    )
     .await?;
 
     let create_code = format!(
