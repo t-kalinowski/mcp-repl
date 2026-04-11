@@ -883,6 +883,14 @@ impl WorkerManager {
                 self.maybe_reset_after_session_end();
                 return Ok(reply);
             }
+            if let Err(err) = self.ensure_process() {
+                let input_context = self.prepare_input_context_pager(&text, echo_input);
+                let reply =
+                    self.build_reply_from_worker_error_pager(&err, input_context, page_bytes);
+                let reply = self.finalize_reply(reply);
+                self.maybe_reset_after_session_end();
+                return Ok(reply);
+            }
             let reply = self.build_idle_poll_reply_pager();
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();

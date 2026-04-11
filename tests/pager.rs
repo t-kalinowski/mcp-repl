@@ -385,6 +385,29 @@ async fn pager_windows_smoke() -> TestResult<()> {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn pager_empty_input_starts_worker_and_surfaces_startup_failure() -> TestResult<()> {
+    let mut session = common::spawn_server_with_args_env_and_pager_page_chars(
+        vec!["--sandbox".to_string(), "inherit".to_string()],
+        Vec::new(),
+        80,
+    )
+    .await?;
+
+    let result = session
+        .write_stdin_raw_unterminated_with("", Some(1.0))
+        .await?;
+    let text = result_text(&result);
+
+    session.cancel().await?;
+
+    assert!(
+        text.contains("--sandbox inherit requested but no client sandbox state was provided"),
+        "expected initial empty pager input to surface worker startup failure, got: {text:?}"
+    );
+    Ok(())
+}
+
 #[cfg(windows)]
 async fn assert_blank_pager_input_advances_page(input: &str) -> TestResult<()> {
     let mut session = common::spawn_server_with_pager_page_chars(80).await?;
