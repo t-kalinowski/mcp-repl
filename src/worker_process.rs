@@ -881,17 +881,10 @@ impl WorkerManager {
             }
         }
 
-        if let Err(err) = self.ensure_process() {
-            let input_context = self.prepare_input_context_pager(&text, echo_input);
-            let reply = self.build_reply_from_worker_error_pager(&err, input_context, page_bytes);
-            let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
-            return Ok(reply);
-        }
-        self.output.start_capture();
-        self.maybe_emit_guardrail_notice();
-        self.resolve_timeout_marker();
         if empty_input {
+            self.output.start_capture();
+            self.maybe_emit_guardrail_notice();
+            self.resolve_timeout_marker();
             if self.pending_request
                 || self.output.has_pending_output()
                 || self.settled_pending_completion.is_some()
@@ -908,6 +901,21 @@ impl WorkerManager {
                 self.maybe_reset_after_session_end();
                 return Ok(reply);
             }
+        }
+
+        if let Err(err) = self.ensure_process() {
+            let input_context = self.prepare_input_context_pager(&text, echo_input);
+            let reply = self.build_reply_from_worker_error_pager(&err, input_context, page_bytes);
+            let reply = self.finalize_reply(reply);
+            self.maybe_reset_after_session_end();
+            return Ok(reply);
+        }
+        if !empty_input {
+            self.output.start_capture();
+            self.maybe_emit_guardrail_notice();
+            self.resolve_timeout_marker();
+        }
+        if empty_input {
             let reply = self.build_idle_poll_reply_pager();
             let reply = self.finalize_reply(reply);
             self.maybe_reset_after_session_end();
@@ -6369,6 +6377,66 @@ mod tests {
         assert!(
             text.contains("detached\n"),
             "expected empty input to poll newly appended output before pager navigation, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn pager_empty_input_advances_page_after_worker_exit() {
+        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        reset_last_reply_marker_offset();
+
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Pager,
+        )
+        .expect("worker manager");
+        manager.process = Some(test_worker_process(sleeping_test_child()));
+        manager.exe_path = PathBuf::from("definitely-missing-worker-exe");
+
+        manager.output.start_capture();
+        let output = (1..=24).map(|n| format!("L{n:04}\n")).collect::<String>();
+        manager
+            .output_timeline
+            .append_text(output.as_bytes(), false, ContentOrigin::Worker);
+        let end_offset = manager.output.end_offset().expect("output end offset");
+        let SnapshotWithImages { buffer, .. } =
+            snapshot_page_with_images(&manager.output, end_offset, 16);
+        manager.pager.activate(buffer.expect("pager buffer"), false);
+
+        {
+            let process = manager.process.as_mut().expect("worker process");
+            process.child.kill().expect("kill test child");
+            process.exit_status = Some(process.child.wait().expect("wait test child"));
+        }
+
+        let reply = manager
+            .write_stdin_pager(
+                String::new(),
+                Duration::from_millis(0),
+                Duration::from_millis(0),
+                Some(16),
+                true,
+            )
+            .expect("empty pager reply");
+        let WorkerReply::Output { contents, .. } = reply;
+        let text = contents_text(&contents);
+
+        if let Some(process) = manager.process.take() {
+            let _ = process.finish_exited();
+        }
+
+        assert!(
+            text.contains("L0002")
+                || text.contains("L0003")
+                || text.contains("L0010")
+                || text.contains("L0014"),
+            "expected blank pager input to advance to the next page after worker exit, got: {text:?}"
+        );
+        assert!(
+            !text.contains("worker io error:"),
+            "expected pager navigation instead of a respawn error after worker exit, got: {text:?}"
         );
     }
 
