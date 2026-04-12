@@ -866,38 +866,8 @@ impl WorkerManager {
         }
 
         let page_bytes = pager::resolve_page_bytes(page_bytes_override);
-        if text.is_empty() {
-            if self.pending_request
-                || self.output.has_pending_output()
-                || self.settled_pending_completion.is_some()
-            {
-                let reply = self.poll_pending_output_pager(worker_timeout, page_bytes)?;
-                let reply = self.finalize_reply(reply);
-                self.maybe_reset_after_session_end();
-                return Ok(reply);
-            }
-            if self.pager.is_active()
-                && let Some(reply) = self.handle_pager_command(&text)
-            {
-                let reply = self.finalize_reply(reply);
-                self.maybe_reset_after_session_end();
-                return Ok(reply);
-            }
-            if let Err(err) = self.ensure_process() {
-                let input_context = self.prepare_input_context_pager(&text, echo_input);
-                let reply =
-                    self.build_reply_from_worker_error_pager(&err, input_context, page_bytes);
-                let reply = self.finalize_reply(reply);
-                self.maybe_reset_after_session_end();
-                return Ok(reply);
-            }
-            let reply = self.build_idle_poll_reply_pager();
-            let reply = self.finalize_reply(reply);
-            self.maybe_reset_after_session_end();
-            return Ok(reply);
-        }
-
-        if self.pager.is_active() {
+        let empty_input = text.is_empty();
+        if !empty_input && self.pager.is_active() {
             let trimmed = text.trim();
             if trimmed.is_empty() || trimmed.starts_with(':') {
                 if let Some(reply) = self.handle_pager_command(&text) {
@@ -921,6 +891,28 @@ impl WorkerManager {
         self.output.start_capture();
         self.maybe_emit_guardrail_notice();
         self.resolve_timeout_marker();
+        if empty_input {
+            if self.pending_request
+                || self.output.has_pending_output()
+                || self.settled_pending_completion.is_some()
+            {
+                let reply = self.poll_pending_output_pager(worker_timeout, page_bytes)?;
+                let reply = self.finalize_reply(reply);
+                self.maybe_reset_after_session_end();
+                return Ok(reply);
+            }
+            if self.pager.is_active()
+                && let Some(reply) = self.handle_pager_command(&text)
+            {
+                let reply = self.finalize_reply(reply);
+                self.maybe_reset_after_session_end();
+                return Ok(reply);
+            }
+            let reply = self.build_idle_poll_reply_pager();
+            let reply = self.finalize_reply(reply);
+            self.maybe_reset_after_session_end();
+            return Ok(reply);
+        }
         if self.pending_request {
             self.resolve_timeout_marker_with_wait(Duration::from_millis(25));
         }
@@ -5513,6 +5505,14 @@ mod tests {
             .expect("spawn sleeping test child")
     }
 
+    #[cfg(target_family = "windows")]
+    fn sleeping_test_child() -> Child {
+        Command::new("powershell.exe")
+            .args(["-NoProfile", "-Command", "Start-Sleep -Seconds 30"])
+            .spawn()
+            .expect("spawn sleeping test child")
+    }
+
     #[cfg(target_family = "unix")]
     fn successful_test_child() -> Child {
         Command::new("sh")
@@ -5546,6 +5546,21 @@ mod tests {
             guardrail_thread_handle: None,
             #[cfg(target_os = "macos")]
             denial_logger: None,
+        }
+    }
+
+    #[cfg(target_family = "windows")]
+    fn test_worker_process(child: Child) -> WorkerProcess {
+        let (stdin_tx, _stdin_rx) = mpsc::channel();
+        WorkerProcess {
+            child,
+            stdin_tx,
+            session_tmpdir: None,
+            ipc: IpcHandle::new(),
+            stdout_reader: None,
+            stderr_reader: None,
+            expected_exit: false,
+            exit_status: None,
         }
     }
 
@@ -6322,6 +6337,7 @@ mod tests {
             crate::oversized_output::OversizedOutputMode::Pager,
         )
         .expect("worker manager");
+        manager.process = Some(test_worker_process(sleeping_test_child()));
 
         manager.output.start_capture();
         manager.output_timeline.append_text(
@@ -6353,6 +6369,53 @@ mod tests {
         assert!(
             text.contains("detached\n"),
             "expected empty input to poll newly appended output before pager navigation, got: {text:?}"
+        );
+    }
+
+    #[test]
+    fn pager_empty_input_preserves_idle_guardrail_notice() {
+        let _output_ring = ensure_output_ring(OUTPUT_RING_CAPACITY_BYTES);
+        reset_output_ring();
+        reset_last_reply_marker_offset();
+
+        let mut manager = WorkerManager::new(
+            Backend::R,
+            SandboxCliPlan::default(),
+            crate::oversized_output::OversizedOutputMode::Pager,
+        )
+        .expect("worker manager");
+        manager.process = Some(test_worker_process(sleeping_test_child()));
+        {
+            let mut slot = manager
+                .guardrail
+                .event
+                .lock()
+                .expect("guardrail event mutex poisoned");
+            *slot = Some(GuardrailEvent {
+                message: "[repl] worker was idle; new session started\n".to_string(),
+                was_busy: false,
+            });
+        }
+
+        let reply = manager
+            .write_stdin_pager(
+                String::new(),
+                Duration::from_millis(0),
+                Duration::from_millis(0),
+                Some(256),
+                true,
+            )
+            .expect("empty poll reply");
+        let WorkerReply::Output { contents, .. } = reply;
+        let text = contents_text(&contents);
+
+        if let Some(process) = manager.process.take() {
+            let _ = process.kill();
+        }
+
+        assert!(
+            text.contains("[repl] worker was idle; new session started"),
+            "expected empty pager polls to preserve idle guardrail restart notices, got: {text:?}"
         );
     }
 

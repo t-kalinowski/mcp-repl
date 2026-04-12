@@ -353,6 +353,22 @@ async fn spawn_server_with_sandbox_state_in_cwd(
 }
 
 #[cfg(target_os = "windows")]
+async fn spawn_server_with_sandbox_state_and_env_in_cwd(
+    state: String,
+    env: Vec<(String, String)>,
+    cwd: &Path,
+) -> TestResult<common::McpTestSession> {
+    let args = sandbox_args_from_state(&state)?;
+    common::spawn_server_with_args_env_and_cwd_and_pager_page_chars(
+        args,
+        env,
+        Some(cwd.to_path_buf()),
+        SANDBOX_PAGER_PAGE_CHARS,
+    )
+    .await
+}
+
+#[cfg(target_os = "windows")]
 fn temp_workspace_root() -> TestResult<tempfile::TempDir> {
     Ok(tempfile::tempdir()?)
 }
@@ -2052,6 +2068,138 @@ tryCatch({{
     assert!(
         !use_text.contains("SESSION_B_WRITE_OK"),
         "another same-checkout session unexpectedly wrote a per-session temp child, got: {use_text}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
+async fn sandbox_workspace_write_concurrent_sessions_do_not_share_in_workspace_session_temp_children()
+-> TestResult<()> {
+    let workspace = temp_workspace_root()?;
+    let repo_root = workspace.path().to_path_buf();
+    let temp_root = repo_root.join("workspace-temp-root");
+    std::fs::create_dir_all(&temp_root)?;
+    scrub_unresolved_windows_sid_aces(&repo_root)?;
+    let expected_stable_sid = windows_workspace_write_prepared_sid_for_cwd(&repo_root, &[])?;
+    let temp_root_value = temp_root.to_string_lossy().to_string();
+    let env = vec![
+        ("TEMP".to_string(), temp_root_value.clone()),
+        ("TMP".to_string(), temp_root_value.clone()),
+        ("TMPDIR".to_string(), temp_root_value),
+    ];
+    let state = sandbox_state_workspace_write(false);
+    let mut session_a =
+        spawn_server_with_sandbox_state_and_env_in_cwd(state.clone(), env.clone(), &repo_root)
+            .await?;
+    let mut session_b =
+        spawn_server_with_sandbox_state_and_env_in_cwd(state, env, &repo_root).await?;
+
+    let create = session_a
+        .write_stdin_raw_with(
+            r#"
+cat("SESSION_A_TMPDIR=", Sys.getenv("MCP_REPL_R_SESSION_TMPDIR"), "\n", sep = "")
+cat("SESSION_A_R_TMPDIR=", tempdir(), "\n", sep = "")
+target_dir <- file.path(tempdir(), "nested")
+dir.create(target_dir, recursive = TRUE, showWarnings = FALSE)
+target <- file.path(target_dir, "mcp-repl-in-workspace-session-temp.txt")
+writeLines("from session a temp", target)
+cat("SESSION_A_TEMPFILE=", target, "\n", sep = "")
+cat("SESSION_A_WRITE_OK=", file.exists(target), "\n", sep = "")
+"#,
+            Some(10.0),
+        )
+        .await?;
+    let create_text = collect_text(&create);
+    if windows_sandbox_backend_unavailable(&create_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session_a.cancel().await?;
+        session_b.cancel().await?;
+        cleanup_restricted_path(&temp_root);
+        return Ok(());
+    }
+    assert!(
+        create_text.contains("SESSION_A_WRITE_OK=TRUE"),
+        "expected first live session to create its in-workspace session temp child, got: {create_text}"
+    );
+    let session_a_tmpdir = PathBuf::from(
+        create_text
+            .lines()
+            .find_map(|line| line.strip_prefix("SESSION_A_TMPDIR="))
+            .unwrap_or_default()
+            .trim(),
+    );
+    assert!(
+        session_a_tmpdir.starts_with(&temp_root),
+        "expected MCP_REPL_R_SESSION_TMPDIR to be rooted inside the checkout temp root, got: {session_a_tmpdir:?}"
+    );
+    let session_a_r_tmpdir = PathBuf::from(
+        create_text
+            .lines()
+            .find_map(|line| line.strip_prefix("SESSION_A_R_TMPDIR="))
+            .unwrap_or_default()
+            .trim(),
+    );
+    let session_tmpdir_acl = unresolved_windows_sid_acl_entries(&session_a_tmpdir)?;
+    let session_r_tmpdir_acl = unresolved_windows_sid_acl_entries(&session_a_r_tmpdir)?;
+    assert!(
+        session_a_r_tmpdir.starts_with(&session_a_tmpdir),
+        "expected R tempdir() to stay under MCP_REPL_R_SESSION_TMPDIR, got r={session_a_r_tmpdir:?} mcp={session_a_tmpdir:?}"
+    );
+    let temp_child = PathBuf::from(
+        create_text
+            .lines()
+            .find_map(|line| line.strip_prefix("SESSION_A_TEMPFILE="))
+            .unwrap_or_default()
+            .trim(),
+    );
+    let temp_child_r = r_string(&temp_child.to_string_lossy());
+    let temp_acl_before_second_session = unresolved_windows_sid_acl_entries(&temp_child)?;
+
+    let ready_b = session_b
+        .write_stdin_raw_with("cat('SESSION_B_READY\\n')\n", Some(10.0))
+        .await?;
+    let ready_b_text = collect_text(&ready_b);
+    if windows_sandbox_backend_unavailable(&ready_b_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        cleanup_restricted_file(&temp_child);
+        session_a.cancel().await?;
+        session_b.cancel().await?;
+        cleanup_restricted_path(&temp_root);
+        return Ok(());
+    }
+
+    let temp_acl = unresolved_windows_sid_acl_entries(&temp_child)?;
+    let use_code = format!(
+        r#"
+target <- {temp_child_r}
+tryCatch({{
+  writeLines("from session b temp", target)
+  cat("SESSION_B_WRITE_OK\n")
+}}, error = function(e) {{
+  message("SESSION_B_ACCESS_ERROR:", conditionMessage(e))
+}})
+"#
+    );
+    let use_result = session_b.write_stdin_raw_with(use_code, Some(10.0)).await?;
+    let use_text = collect_text(&use_result);
+
+    cleanup_restricted_file(&temp_child);
+    session_a.cancel().await?;
+    session_b.cancel().await?;
+    cleanup_restricted_path(&temp_root);
+
+    assert!(
+        !temp_acl.contains(&expected_stable_sid),
+        "expected prepared refresh to keep the shared stable SID {expected_stable_sid} off an in-workspace session temp child, got session_tmpdir={session_tmpdir_acl:?} r_tmpdir={session_r_tmpdir_acl:?} before={temp_acl_before_second_session:?} after={temp_acl:?} session_b={use_text}"
+    );
+    assert!(
+        use_text.contains("SESSION_B_ACCESS_ERROR:"),
+        "expected concurrent same-checkout sessions to stay isolated even when their session temp root lives inside the workspace, got: {use_text}"
+    );
+    assert!(
+        !use_text.contains("SESSION_B_WRITE_OK"),
+        "another same-checkout session unexpectedly wrote an in-workspace session temp child, got: {use_text}"
     );
     Ok(())
 }
