@@ -145,7 +145,6 @@ const OBJECT_INHERIT_ACE: u32 = 0x1;
 const INHERIT_ONLY_ACE: u8 = 0x08;
 const INHERITED_ACE: u8 = 0x10;
 const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
-const SESSION_TEMP_DIR_PREFIX: &str = "mcp-repl-session-";
 const WRAPPER_STDIO_DRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(2);
 const WRAPPER_STDIO_DRAIN_MAX_WAIT: Duration = Duration::from_secs(15);
 const WRAPPER_STDIO_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -1125,27 +1124,6 @@ fn session_temp_root_subtree_to_skip(root: &Path, session_temp_dir: &Path) -> Op
         .then_some(session_temp_root)
 }
 
-fn path_is_within_session_temp_tree(path: &Path, temp_root: &Path) -> bool {
-    if !path.starts_with(temp_root) {
-        return false;
-    }
-
-    let mut current = Some(path);
-    while let Some(candidate) = current {
-        if candidate == temp_root {
-            break;
-        }
-        if candidate
-            .file_name()
-            .is_some_and(|name| name.to_string_lossy().starts_with(SESSION_TEMP_DIR_PREFIX))
-        {
-            return true;
-        }
-        current = candidate.parent();
-    }
-    false
-}
-
 fn prepared_launch_allow_targets_read_dir(path: &Path) -> std::io::Result<std::fs::ReadDir> {
     #[cfg(test)]
     test_support::record_prepared_launch_allow_targets_read_dir_call(path);
@@ -1170,7 +1148,6 @@ fn prepared_launch_allow_targets(
 ) -> Result<Vec<PathBuf>, String> {
     let mut targets = Vec::new();
     let root_canonical = canonicalize_or_identity(root);
-    let session_temp_root = session_temp_tree_root(session_temp_dir);
     let skip_session_temp_root_subtree = session_temp_root_subtree_to_skip(root, session_temp_dir);
     let mut stack = vec![(root.to_path_buf(), 0usize)];
     let mut visited = HashSet::new();
@@ -1183,9 +1160,6 @@ fn prepared_launch_allow_targets(
             || skip_session_temp_root_subtree
                 .as_ref()
                 .is_some_and(|temp_root| canonical.starts_with(temp_root))
-            || session_temp_root
-                .as_ref()
-                .is_some_and(|temp_root| path_is_within_session_temp_tree(&canonical, temp_root))
         {
             continue;
         }

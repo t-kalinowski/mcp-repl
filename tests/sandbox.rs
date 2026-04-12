@@ -3803,6 +3803,98 @@ tryCatch({{
 
 #[cfg(target_os = "windows")]
 #[tokio::test(flavor = "multi_thread")]
+async fn sandbox_workspace_write_first_launch_accepts_temp_prefixed_writable_root_under_temp_root()
+-> TestResult<()> {
+    let temp_root = tempfile::tempdir()?;
+    let workspace = temp_workspace_root()?;
+    let cwd = workspace.path().join("workspace");
+    let writable_root = temp_root.path().join("mcp-repl-session-demo");
+    let artifact = writable_root.join(format!(
+        "mcp-repl-sandbox-temp-prefixed-root-{}.txt",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let artifact_r = r_string(&artifact.to_string_lossy());
+    let temp_root_value = temp_root.path().to_string_lossy().to_string();
+    let env = vec![
+        ("TEMP".to_string(), temp_root_value.clone()),
+        ("TMP".to_string(), temp_root_value.clone()),
+        ("TMPDIR".to_string(), temp_root_value),
+    ];
+    std::fs::create_dir_all(&cwd)?;
+    std::fs::create_dir_all(&writable_root)?;
+    scrub_unresolved_windows_sid_aces(&writable_root)?;
+    let expected_stable_sid =
+        windows_workspace_write_prepared_sid_for_cwd(&cwd, std::slice::from_ref(&writable_root))?;
+    let mut session = spawn_server_with_sandbox_state_and_env_in_cwd(
+        sandbox_state_workspace_write_with_roots(false, vec![writable_root.clone()]),
+        env,
+        &cwd,
+    )
+    .await?;
+
+    let create_code = format!(
+        r#"
+cat("SESSION_TMPDIR=", Sys.getenv("MCP_REPL_R_SESSION_TMPDIR"), "\n", sep = "")
+target <- {artifact_r}
+tryCatch({{
+  writeLines("ok", target)
+  cat("WRITE_OK=", file.exists(target), "\n", sep = "")
+}}, error = function(e) {{
+  message("WRITE_ERROR:", conditionMessage(e))
+}})
+"#
+    );
+    let create = session
+        .write_stdin_raw_with(create_code, Some(10.0))
+        .await?;
+    let create_text = collect_text(&create);
+    if windows_sandbox_backend_unavailable(&create_text) {
+        eprintln!("windows restricted token setup unavailable; skipping");
+        session.cancel().await?;
+        cleanup_restricted_path(&writable_root);
+        return Ok(());
+    }
+
+    let session_temp_dir = PathBuf::from(
+        create_text
+            .lines()
+            .find_map(|line| line.strip_prefix("SESSION_TMPDIR="))
+            .unwrap_or_default()
+            .trim(),
+    );
+    let writable_root_acl = unresolved_windows_sid_acl_entries(&writable_root)?;
+
+    cleanup_restricted_path(&writable_root);
+    session.cancel().await?;
+
+    assert!(
+        session_temp_dir.starts_with(temp_root.path()),
+        "expected the configured session temp dir to stay under the redirected TEMP root, got: {session_temp_dir:?}"
+    );
+    assert_ne!(
+        session_temp_dir, writable_root,
+        "expected the extra writable root to differ from the actual session temp dir, got: {session_temp_dir:?}"
+    );
+    assert!(
+        create_text.contains("WRITE_OK=TRUE"),
+        "expected first launch to write inside a temp-prefixed writable root under TEMP, got: {create_text}"
+    );
+    assert!(
+        !create_text.contains("WRITE_ERROR:"),
+        "temp-prefixed writable roots under TEMP should not be skipped during first-launch ACL setup, got: {create_text}"
+    );
+    assert!(
+        writable_root_acl.contains(&expected_stable_sid),
+        "expected the temp-prefixed writable root to keep the stable prepared SID {expected_stable_sid}, got: {writable_root_acl:?}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
+#[tokio::test(flavor = "multi_thread")]
 async fn sandbox_workspace_write_session_exit_removes_launch_acl_from_midrun_file() -> TestResult<()>
 {
     let writable_root = tempfile::tempdir()?;
